@@ -23,6 +23,8 @@ if len(sys.argv) >= 2 and sys.argv[1] == '--xlate':
         k = j.get('key'); spv = os.path.join(w, f'{k}.spv')
         if not k or not os.path.exists(spv): continue
         shutil.copyfile(spv, os.path.join(out, f'{k}.spv'))
+        res = os.path.join(w, f'{k}.res.json')   # the translator's reflection: each buffer's, texture's and image's binding (all in set 0)
+        if os.path.exists(res): shutil.copyfile(res, os.path.join(out, f'{k}.res.json'))
         j = dict(j); j.pop('code', None)   # the code file is the work folder's
         with open(os.path.join(out, f'{k}.json'), 'w') as f: json.dump(j, f)
     sys.exit(r.returncode)
@@ -60,6 +62,6 @@ except SystemExit as e:
 finally:
     shutil.rmtree(fake, ignore_errors=True)
     shutil.rmtree(out / '.mac_out', ignore_errors=True)
-n = sum(1 for _ in out.glob('*.spv'))
-print(f'\nSPIR-V: {n} shaders in {out}', flush=True)
+n = sum(1 for _ in out.glob('*.spv')); nr = sum(1 for _ in out.glob('*.res.json'))
+print(f'\nSPIR-V: {n} shaders ({nr} with bindings) in {out}', flush=True)
 sys.exit(0 if n else 1)
