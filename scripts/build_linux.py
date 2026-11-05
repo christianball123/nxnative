@@ -79,12 +79,30 @@ def unpack(game, version, work):
     die(f'{game}: neither a .nup file nor a dump folder')
 
 
+def shaders(tid, ver, ext, exefs, nro_dir, lw, env, jobs):
+    # Graphics stage C: the game's shaders split out of its files (dm/gfx/tools/shader_split.py, as the NSP script does) and translated to SPIR-V (dm/linux/tools/spv_build.py)
+    if not shutil.which('dotnet'): die('the shader step needs the .NET 10 runtime: sudo dnf install -y dotnet-runtime-10.0 (in the toolbox), then build again')
+    sh = lw / f'shaders_v{ver}'; pkg, tables, spv = sh / 'pkg', sh / 'tables', sh / 'spv'
+    env = dict(env, J=str(jobs))
+    if nro_dir.is_dir(): env['DM_NRO_DIR'] = str(nro_dir)
+    if not (sh / 'split.done').is_file():
+        shutil.rmtree(pkg, ignore_errors=True); tables.mkdir(parents=True, exist_ok=True)
+        say('splitting out the shaders (a few minutes)')
+        mains = [exefs / 'main']
+        run([sys.executable, REPO / 'dm/gfx/tools/shader_split.py', ext / 'RomFS.img', ','.join(map(str, mains)), pkg] +
+            [tables / n for n in ('shader_map.tsv', 'shader_facts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv')], env=env)
+        (sh / 'split.done').write_text('')
+    else: say('shaders: already split')
+    say('translating the shaders to SPIR-V (can take 10+ minutes the first time)')
+    run([sys.executable, REPO / 'dm/linux/tools/spv_build.py', pkg, spv], env=env)
+
 def main():
     ap = argparse.ArgumentParser(description='Build a Switch / Switch 2 game for Linux aarch64 (null graphics: headless boot test)')
     ap.add_argument('game', type=Path, help='a .nup file, a folder holding one, or a dump folder')
     ap.add_argument('--version', type=int, help='the update to build (default: the newest; 0 = the base game)')
     ap.add_argument('--work-dir', type=Path, help='the build folder (default: <title ID>_build beside the game)')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
+    ap.add_argument('--shaders', action='store_true', help='also translate the game\'s shaders to SPIR-V (graphics stage C; needs the .NET 10 runtime, takes a while)')
     a = ap.parse_args()
     if platform.machine() not in ('aarch64', 'arm64'): say(f'[RED] this machine is {platform.machine()}: the build runs here, but the game only runs on arm64 Linux')
     check_tools()
@@ -182,6 +200,7 @@ def main():
             import fontTools  # noqa: F401
             run([sys.executable, REPO / 'dm/tools/make_ext_font.py', font / 'nintendo_ext.ttf'] + ([font / 'standard.ttf'] if (font / 'standard.ttf').exists() else []))
         except ImportError: say(f'[YELLOW] no button-icon font: {sys.executable} -m pip install --user fonttools, then build again')
+    if a.shaders: shaders(tid, ver, ext, exefs, nro_dir, lw, renv, a.jobs)
     aoc = work / 'aoc'
     script = lw / 'run.sh'
     script.write_text(f'''#!/bin/sh
