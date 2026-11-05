@@ -49,6 +49,7 @@ typedef struct {
     uint32_t pend[CV_BUFS], phead, pcount;    // released, waiting for a picture
     vpx_image_t *held[CV_HOLD]; int64_t held_ts[CV_HOLD]; uint8_t held_eos[CV_HOLD]; int nheld;
     int eos_pending;
+    uint64_t dec_n; double dec_ms_sum, dec_ms_max;   // libvpx decode time (cv_submit)
 } cv_dec;
 
 static cv_dec *g_cv[16];
@@ -244,7 +245,14 @@ static void cv_open(cv_dec *d) {   // (re)creates the codec state: a new stream 
     }
     if (d->codec == CV_H264) { if (!d->avc) d->avc = mavc_new(); else mavc_drop(d->avc); if (d->csd_n) mavc_param_sets(d->avc, d->csd, d->csd_n); d->vpx_ok = 1; return; }
     if (d->vpx_ok) vpx_codec_destroy(&d->vpx);
-    vpx_codec_dec_cfg_t cfg = {.threads = 2, .w = d->w, .h = d->h};
+    // DM_VPX_THREADS: libvpx's threads (default 2; on Linux 4, as the AYN Thor's cores decode a 2560x1440 VP9 movie slower than an Apple chip's: Mario Tennis Fever's intro)
+    const char *te = getenv("DM_VPX_THREADS");
+#ifdef __linux__
+    unsigned thr = te && *te ? (unsigned)atoi(te) : 4;
+#else
+    unsigned thr = te && *te ? (unsigned)atoi(te) : 2;
+#endif
+    vpx_codec_dec_cfg_t cfg = {.threads = thr ? thr : 1, .w = d->w, .h = d->h};
     d->vpx_ok = vpx_codec_dec_init(&d->vpx, d->codec == CV_VP8 ? vpx_codec_vp8_dx() : vpx_codec_vp9_dx(), &cfg, 0) == VPX_CODEC_OK;
     if (!d->vpx_ok) LOG("[RED] nn::codec %s decoder: libvpx init failed", k_cv_name[d->codec]);
 }
@@ -360,7 +368,14 @@ static Result cv_dec_submit(uint64_t *out, void *t, const void *data, uint64_t s
             if (mav1_decode(d->av1, data, (size_t)size, &pic) == 1) { vpx_image_t *c = av1_to_i420(&pic); if (c) got += cv_hold(d, c, ts); }
         }
     } else if (size && d->vpx_ok) {
-        if (vpx_codec_decode(&d->vpx, data, (unsigned)size, NULL, 0) != VPX_CODEC_OK) { static int n; if (n++ < 4) LOG("[RED] nn::codec %s: %s (%s)", k_cv_name[d->codec], vpx_codec_error(&d->vpx), vpx_codec_error_detail(&d->vpx) ? vpx_codec_error_detail(&d->vpx) : ""); }
+        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+        int dec_rc = vpx_codec_decode(&d->vpx, data, (unsigned)size, NULL, 0);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        {   // decode time: a movie whose pictures take longer than its frame period falls behind, and its player holds the audio to wait (heard as pauses)
+            double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6; d->dec_ms_sum += ms; if (ms > d->dec_ms_max) d->dec_ms_max = ms;
+            if (++d->dec_n % 600 == 0) { LOG("[codec] %s decoder %u: decode time mean %.1f ms / max %.1f ms over the last 600 pictures (%ux%u)", k_cv_name[d->codec], d->id, d->dec_ms_sum / 600, d->dec_ms_max, d->w, d->h); d->dec_ms_sum = 0; d->dec_ms_max = 0; }
+        }
+        if (dec_rc != VPX_CODEC_OK) { static int n; if (n++ < 4) LOG("[RED] nn::codec %s: %s (%s)", k_cv_name[d->codec], vpx_codec_error(&d->vpx), vpx_codec_error_detail(&d->vpx) ? vpx_codec_error_detail(&d->vpx) : ""); }
         vpx_codec_iter_t it = NULL; const vpx_image_t *im;
         while ((im = vpx_codec_get_frame(&d->vpx, &it))) { vpx_image_t *c = img_copy(im); if (c) got += cv_hold(d, c, ts); }
     }
