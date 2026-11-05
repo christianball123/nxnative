@@ -22,6 +22,8 @@ static struct {
     SDL_AudioStream *(*OpenAudioDeviceStream)(uint32_t, const SDL_AudioSpec *, SDL_AudioStreamCallback, void *);
     bool (*PutAudioStreamData)(SDL_AudioStream *, const void *, int);
     int (*GetAudioStreamQueued)(SDL_AudioStream *);
+    uint32_t (*GetAudioStreamDevice)(SDL_AudioStream *);
+    bool (*GetAudioDeviceFormat)(uint32_t, SDL_AudioSpec *, int *);
     bool (*ResumeAudioStreamDevice)(SDL_AudioStream *);
     bool (*PauseAudioStreamDevice)(SDL_AudioStream *);
     void (*DestroyAudioStream)(SDL_AudioStream *);
@@ -37,10 +39,11 @@ static int sdl_audio(void) {
         else {
             int ok = 1;
 #define L(f) if (!(*(void **)&A.f = dlsym(A.lib, "SDL_" #f))) { LOG("[RED] audio: SDL3 has no SDL_" #f); ok = 0; }
-            L(InitSubSystem) L(GetError) L(SetHint) L(OpenAudioDeviceStream) L(PutAudioStreamData) L(GetAudioStreamQueued) L(ResumeAudioStreamDevice) L(PauseAudioStreamDevice) L(DestroyAudioStream) L(GetCurrentAudioDriver)
+            L(InitSubSystem) L(GetError) L(SetHint) L(OpenAudioDeviceStream) L(PutAudioStreamData) L(GetAudioStreamQueued) L(GetAudioStreamDevice) L(GetAudioDeviceFormat) L(ResumeAudioStreamDevice) L(PauseAudioStreamDevice) L(DestroyAudioStream) L(GetCurrentAudioDriver)
 #undef L
             if (ok) {
-                const char *fr = getenv("DM_AUDIO_FRAMES"); if (fr && *fr) A.SetHint("SDL_AUDIO_DEVICE_SAMPLE_FRAMES", fr);
+                // a short device period (SDL asks PipeWire for it as the node's latency); the cushion follows the period the device really has (feeder)
+                const char *fr = getenv("DM_AUDIO_FRAMES"); A.SetHint("SDL_AUDIO_DEVICE_SAMPLE_FRAMES", fr && *fr ? fr : "256");
                 A.SetHint("SDL_AUDIO_DEVICE_APP_NAME", "nxnative");
                 if (!A.InitSubSystem(SDL_INIT_AUDIO)) LOG("[RED] audio: SDL audio does not start: %s", A.GetError());
                 else { A.ok = 1; LOG("audio: SDL3 audio, driver %s", A.GetCurrentAudioDriver() ? A.GetCurrentAudioDriver() : "?"); }
@@ -60,8 +63,15 @@ static void *feeder(void *p) {
     AudioUnit u = p; dm_pthread_setname_self("audio feeder");
     UInt32 bpf = u->fmt.mBytesPerFrame ? u->fmt.mBytesPerFrame : 4, frames = (UInt32)(u->fmt.mSampleRate / 200), n = frames * bpf;   // 5 ms
     if (n > sizeof u->buf) { frames = (UInt32)(sizeof u->buf / bpf); n = frames * bpf; }
-    const char *c = getenv("DM_AUDIO_CUSHION_MS"); int ms = c && *c ? atoi(c) : 50; if (ms < 10) ms = 10;
+    // The cushion: DM_AUDIO_CUSHION_MS, else two of the device's periods and at least 40 ms. A sound server may run a far longer period than asked (a handheld saving power:
+    // PipeWire at 4096 or 8192 frames), and a cushion shorter than one period leaves a gap at every period: the sound pauses and resumes (seen on the AYN Thor at 50 ms)
+    SDL_AudioSpec ds = {0}; int dev_frames = 0;
+    if (!A.GetAudioDeviceFormat(A.GetAudioStreamDevice(u->st), &ds, &dev_frames) || dev_frames <= 0) dev_frames = 1024;
+    const char *c = getenv("DM_AUDIO_CUSHION_MS");
+    int ms = c && *c ? atoi(c) : (int)(2.0 * dev_frames * 1000 / (ds.freq > 0 ? ds.freq : 48000)) + 10;
+    if (ms < 40) ms = 40;
     int cushion = (int)(u->fmt.mSampleRate * ms / 1000) * (int)bpf;
+    LOG("audio: device period %d frames at %d Hz: cushion %d ms", dev_frames, ds.freq, ms);
     // The cushion starts as silence, so the game is never asked for a burst: its audio renderer is paced by its buffers' release (hle_audio.c, hle_audren.c), and releasing
     // several at once put it out of step with the game's updates (catch-up frames, underruns: 115 in 2000 periods on the Thor with a fill-to-cushion feeder)
     memset(u->buf, 0, n);
@@ -76,6 +86,12 @@ static void *feeder(void *p) {
         if (u->cb.inputProc(u->cb.inputProcRefCon, &fl, &ts, 0, frames, &bl)) memset(u->buf, 0, n);
         A.PutAudioStreamData(u->st, u->buf, (int)n);
         int q = A.GetAudioStreamQueued(u->st);
+        if (q < (int)n && cushion < (int)(u->fmt.mSampleRate * bpf)) {   // ran dry: the device takes more per period than the cushion holds; grow it (up to 1 s), once with silence
+            int add = cushion / 2; cushion += add; memset(u->buf, 0, n);
+            for (int k = 0; k < add; k += (int)n) A.PutAudioStreamData(u->st, u->buf, (int)n);
+            LOG("[RED] audio: the device ran dry: cushion raised to %d ms", (int)((int64_t)cushion * 1000 / ((int64_t)u->fmt.mSampleRate * bpf)));
+            q = A.GetAudioStreamQueued(u->st);
+        }
         int64_t trim = q > cushion * 3 / 2 ? (int64_t)period / 200 : q < cushion / 2 ? -(int64_t)period / 200 : 0;
         next += period + trim;
         uint64_t now = mono_ns(); if (next + 50000000 < now) next = now;   // asleep for 50 ms or more (a stall): start from now instead of catching up in a burst
