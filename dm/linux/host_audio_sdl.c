@@ -2,8 +2,8 @@
 // machine without it still runs: Start then fails, and hle_audio.c's silent sink stands in.
 // Pushed, not pulled: the game queues about 20 ms of sound in 5 ms buffers (4 in flight), and a sound server that asks for a bigger period at once (PipeWire's default is
 // 1024 frames, 21 ms, and it ignores a smaller request from SDL) finds too little queued and fills the rest with silence: the sound stutters (seen on the AYN Thor). So a feeder
-// thread asks the unit's render callback (hle_audio.c au_render) for 5 ms at a time and keeps the SDL stream DM_AUDIO_CUSHION_MS ahead (default 50 ms): the game's buffers
-// are released at the device's pace, and the server's period no longer has to fit in what the game has queued.
+// thread asks the unit's render callback (hle_audio.c au_render) for 5 ms every 5 ms and keeps the SDL stream about DM_AUDIO_CUSHION_MS ahead (default 50 ms), so the
+// server's period no longer has to fit in what the game has queued.
 #include "dm.h"
 #include <AudioToolbox/AudioToolbox.h>
 #include <dlfcn.h>
@@ -62,25 +62,31 @@ static void *feeder(void *p) {
     if (n > sizeof u->buf) { frames = (UInt32)(sizeof u->buf / bpf); n = frames * bpf; }
     const char *c = getenv("DM_AUDIO_CUSHION_MS"); int ms = c && *c ? atoi(c) : 50; if (ms < 10) ms = 10;
     int cushion = (int)(u->fmt.mSampleRate * ms / 1000) * (int)bpf;
+    // The cushion starts as silence, so the game is never asked for a burst: its audio renderer is paced by its buffers' release (hle_audio.c, hle_audren.c), and releasing
+    // several at once put it out of step with the game's updates (catch-up frames, underruns: 115 in 2000 periods on the Thor with a fill-to-cushion feeder)
+    memset(u->buf, 0, n);
+    for (int k = 0; k < cushion; k += (int)n) A.PutAudioStreamData(u->st, u->buf, (int)n);
+    // Then one period every period of real time, as the silent sink does; the device's clock and CLOCK_MONOTONIC differ by a few ppm, so the period is trimmed by up to 0.5 %
+    // toward a queue of one cushion (the game's pace follows; nothing is dropped or padded for it)
+    const uint64_t period = (uint64_t)frames * 1000000000ull / (uint64_t)u->fmt.mSampleRate;
     uint64_t next = mono_ns();
     while (atomic_load(&u->running)) {
-        // top the stream up to the cushion, 5 ms at a time; a stream already full waits for the device to play some
-        while (atomic_load(&u->running) && A.GetAudioStreamQueued(u->st) < cushion) {
-            AudioBufferList bl = {1, {{u->fmt.mChannelsPerFrame, n, u->buf}}};
-            AudioUnitRenderActionFlags fl = 0; AudioTimeStamp ts = {0};
-            if (u->cb.inputProc(u->cb.inputProcRefCon, &fl, &ts, 0, frames, &bl)) memset(u->buf, 0, n);
-            A.PutAudioStreamData(u->st, u->buf, (int)n);
-        }
-        next += 2500000;   // look again in 2.5 ms
-        uint64_t now = mono_ns(); if (next < now) next = now + 1000000;
-        struct timespec ts = {(time_t)(next / 1000000000ull), (long)(next % 1000000000ull)};
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+        AudioBufferList bl = {1, {{u->fmt.mChannelsPerFrame, n, u->buf}}};
+        AudioUnitRenderActionFlags fl = 0; AudioTimeStamp ts = {0};
+        if (u->cb.inputProc(u->cb.inputProcRefCon, &fl, &ts, 0, frames, &bl)) memset(u->buf, 0, n);
+        A.PutAudioStreamData(u->st, u->buf, (int)n);
+        int q = A.GetAudioStreamQueued(u->st);
+        int64_t trim = q > cushion * 3 / 2 ? (int64_t)period / 200 : q < cushion / 2 ? -(int64_t)period / 200 : 0;
+        next += period + trim;
+        uint64_t now = mono_ns(); if (next + 50000000 < now) next = now;   // asleep for 50 ms or more (a stall): start from now instead of catching up in a burst
+        struct timespec t = {(time_t)(next / 1000000000ull), (long)(next % 1000000000ull)};
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL);
     }
     return NULL;
 }
 
 AudioComponent AudioComponentFindNext(AudioComponent after, const AudioComponentDescription *d) { (void)d; return after ? NULL : &g_comp; }
-OSStatus AudioComponentInstanceNew(AudioComponent c, AudioComponentInstance *out) { (void)c; *out = calloc(1, sizeof **out); return *out ? noErr : -1; }
+OSStatus AudioComponentInstanceNew(AudioComponent c, AudioComponentInstance *out) { (void)c; sdl_audio(); *out = calloc(1, sizeof **out); return *out ? noErr : -1; }   // SDL starts here: a slow start inside Start tripped hle_audio.c's 200 ms watchdog
 OSStatus AudioComponentInstanceDispose(AudioComponentInstance u) { if (!u) return noErr; AudioOutputUnitStop(u); if (u->st) A.DestroyAudioStream(u->st); free(u); return noErr; }
 OSStatus AudioUnitInitialize(AudioUnit u) { (void)u; return noErr; }
 OSStatus AudioUnitUninitialize(AudioUnit u) { (void)u; return noErr; }
