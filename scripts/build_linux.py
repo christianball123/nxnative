@@ -102,15 +102,66 @@ def main():
         env['DM_GAMES_DIR'] = str(pdir)
     mods = subprocess.run([sys.executable, REPO / 'dm/games/game.py', tid, 'modules'], capture_output=True, text=True, env=env).stdout.split()
     if not mods: mods = [p.name for p in exefs.iterdir() if p.name in ('main', 'sdk') or p.name.startswith('subsdk')]
-    lw = work / 'linux'; patched = lw / f'patched_v{ver}'
+    lw = work / 'linux'; patched = lw / f'patched_v{ver}'; nro_dir = lw / f'nro_v{ver}'
     patched.mkdir(parents=True, exist_ok=True)
-    for m in mods:
-        if not (exefs / m).is_file(): say(f'[RED] {m}: not in {exefs}, skipped'); continue
-        run([sys.executable, REPO / 'dm/tools/patch_nso.py', exefs / m, patched, m], env=dict(env, DM_GAME=tid))
-    run(['make', '-C', REPO / 'dm/linux', f'GAME={tid}', f'-j{a.jobs}'] + ([] if platform.machine() in ('aarch64', 'arm64') else ['CROSS=1']), env=env)
-    host = lw / 'dmhost'
-    shutil.copy2(REPO / 'dm/linux/build' / tid / 'dmhost', host)
+    renv = dict(env, DM_GAME=tid)
+    def rewrite(names):
+        for m, src in names.items():
+            if not src.is_file(): say(f'[RED] {m}: not in {src.parent}, skipped'); continue
+            if (patched / f'{m}.patched.bin').is_file() and (patched / f'{m}.patched.bin').stat().st_mtime > src.stat().st_mtime: say(f'{m}: already rewritten'); continue
+            run([sys.executable, REPO / 'dm/tools/patch_nso.py', src, patched, m], env=renv)
+    rewrite({m: exefs / m for m in mods})
+    # The NROs the game loads at run time with nn::ro (dm/tools/nro_collect.py): found in its files, or, when no file holds one (Mario Tennis Fever decodes its game code in memory),
+    # caught from a first boot (DM_NRO_CAPTURE, dm/host/hle_ro.c), as the NSP script's capture_nro does
+    romfs = ext / 'RomFS.img'
+    nrrs = True
+    if not (nro_dir / 'nro.tsv').is_file():
+        tmp = nro_dir.with_name(nro_dir.name + '.partial'); shutil.rmtree(tmp, ignore_errors=True)
+        r = subprocess.run([sys.executable, REPO / 'dm/tools/nro_collect.py', romfs, tmp, '--missing-ok'], capture_output=True, text=True, env=env)
+        sys.stdout.write(r.stdout[-2000:])
+        if r.returncode: sys.stderr.write(r.stderr[-2000:]); die('nro_collect.py failed')
+        if (tmp / 'nro.tsv').is_file(): shutil.rmtree(nro_dir, ignore_errors=True); tmp.rename(nro_dir)
+        else: nrrs = False; shutil.rmtree(tmp, ignore_errors=True)
+    host_built = False
+    def build_host():
+        nonlocal host_built
+        if host_built: return
+        run(['make', '-C', REPO / 'dm/linux', f'GAME={tid}', f'-j{a.jobs}'] + ([] if platform.machine() in ('aarch64', 'arm64') else ['CROSS=1']), env=env)
+        shutil.copy2(REPO / 'dm/linux/build' / tid / 'dmhost', lw / 'dmhost'); host_built = True
     for d in ('save', 'temp'): (lw / 'run' / d).mkdir(parents=True, exist_ok=True)
+    missing = nro_dir / 'missing.tsv'
+    want = dict(l.split('\t')[:2] for l in missing.read_text().splitlines() if l) if missing.is_file() else {}
+    if want and platform.machine() in ('aarch64', 'arm64'):
+        build_host()
+        cap = nro_dir / 'capture'; shutil.rmtree(cap, ignore_errors=True); cap.mkdir(parents=True)
+        say(f'{len(want)} NRO(s) the game registers are in no file: booting it once to catch what it decodes (up to 2 minutes)')
+        henv = dict(env, DM_ROMFS=str(romfs), DM_SAVE=str(lw / 'run/save'), DM_TEMP=str(lw / 'run/temp'), DM_ROOT=str(lw / 'run'), DM_NRO_CAPTURE=str(cap))
+        if (patched / 'nro.tsv').exists(): (patched / 'nro.tsv').unlink()
+        with open(lw / 'nro_capture.log', 'w') as logf:
+            p = subprocess.Popen([str(lw / 'dmhost'), str(patched)], env=henv, stdout=logf, stderr=subprocess.STDOUT)
+            import time
+            t0 = time.monotonic()
+            while p.poll() is None and time.monotonic() - t0 < 120 and not any(cap.glob('*.nro')): time.sleep(0.5)
+            if p.poll() is None: p.terminate(); p.wait()
+        got = sorted(cap.glob('*.nro'))
+        if not got or got[0].stem not in want:
+            say(''.join(open(lw / 'nro_capture.log', errors='replace').readlines()[-30:]))
+            die(f'the game decoded none of the NROs it registers (log: {lw / "nro_capture.log"})')
+        rows = [l for l in (nro_dir / 'nro.tsv').read_text().splitlines() if l]
+        name = f'nro{sum(1 for l in rows if not l.startswith(("#", "refused")))}'
+        sha = got[0].stem
+        shutil.move(got[0], nro_dir / f'{name}.nro')
+        (nro_dir / 'nro.tsv').write_text('\n'.join(rows + [f'{name}\t{sha}\t{(nro_dir / f"{name}.nro").stat().st_size}\t{want.pop(sha)}\tcapture']) + '\n')
+        missing.write_text(''.join(f'{h}\t{n}\n' for h, n in want.items()))
+        shutil.rmtree(cap, ignore_errors=True)
+        say(f'caught {name} ({(nro_dir / f"{name}.nro").stat().st_size / 2**20:.1f} MB)')
+    elif want:
+        say(f'[RED] {len(want)} NRO(s) can only be caught by booting the game, which needs arm64: run this on the Thor')
+    if nrrs and (nro_dir / 'nro.tsv').is_file():
+        nros = {l.split('\t')[0]: nro_dir / (l.split('\t')[0] + '.nro') for l in (nro_dir / 'nro.tsv').read_text().splitlines() if l and not l.startswith(('#', 'refused\t'))}
+        rewrite(nros)
+        shutil.copyfile(nro_dir / 'nro.tsv', patched / 'nro.tsv')
+    build_host()
     aoc = work / 'aoc'
     script = lw / 'run.sh'
     script.write_text(f'''#!/bin/sh
