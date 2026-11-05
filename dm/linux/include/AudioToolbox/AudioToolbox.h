@@ -1,5 +1,5 @@
-// AudioToolbox on Linux: types and constants only, every call fails. hle_audio.c then uses its silent sink (real-time pacing, no sound; the Mac default too, DM_AUDIO=1 asks
-// for the device), and hle_movie.c's AAC decoder gives no audio. A real Linux output (SDL3) replaces au_* in hle_audio.c later.
+// AudioToolbox on Linux: the AudioUnit output calls hle_audio.c makes are implemented on SDL3 audio (dm/linux/host_audio_sdl.c), so its watchdog and silent-sink fallback work
+// unchanged; DM_AUDIO=1 (run.sh's default) asks for the device. The AudioConverter calls (hle_movie.c's AAC decoder) still fail: movies' AAC tracks are silent.
 #pragma once
 #include "../dm_apple_media.h"
 typedef struct dm_au *AudioUnit, *AudioComponentInstance;
@@ -22,17 +22,17 @@ enum { kAudioUnitScope_Global = 0, kAudioUnitScope_Input = 1, kAudioUnitScope_Ou
 enum { kAudioUnitProperty_StreamFormat = 8, kAudioUnitProperty_SetRenderCallback = 23, kAudioOutputUnitProperty_CurrentDevice = 2000,
        kAudioDevicePropertyBufferFrameSize = 0x6673697a, kAudioDevicePropertyBufferFrameSizeRange = 0x66737a23, kAudioConverterDecompressionMagicCookie = 0x646d6763 };
 enum { kAudioFormatLinearPCM = 0x6c70636d, kAudioFormatMPEG4AAC = 0x61616320, kLinearPCMFormatFlagIsSignedInteger = 4, kLinearPCMFormatFlagIsPacked = 8, kAudioObjectUnknown = 0 };
-#define AudioComponentFindNext(...) (DM_IGN(__VA_ARGS__), (AudioComponent)0)
-#define AudioComponentInstanceNew(...) (DM_IGN(__VA_ARGS__), DM_UNSUPPORTED)
-#define AudioComponentInstanceDispose(...) (DM_IGN(__VA_ARGS__), noErr)
-#define AudioUnitInitialize(...) (DM_IGN(__VA_ARGS__), DM_UNSUPPORTED)
-#define AudioUnitUninitialize(...) (DM_IGN(__VA_ARGS__), noErr)
-#define AudioUnitGetProperty(...) (DM_IGN(__VA_ARGS__), DM_UNSUPPORTED)
-#define AudioUnitSetProperty(...) (DM_IGN(__VA_ARGS__), DM_UNSUPPORTED)
-#define AudioUnitAddPropertyListener(...) (DM_IGN(__VA_ARGS__), DM_UNSUPPORTED)
-#define AudioUnitRemovePropertyListenerWithUserData(...) (DM_IGN(__VA_ARGS__), noErr)
-#define AudioOutputUnitStart(...) (DM_IGN(__VA_ARGS__), DM_UNSUPPORTED)
-#define AudioOutputUnitStop(...) (DM_IGN(__VA_ARGS__), noErr)
+AudioComponent AudioComponentFindNext(AudioComponent after, const AudioComponentDescription *d);
+OSStatus AudioComponentInstanceNew(AudioComponent c, AudioComponentInstance *out);
+OSStatus AudioComponentInstanceDispose(AudioComponentInstance u);
+OSStatus AudioUnitInitialize(AudioUnit u);
+OSStatus AudioUnitUninitialize(AudioUnit u);
+OSStatus AudioUnitGetProperty(AudioUnit u, AudioUnitPropertyID id, AudioUnitScope scope, AudioUnitElement el, void *data, UInt32 *size);
+OSStatus AudioUnitSetProperty(AudioUnit u, AudioUnitPropertyID id, AudioUnitScope scope, AudioUnitElement el, const void *data, UInt32 size);
+OSStatus AudioUnitAddPropertyListener(AudioUnit u, AudioUnitPropertyID id, AudioUnitPropertyListenerProc proc, void *data);
+OSStatus AudioUnitRemovePropertyListenerWithUserData(AudioUnit u, AudioUnitPropertyID id, AudioUnitPropertyListenerProc proc, void *data);
+OSStatus AudioOutputUnitStart(AudioUnit u);
+OSStatus AudioOutputUnitStop(AudioUnit u);
 #define AudioConverterNew(...) (DM_IGN(__VA_ARGS__), DM_UNSUPPORTED)
 #define AudioConverterDispose(...) (DM_IGN(__VA_ARGS__), noErr)
 #define AudioConverterSetProperty(...) (DM_IGN(__VA_ARGS__), DM_UNSUPPORTED)

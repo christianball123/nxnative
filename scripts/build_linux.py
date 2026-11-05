@@ -189,6 +189,7 @@ def main():
 # Ctrl+C stops it. DM_TIME_LIMIT=<seconds> stops it by itself.
 cd "$(dirname "$0")"
 export DM_ROOT="{lw}/run" DM_ROMFS="{ext / 'RomFS.img'}" DM_SAVE="{lw}/run/save" DM_TEMP="{lw}/run/temp" DM_FONT_DIR="{lw}/font"
+export DM_AUDIO="${{DM_AUDIO:-1}}"   # sound through SDL3 (DM_AUDIO=0: silent)
 {f'export DM_AOC_DIR="{aoc}"' if aoc.is_dir() and any(aoc.iterdir()) else '# no DLC'}
 exec ./dmhost "{patched}" "$@" 2>&1 | tee log.txt
 ''')

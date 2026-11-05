@@ -10,7 +10,7 @@ A port of the nxnative host to arm64 Linux, aimed at ArmadaOS on the AYN Thor. T
 | Rewriter (`dm/tools/patch_nso.py`) | `DM_TARGET=linux`: patch code reads its thread slots through `tpidr_el0` |
 | Graphics | null device (`gfx_null.c`); with `DM_WINDOW=1` a window (SDL3 + Vulkan, `gfx_vk_window.c`) presents with every game frame, no picture yet. Plan: [GRAPHICS.md](GRAPHICS.md) |
 | Window, controller | window with `DM_WINDOW=1` (`DM_FULLSCREEN=1`); controller next |
-| Audio | the host's silent sink (real-time pacing). Next: SDL3 output |
+| Audio | SDL3 output behind the AudioUnit interface (`host_audio_sdl.c`), on by default in run.sh (`DM_AUDIO=0` silences it); movie AAC tracks still silent |
 | Movies | AV1 through dav1d; AVC shows black frames (no H.264 decoder yet) |
 
 ## Build and run a game (stage 1: headless boot test)
