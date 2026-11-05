@@ -17,11 +17,15 @@ The Apple host replays NVN on Metal (`dm/gfx/nvn/nvn_mtl.m`, 13,700 lines) behin
 
 | Stage | What it gives | State |
 |---|---|---|
-| A | SDL3 window, Vulkan instance / device / swapchain, presents paced with the game's (`DM_WINDOW=1`) | in progress |
-| B | memory pools on the GPU, textures (`VkImage`) with their storage, texture and buffer copies, clears; the game's swapchain image shown in the window | |
+| A | SDL3 window, Vulkan instance / device / swapchain, presents paced with the game's (`DM_WINDOW=1`) | done (tested on the Thor: Turnip, Adreno 740, 60 fps) |
+| B | the replay's CPU effects (events, counters, fence syncs, buffer copies / fills / uniform updates), textures as `VkImage`s, clears, texture and buffer copies, the game's swapchain image in the window (`gfx_vk_replay.c`) | first version: no memory pools on the GPU yet (no draws need them), no packaged texture uploads, no partial clears |
 | C | shaders: SPIR-V per key, pipelines, draws (vertex streams, index buffers, uniform buffers, textures and samplers) | |
 | D | the rest of Mario Tennis Fever's frame: depth / stencil, blending, compute, queries, the formats it uses | |
 | E | controller (SDL3 gamepad → `hle_hid.c`), audio out (SDL3) | |
 | F | performance: pipeline cache, prewarm lists, Adreno specifics | |
 
 Mario Tennis Fever is the test game: it plays on the Mac, so a difference is the Linux layer's.
+
+## Notes
+
+- Turnip (Adreno 740) has no `VK_EXT_external_memory_host`: stage C maps device memory over the pools instead.

@@ -2,8 +2,6 @@
 // SDL3 and the Vulkan loader are opened at run time (dlopen), so the build needs neither's development files: ArmadaOS has libSDL3.so.0 and libvulkan.so.1 (sudo dnf install SDL3 vulkan-loader
 // in the toolbox if not). Until stage B shows the game's own image, the window shows a colour that steps with every present, so its pace and the frame count are visible.
 // The window is made on the thread of the first present (the game's present thread), and its events are read on that thread at every present.
-#define VK_NO_PROTOTYPES 1
-#include <vulkan/vulkan_core.h>   // the repository's headers (third_party/vulkan-headers): core with the KHR surface and swapchain
 #include "dm.h"
 #include "gfx_vk.h"
 #include <dlfcn.h>
@@ -40,23 +38,18 @@ static int sdl_load(void) {
     return 1;
 }
 
-// ---- Vulkan functions, loaded through SDL's vkGetInstanceProcAddr
-#define VKI_FUNCS(X) X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) \
-    X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR) \
-    X(vkCreateDevice) X(vkGetDeviceProcAddr) X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceMemoryProperties)
-#define VKD_FUNCS(X) X(vkGetDeviceQueue) X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) \
-    X(vkCreateCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkResetCommandBuffer) X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) \
-    X(vkQueueSubmit) X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkDeviceWaitIdle)
+// ---- Vulkan functions (the lists are in gfx_vk.h), loaded through SDL's vkGetInstanceProcAddr
 static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr_;
 static PFN_vkCreateInstance vkCreateInstance_;
-#define DECL(f) static PFN_##f f##_;
-VKI_FUNCS(DECL) VKD_FUNCS(DECL)
-#undef DECL
+#define DEF(f) PFN_##f f##_;
+VKI_FUNCS(DEF) VKD_FUNCS(DEF)
+#undef DEF
+vk_core VK = {.qmu = PTHREAD_MUTEX_INITIALIZER};
 
 #define SWAP_MAX 8
 static struct {
     SDL_Window *win;
-    VkInstance inst; VkPhysicalDevice phys; VkDevice dev; VkQueue q; uint32_t qfam; VkSurfaceKHR surf;
+    VkSurfaceKHR surf;
     VkSwapchainKHR sc; VkFormat fmt; VkExtent2D ext; uint32_t nimg; VkImage img[SWAP_MAX];
     VkSemaphore acquired[SWAP_MAX], done[SWAP_MAX]; VkCommandPool pool; VkCommandBuffer cb[SWAP_MAX]; VkFence fence[SWAP_MAX]; uint32_t slot;
     int ok, failed, resized; uint64_t frames; double t0; char devname[256]; int ext_host_mem;
@@ -65,12 +58,12 @@ static struct {
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 
 static int swapchain_make(void) {
-    VkSurfaceCapabilitiesKHR cap; vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(W.phys, W.surf, &cap);
+    VkSurfaceCapabilitiesKHR cap; vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(VK.phys, W.surf, &cap);
     int pw = 0, ph = 0; S.GetWindowSizeInPixels(W.win, &pw, &ph);
     VkExtent2D e = cap.currentExtent.width != 0xffffffffu ? cap.currentExtent : (VkExtent2D){(uint32_t)pw, (uint32_t)ph};
     if (!e.width || !e.height) return 0;   // minimized
-    uint32_t n = 0; vkGetPhysicalDeviceSurfaceFormatsKHR_(W.phys, W.surf, &n, NULL);
-    VkSurfaceFormatKHR f[64]; if (n > 64) n = 64; vkGetPhysicalDeviceSurfaceFormatsKHR_(W.phys, W.surf, &n, f);
+    uint32_t n = 0; vkGetPhysicalDeviceSurfaceFormatsKHR_(VK.phys, W.surf, &n, NULL);
+    VkSurfaceFormatKHR f[64]; if (n > 64) n = 64; vkGetPhysicalDeviceSurfaceFormatsKHR_(VK.phys, W.surf, &n, f);
     VkSurfaceFormatKHR pick = f[0];
     for (uint32_t i = 0; i < n; i++) if (f[i].format == VK_FORMAT_B8G8R8A8_UNORM || f[i].format == VK_FORMAT_R8G8B8A8_UNORM) { pick = f[i]; break; }
     uint32_t count = cap.minImageCount + 1; if (cap.maxImageCount && count > cap.maxImageCount) count = cap.maxImageCount; if (count > SWAP_MAX) count = SWAP_MAX;
@@ -79,10 +72,10 @@ static int swapchain_make(void) {
                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
                                    cap.currentTransform, VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_PRESENT_MODE_FIFO_KHR, VK_TRUE, old};
     if (!(cap.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)) ci.compositeAlpha = (VkCompositeAlphaFlagBitsKHR)(cap.supportedCompositeAlpha & -cap.supportedCompositeAlpha);
-    VkResult r = vkCreateSwapchainKHR_(W.dev, &ci, NULL, &W.sc);
-    if (old) { vkDeviceWaitIdle_(W.dev); vkDestroySwapchainKHR_(W.dev, old, NULL); }
+    VkResult r = vkCreateSwapchainKHR_(VK.dev, &ci, NULL, &W.sc);
+    if (old) { vkDeviceWaitIdle_(VK.dev); vkDestroySwapchainKHR_(VK.dev, old, NULL); }
     if (r) { LOG("[RED] [vk] vkCreateSwapchainKHR %dx%d failed (%d)", e.width, e.height, r); W.sc = VK_NULL_HANDLE; return 0; }
-    W.fmt = pick.format; W.ext = e; W.nimg = SWAP_MAX; vkGetSwapchainImagesKHR_(W.dev, W.sc, &W.nimg, W.img);
+    W.fmt = pick.format; W.ext = e; W.nimg = SWAP_MAX; vkGetSwapchainImagesKHR_(VK.dev, W.sc, &W.nimg, W.img);
     LOG("[vk] swapchain %ux%u, %u images, format %d, FIFO (vsync)", e.width, e.height, W.nimg, pick.format);
     return 1;
 }
@@ -99,52 +92,53 @@ static int window_init(void) {
     uint32_t next = 0; const char *const *exts = S.Vulkan_GetInstanceExtensions(&next);
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "nxnative", 1, "nxnative", 1, VK_API_VERSION_1_1};
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, next, exts};
-    VkResult r = vkCreateInstance_(&ici, NULL, &W.inst);
+    VkResult r = vkCreateInstance_(&ici, NULL, &VK.inst);
     if (r) { LOG("[RED] [vk] vkCreateInstance failed (%d)", r); return 0; }
-#define LI(f) f##_ = (PFN_##f)vkGetInstanceProcAddr_(W.inst, #f); if (!f##_) { LOG("[RED] [vk] no " #f); return 0; }
+#define LI(f) f##_ = (PFN_##f)vkGetInstanceProcAddr_(VK.inst, #f); if (!f##_) { LOG("[RED] [vk] no " #f); return 0; }
     VKI_FUNCS(LI)
 #undef LI
-    if (!S.Vulkan_CreateSurface(W.win, W.inst, NULL, &W.surf)) { LOG("[RED] [vk] SDL_Vulkan_CreateSurface: %s", S.GetError()); return 0; }
+    if (!S.Vulkan_CreateSurface(W.win, VK.inst, NULL, &W.surf)) { LOG("[RED] [vk] SDL_Vulkan_CreateSurface: %s", S.GetError()); return 0; }
     // A real GPU before a software one (llvmpipe, lavapipe: VK_PHYSICAL_DEVICE_TYPE_CPU), which Mesa also installs; DM_VK_GPU=<n> picks by its index in vulkaninfo's list
-    uint32_t np = 8; VkPhysicalDevice pd[8]; vkEnumeratePhysicalDevices_(W.inst, &np, pd);
+    uint32_t np = 8; VkPhysicalDevice pd[8]; vkEnumeratePhysicalDevices_(VK.inst, &np, pd);
     const char *pick = getenv("DM_VK_GPU");
-    for (int pass = 0; pass < 2 && !W.phys; pass++)
-        for (uint32_t i = 0; i < np && !W.phys; i++) {
+    for (int pass = 0; pass < 2 && !VK.phys; pass++)
+        for (uint32_t i = 0; i < np && !VK.phys; i++) {
             VkPhysicalDeviceProperties dp; vkGetPhysicalDeviceProperties_(pd[i], &dp);
             if (pick && *pick ? (int)i != atoi(pick) : pass == 0 && dp.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) continue;
             uint32_t nq = 16; VkQueueFamilyProperties qp[16]; vkGetPhysicalDeviceQueueFamilyProperties_(pd[i], &nq, qp);
             for (uint32_t k = 0; k < nq; k++) {
                 VkBool32 pres = 0; vkGetPhysicalDeviceSurfaceSupportKHR_(pd[i], k, W.surf, &pres);
-                if ((qp[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) && pres) { W.phys = pd[i]; W.qfam = k; break; }
+                if ((qp[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) && pres) { VK.phys = pd[i]; VK.qfam = k; break; }
             }
         }
-    if (!W.phys) { LOG("[RED] [vk] no GPU can draw to this window"); return 0; }
-    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties_(W.phys, &pp);
+    if (!VK.phys) { LOG("[RED] [vk] no GPU can draw to this window"); return 0; }
+    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties_(VK.phys, &pp);
     snprintf(W.devname, sizeof W.devname, "%s", pp.deviceName);
-    uint32_t ne = 0; vkEnumerateDeviceExtensionProperties_(W.phys, NULL, &ne, NULL);
-    VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep); vkEnumerateDeviceExtensionProperties_(W.phys, NULL, &ne, ep);
+    uint32_t ne = 0; vkEnumerateDeviceExtensionProperties_(VK.phys, NULL, &ne, NULL);
+    VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep); vkEnumerateDeviceExtensionProperties_(VK.phys, NULL, &ne, ep);
     for (uint32_t i = 0; i < ne; i++) if (!strcmp(ep[i].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) W.ext_host_mem = 1;
     free(ep);
     LOG("[vk] GPU %s, Vulkan %u.%u.%u, driver %#x; guest memory import (VK_EXT_external_memory_host): %s", pp.deviceName, VK_API_VERSION_MAJOR(pp.apiVersion), VK_API_VERSION_MINOR(pp.apiVersion),
         VK_API_VERSION_PATCH(pp.apiVersion), pp.driverVersion, W.ext_host_mem ? "yes" : "no (stage B will mirror pools instead)");
     float prio = 1.0f;
-    VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, W.qfam, 1, &prio};
+    VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, VK.qfam, 1, &prio};
     const char *dext[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qci, 0, NULL, 1, dext, NULL};
-    if ((r = vkCreateDevice_(W.phys, &dci, NULL, &W.dev))) { LOG("[RED] [vk] vkCreateDevice failed (%d)", r); return 0; }
-#define LD(f) f##_ = (PFN_##f)vkGetDeviceProcAddr_(W.dev, #f); if (!f##_) { LOG("[RED] [vk] no " #f); return 0; }
+    if ((r = vkCreateDevice_(VK.phys, &dci, NULL, &VK.dev))) { LOG("[RED] [vk] vkCreateDevice failed (%d)", r); return 0; }
+#define LD(f) f##_ = (PFN_##f)vkGetDeviceProcAddr_(VK.dev, #f); if (!f##_) { LOG("[RED] [vk] no " #f); return 0; }
     VKD_FUNCS(LD)
 #undef LD
-    vkGetDeviceQueue_(W.dev, W.qfam, 0, &W.q);
-    VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, W.qfam};
-    vkCreateCommandPool_(W.dev, &pci, NULL, &W.pool);
+    vkGetDeviceQueue_(VK.dev, VK.qfam, 0, &VK.q);
+    vkGetPhysicalDeviceMemoryProperties_(VK.phys, &VK.mem);
+    VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, VK.qfam};
+    vkCreateCommandPool_(VK.dev, &pci, NULL, &W.pool);
     VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, W.pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, SWAP_MAX};
-    vkAllocateCommandBuffers_(W.dev, &cai, W.cb);
+    vkAllocateCommandBuffers_(VK.dev, &cai, W.cb);
     for (int i = 0; i < SWAP_MAX; i++) {
         VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, NULL, 0};
-        vkCreateSemaphore_(W.dev, &si, NULL, &W.acquired[i]); vkCreateSemaphore_(W.dev, &si, NULL, &W.done[i]);
+        vkCreateSemaphore_(VK.dev, &si, NULL, &W.acquired[i]); vkCreateSemaphore_(VK.dev, &si, NULL, &W.done[i]);
         VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, VK_FENCE_CREATE_SIGNALED_BIT};
-        vkCreateFence_(W.dev, &fi, NULL, &W.fence[i]);
+        vkCreateFence_(VK.dev, &fi, NULL, &W.fence[i]);
     }
     if (!swapchain_make()) return 0;
     W.t0 = now_s();
@@ -164,45 +158,74 @@ static void events(void) {
     }
 }
 
+uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want) {
+    for (uint32_t i = 0; i < VK.mem.memoryTypeCount; i++) if ((bits & 1u << i) && (VK.mem.memoryTypes[i].propertyFlags & want) == want) return i;
+    return ~0u;
+}
 int vkw_active(void) { return W.ok; }
 int vkw_wanted(void) { const char *w = getenv("DM_WINDOW"); return w && *w && *w != '0'; }
+int vkw_init(void) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    if (!W.ok && !W.failed) {
+        if (window_init()) { W.ok = 1; VK.ok = 1; }
+        else { W.failed = 1; LOG("[RED] [vk] no window: running headless"); }
+    }
+    pthread_mutex_unlock(&mu);
+    return W.ok;
+}
 
-// One present: the next swapchain image, cleared to this frame's colour (stage A), shown with FIFO (the display's vsync paces the game as a Switch's display would)
-void vkw_present(uint64_t n) {
-    if (W.failed) return;
-    if (!W.ok) { if (!window_init()) { W.failed = 1; LOG("[RED] [vk] no window: running headless"); return; } W.ok = 1; }
+// One present: the next swapchain image, with the game's image scaled into it (or stage A's colour when there is none yet), shown with FIFO: the display's vsync paces the game
+// as a Switch's display would. The game's image stays in VK_IMAGE_LAYOUT_GENERAL, the layout gfx_vk_replay.c keeps every image in
+void vkw_present(uint64_t n, VkImage gimg, uint32_t gw, uint32_t gh, const int crop[4]) {
+    if (!vkw_init()) return;
     events();
-    if (W.resized || !W.sc) { W.resized = 0; if (!swapchain_make()) return; }
+    pthread_mutex_lock(&VK.qmu);
+    if (W.resized || !W.sc) { W.resized = 0; if (!swapchain_make()) { pthread_mutex_unlock(&VK.qmu); return; } }
     uint32_t s = W.slot = (W.slot + 1) % W.nimg;
-    vkWaitForFences_(W.dev, 1, &W.fence[s], VK_TRUE, UINT64_MAX);
+    vkWaitForFences_(VK.dev, 1, &W.fence[s], VK_TRUE, UINT64_MAX);
     uint32_t idx;
-    VkResult r = vkAcquireNextImageKHR_(W.dev, W.sc, UINT64_MAX, W.acquired[s], VK_NULL_HANDLE, &idx);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) { W.resized = 1; return; }
-    if (r && r != VK_SUBOPTIMAL_KHR) { LOG("[RED] [vk] vkAcquireNextImageKHR failed (%d)", r); return; }
-    vkResetFences_(W.dev, 1, &W.fence[s]);
+    VkResult r = vkAcquireNextImageKHR_(VK.dev, W.sc, UINT64_MAX, W.acquired[s], VK_NULL_HANDLE, &idx);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { W.resized = 1; pthread_mutex_unlock(&VK.qmu); return; }
+    if (r && r != VK_SUBOPTIMAL_KHR) { LOG("[RED] [vk] vkAcquireNextImageKHR failed (%d)", r); pthread_mutex_unlock(&VK.qmu); return; }
+    vkResetFences_(VK.dev, 1, &W.fence[s]);
     VkCommandBuffer cb = W.cb[s]; vkResetCommandBuffer_(cb, 0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
     vkBeginCommandBuffer_(cb, &bi);
     barrier(cb, W.img[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    // Stage A's picture: a dark blue that brightens and dims once a second at 60 presents a second (so a steady pulse means a steady 60 fps)
-    double ph = (double)(n % 60) / 60.0, k = 0.5 - 0.5 * cos(ph * 2 * M_PI);
-    VkClearColorValue c = {{0.02f + 0.10f * (float)k, 0.06f + 0.20f * (float)k, 0.20f + 0.45f * (float)k, 1.0f}};
     VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage_(cb, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &rr);
+    if (gimg) {
+        VkClearColorValue black = {{0, 0, 0, 1}};
+        vkCmdClearColorImage_(cb, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rr);
+        // the game's crop (WindowSetCrop), fitted into the window with its aspect kept
+        int cx = crop ? crop[0] : 0, cy = crop ? crop[1] : 0, cw = crop && crop[2] > 0 ? crop[2] : (int)gw, ch = crop && crop[3] > 0 ? crop[3] : (int)gh;
+        double sx = (double)W.ext.width / cw, sy = (double)W.ext.height / ch, k = sx < sy ? sx : sy;
+        int dw = (int)(cw * k), dh = (int)(ch * k), dx = ((int)W.ext.width - dw) / 2, dy = ((int)W.ext.height - dh) / 2;
+        VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{cx, cy, 0}, {cx + cw, cy + ch, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+        vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        vkCmdBlitImage_(cb, gimg, VK_IMAGE_LAYOUT_GENERAL, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    } else {
+        // Stage A's picture: a dark blue that brightens and dims once a second at 60 presents a second (so a steady pulse means a steady 60 fps)
+        double ph = (double)(n % 60) / 60.0, k = 0.5 - 0.5 * cos(ph * 2 * M_PI);
+        VkClearColorValue c = {{0.02f + 0.10f * (float)k, 0.06f + 0.20f * (float)k, 0.20f + 0.45f * (float)k, 1.0f}};
+        vkCmdClearColorImage_(cb, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &rr);
+    }
     barrier(cb, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     vkEndCommandBuffer_(cb);
     VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &W.acquired[s], &ws, 1, &cb, 1, &W.done[s]};
-    if ((r = vkQueueSubmit_(W.q, 1, &si, W.fence[s]))) { LOG("[RED] [vk] vkQueueSubmit failed (%d)", r); return; }
+    if ((r = vkQueueSubmit_(VK.q, 1, &si, W.fence[s]))) { LOG("[RED] [vk] vkQueueSubmit failed (%d)", r); pthread_mutex_unlock(&VK.qmu); return; }
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &W.done[s], 1, &W.sc, &idx, NULL};
-    r = vkQueuePresentKHR_(W.q, &pi);
+    r = vkQueuePresentKHR_(VK.q, &pi);
+    pthread_mutex_unlock(&VK.qmu);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) W.resized = 1;
     else if (r) LOG("[RED] [vk] vkQueuePresentKHR failed (%d)", r);
     W.frames++;
     if (W.frames == 1) LOG("[vk] first frame in the window");
     if (W.frames % 60 == 0) {
         double t = now_s(); static double last; static uint64_t lastf;
-        if (last) { char title[200]; snprintf(title, sizeof title, "nxnative - %s - %.1f fps - frame %llu (graphics: stage A, no picture yet)", W.devname, (W.frames - lastf) / (t - last), (unsigned long long)n); S.SetWindowTitle(W.win, title); }
+        if (last) { char title[200]; snprintf(title, sizeof title, "nxnative - %s - %.1f fps - frame %llu (graphics: stage B, clears and copies only)", W.devname, (W.frames - lastf) / (t - last), (unsigned long long)n); S.SetWindowTitle(W.win, title); }
         last = t; lastf = W.frames;
     }
 }
