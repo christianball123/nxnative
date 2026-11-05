@@ -8,6 +8,32 @@
 #include <string.h>
 #include "game_profile.h"   // constants of the current game profile (generated from dm/games/<id>/game.tsv, chosen by the Makefile's GAME)
 
+// Platform views of a signal's register state (crash.c, probe.c, hle_thread.c) and of the host's registration sections (hle.h).
+// Apple: ucontext's mcontext pointer holds __ss / __ns / __es. Linux: dm/linux/include/dm_linux.h lays the same Darwin structs over Linux's mcontext.
+#ifdef __linux__
+#include "dm_linux.h"
+#define DM_UC_SS(uc) dm_uc_ss(uc)
+#define DM_UC_NS(uc) dm_uc_ns(uc)
+#define DM_UC_ESR(uc) dm_uc_esr(uc)
+#else
+#define DM_UC_SS(uc) (&(uc)->uc_mcontext->__ss)
+#define DM_UC_NS(uc) (&(uc)->uc_mcontext->__ns)
+#define DM_UC_ESR(uc) ((uc)->uc_mcontext->__es.__esr)
+#define DM_SECTION(seg, sect) section(#seg "," #sect)
+#endif
+// Symbol spelling in inline assembly: Mach-O prefixes C names with an underscore and addresses pages with @PAGE / @PAGEOFF; ELF does neither
+#ifdef __linux__
+#define DM_ASM_SYM(s) s
+#define DM_ASM_HIDDEN(s) ".hidden " s "\n"
+#define DM_ASM_PAGE(s) s
+#define DM_ASM_PAGEOFF(s) ":lo12:" s
+#else
+#define DM_ASM_SYM(s) "_" s
+#define DM_ASM_HIDDEN(s) ".private_extern _" s "\n"
+#define DM_ASM_PAGE(s) "_" s "@PAGE"
+#define DM_ASM_PAGEOFF(s) "_" s "@PAGEOFF"
+#endif
+
 // Explicit host work does not occupy a guest core (Metal submission, or a blocked native codec lock). A contended host mutex must count as blocked: a signal's same-core handoff
 // can otherwise wait forever for a peer that needs the signaller's native lock. Uncontended locks retain guest ordering; the counter nests inside existing host work.
 extern __thread _Atomic int dm_host_work;

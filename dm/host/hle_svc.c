@@ -70,6 +70,14 @@ static size_t env_size(const char *name, size_t min, size_t align) {
 // it is sized, so one left behind holds nothing. guest_file_thread stops the game when the disk falls under the minimum later. What the game gives back only goes PROT_NONE in the files (guest_release)
 // and reads 0 when it is opened again (alias_initialize, SetHeapSize)
 int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);   // libproc.h, which the iOS SDK does not have
+// The guest files' volume: Apple systems want local APFS (sparse, fast); Linux wants tmpfs (/dev/shm: RAM, shared) or another local file system
+#ifdef __linux__
+#define DM_FSTYPENAME(fs) dm_statfs_type(fs)
+#define DM_FS_GOOD(fs) (strcmp(dm_statfs_type(fs), "nfs") && strcmp(dm_statfs_type(fs), "fuse"))
+#else
+#define DM_FSTYPENAME(fs) ((fs)->f_fstypename)
+#define DM_FS_GOOD(fs) (!strcmp((fs)->f_fstypename, "apfs") && ((fs)->f_flags & MNT_LOCAL))
+#endif
 #define GF_MAX 1024
 static int g_gf_tab[GF_MAX];       // the files, open for reading and writing
 static int g_gf_n;                 // how many; 0 while the guest is anonymous. Set by mem_init_once, whose pthread_once orders it before every reader
@@ -181,8 +189,8 @@ static void guest_file_init(void) {
     else if (!confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir)) { LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: no temporary folder, errno %d)", errno); return; }
     if (!guest_files_map(dir, chunk, n, &fs, why, sizeof why)) { LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: %s)", why); return; }
     g_gf_n = n;
-    LOG("[mem] guest memory: %d files of %.2f GB in %s (unlinked, sparse, shared), %.2f GB in all, on the %s volume, %.1f GB free on it", n, chunk / G, dir, g_reserve / G, fs.f_fstypename, (double)fs.f_bavail * fs.f_bsize / G);
-    if (strcmp(fs.f_fstypename, "apfs") || !(fs.f_flags & MNT_LOCAL)) LOG("[RED] [mem] guest file: not on a local APFS volume, where it may not be sparse, or be slow");
+    LOG("[mem] guest memory: %d files of %.2f GB in %s (unlinked, sparse, shared), %.2f GB in all, on the %s volume, %.1f GB free on it", n, chunk / G, dir, g_reserve / G, DM_FSTYPENAME(&fs), (double)fs.f_bavail * fs.f_bsize / G);
+    if (!DM_FS_GOOD(&fs)) LOG("[RED] [mem] guest file: not on a local APFS volume, where it may not be sparse, or be slow");
     pthread_t th; int rc = pthread_create(&th, NULL, guest_file_thread, NULL);
     if (!rc) pthread_detach(th);
     else LOG("[RED] [mem] guest file: no thread to watch it (error %d): no 10-s line, and nothing stops the game when its disk fills", rc);

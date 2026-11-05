@@ -39,6 +39,52 @@ static void create_keys(void) {
     LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", g_key18, g_keytls, g_keytlr, g_keygate);
 }
 
+#ifdef __linux__
+// Linux: the rewritten code reads its slots at tpidr_el0 + offset (patch_nso.py, DM_TARGET=linux). glibc keeps the values of the first 32 pthread keys in a fixed array of
+// struct pthread, at a fixed distance from the thread pointer for every thread; the distance depends on the glibc build, so it is found here: a marker is stored in the key and
+// looked for near the thread pointer, then checked with a second value and on a second thread
+static uint64_t thread_pointer(void) { uint64_t t; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(t)); return t; }
+static int64_t g_key_off[KEY_N];
+static int64_t find_key_off(pthread_key_t k) {
+    if (k >= 32) die("pthread key %u is beyond glibc's first block (32): its value has no fixed place", (unsigned)k);
+    const uint64_t mark = 0x6e786e6174697665ull ^ (uint64_t)k;   // "nxnative"
+    pthread_setspecific(k, (void *)mark);
+    uint64_t tp = thread_pointer(); int64_t found = 0; int hits = 0;
+    for (int64_t o = -0x4000; o < 0x400; o += 8) {
+        uintptr_t pg = (uintptr_t)(tp + o) & ~(uintptr_t)4095;
+        if (msync((void *)pg, 4096, MS_ASYNC)) continue;   // not mapped (ENOMEM): skip the page instead of faulting on it
+        if (*(volatile uint64_t *)(uintptr_t)(tp + o) != mark) continue;
+        found = o; hits++;
+    }
+    if (hits != 1) die("pthread key %u: its value was found %d times near the thread pointer (expected once)", (unsigned)k, hits);
+    pthread_setspecific(k, (void *)(mark + 1));
+    if (*(uint64_t *)(tp + found) != mark + 1) die("pthread key %u: the value at tp%+lld does not follow the key", (unsigned)k, (long long)found);
+    pthread_setspecific(k, NULL);
+    return found;
+}
+static void *key_off_check(void *arg) {
+    (void)arg;
+    for (unsigned i = 0; i < KEY_N; i++) {
+        pthread_setspecific(key_value(i), (void *)(uintptr_t)(0x1000 + i));
+        if (*(uint64_t *)(thread_pointer() + g_key_off[i]) != 0x1000 + i) return (void *)1;
+    }
+    return NULL;
+}
+static void key_offsets(void) {
+    for (unsigned i = 0; i < KEY_N; i++) g_key_off[i] = find_key_off(key_value(i));
+    pthread_t t; void *bad = (void *)1;
+    if (pthread_create(&t, NULL, key_off_check, NULL) || pthread_join(t, &bad) || bad) die("pthread key slots move between threads: the rewritten code could not find them");
+    LOG("thread slots at tp%+lld %+lld %+lld %+lld (K18 KTLS KTLR KGATE)", (long long)g_key_off[0], (long long)g_key_off[1], (long long)g_key_off[2], (long long)g_key_off[3]);
+}
+static uint64_t key_slot_off(unsigned i) { return (uint64_t)g_key_off[i]; }
+static void tsd_check(void) {
+    pthread_setspecific(g_key18, (void *)0x1234);
+    uint64_t off = *(uint64_t *)(g_mod[0].base + g_mod[0].key_page_off + g_mod[0].key_idx[KEY_K18] * 8);
+    if (*(uint64_t *)(thread_pointer() + off) != 0x1234) die("TSD layout mismatch");
+    pthread_setspecific(g_key18, 0);
+}
+#else
+static uint64_t key_slot_off(unsigned i) { return (uint64_t)key_value(i) * 8; }
 // K slot check: the pthread TSD layout is fixed, slot = tpidrro_el0 + 8*key
 static void tsd_check(void) {
     pthread_setspecific(g_key18, (void *)0x1234);
@@ -47,6 +93,7 @@ static void tsd_check(void) {
     if (((uint64_t *)(base & ~7ull))[off / 8] != 0x1234) die("TSD layout mismatch");
     pthread_setspecific(g_key18, 0);
 }
+#endif
 
 static void build_symhash(module_t *m);
 static void parse_dynamic(module_t *m) {
@@ -354,7 +401,7 @@ static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: key page out of range", m->name);
     uint64_t *page = (uint64_t *)(m->base + m->key_page_off);
     memset(page, 0, m->key_page_size);
-    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = (uint64_t)key_value(i) * 8;
+    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = key_slot_off(i);
     for (int k = 0; k < KEY_N; k++) if (!page[m->key_idx[k]]) die("%s: key page entry %d is 0 (host key not created) -- the game would read TSD slot 0", m->name, k);
     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s key page mprotect", m->name);
     if (m->fps_state_off) install_fps_state(m);
@@ -826,6 +873,9 @@ void load_modules(const char *dir, const char **names, int n) {
         read_layout(m, dir);
     }
     create_keys();
+#ifdef __linux__
+    key_offsets();
+#endif
     jit_layout_init();
     for (int i = 0; i < n; i++) {
         module_t *m = &g_mod[i];

@@ -11,7 +11,13 @@ def STUR(t, n, off): return 0xF8000000 | ((off & 0x1FF) << 12) | (n << 5) | t   
 def LDUR(t, n, off): return 0xF8400000 | ((off & 0x1FF) << 12) | (n << 5) | t   # ldur xt,[xn,#off]
 def LDRX(t, n, imm12=0): return 0xF9400000 | (imm12 << 10) | (n << 5) | t
 def STRX(t, n, imm12=0): return 0xF9000000 | (imm12 << 10) | (n << 5) | t
-def MRS_TPIDRRO(t): return 0xD53BD060 | t
+# The register that holds the host's thread pointer, which the patch code adds a thread slot's offset to (the key page holds the offsets: patch_nso.py, loader.c install_key_page).
+# Apple systems: tpidrro_el0 (the pthread TSD base, slot = key * 8). Linux (DM_TARGET=linux): tpidr_el0, glibc's thread pointer, the offsets found by loader.c key_offsets.
+# The name stays MRS_TPIDRRO: the patch files call it by that name.
+import os as _os
+_TARGET = _os.environ.get('DM_TARGET', 'apple')
+if _TARGET not in ('apple', 'linux'): raise SystemExit(f'[RED] DM_TARGET must be apple or linux, not {_TARGET!r}')
+def MRS_TPIDRRO(t): return (0xD53BD040 if _TARGET == 'linux' else 0xD53BD060) | t
 def ADRP(dd, pc, target):
     imm = ((target & ~0xFFF) - (pc & ~0xFFF)) >> 12; assert -(1 << 20) <= imm < (1 << 20)
     return 0x90000000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5) | dd
