@@ -245,10 +245,10 @@ static void cv_open(cv_dec *d) {   // (re)creates the codec state: a new stream 
     }
     if (d->codec == CV_H264) { if (!d->avc) d->avc = mavc_new(); else mavc_drop(d->avc); if (d->csd_n) mavc_param_sets(d->avc, d->csd, d->csd_n); d->vpx_ok = 1; return; }
     if (d->vpx_ok) vpx_codec_destroy(&d->vpx);
-    // DM_VPX_THREADS: libvpx's threads (default 2; on Linux 4, as the AYN Thor's cores decode a 2560x1440 VP9 movie slower than an Apple chip's: Mario Tennis Fever's intro)
+    // DM_VPX_THREADS: libvpx's threads (default 2; on Linux 8, as the AYN Thor's cores decode a 2560x1440 VP9 movie slower than an Apple chip's: Mario Tennis Fever's intro)
     const char *te = getenv("DM_VPX_THREADS");
 #ifdef __linux__
-    unsigned thr = te && *te ? (unsigned)atoi(te) : 4;
+    unsigned thr = te && *te ? (unsigned)atoi(te) : 8;
 #else
     unsigned thr = te && *te ? (unsigned)atoi(te) : 2;
 #endif
