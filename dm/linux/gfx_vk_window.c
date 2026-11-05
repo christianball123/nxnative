@@ -105,14 +105,19 @@ static int window_init(void) {
     VKI_FUNCS(LI)
 #undef LI
     if (!S.Vulkan_CreateSurface(W.win, W.inst, NULL, &W.surf)) { LOG("[RED] [vk] SDL_Vulkan_CreateSurface: %s", S.GetError()); return 0; }
+    // A real GPU before a software one (llvmpipe, lavapipe: VK_PHYSICAL_DEVICE_TYPE_CPU), which Mesa also installs; DM_VK_GPU=<n> picks by its index in vulkaninfo's list
     uint32_t np = 8; VkPhysicalDevice pd[8]; vkEnumeratePhysicalDevices_(W.inst, &np, pd);
-    for (uint32_t i = 0; i < np && !W.phys; i++) {
-        uint32_t nq = 16; VkQueueFamilyProperties qp[16]; vkGetPhysicalDeviceQueueFamilyProperties_(pd[i], &nq, qp);
-        for (uint32_t k = 0; k < nq; k++) {
-            VkBool32 pres = 0; vkGetPhysicalDeviceSurfaceSupportKHR_(pd[i], k, W.surf, &pres);
-            if ((qp[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) && pres) { W.phys = pd[i]; W.qfam = k; break; }
+    const char *pick = getenv("DM_VK_GPU");
+    for (int pass = 0; pass < 2 && !W.phys; pass++)
+        for (uint32_t i = 0; i < np && !W.phys; i++) {
+            VkPhysicalDeviceProperties dp; vkGetPhysicalDeviceProperties_(pd[i], &dp);
+            if (pick && *pick ? (int)i != atoi(pick) : pass == 0 && dp.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) continue;
+            uint32_t nq = 16; VkQueueFamilyProperties qp[16]; vkGetPhysicalDeviceQueueFamilyProperties_(pd[i], &nq, qp);
+            for (uint32_t k = 0; k < nq; k++) {
+                VkBool32 pres = 0; vkGetPhysicalDeviceSurfaceSupportKHR_(pd[i], k, W.surf, &pres);
+                if ((qp[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) && pres) { W.phys = pd[i]; W.qfam = k; break; }
+            }
         }
-    }
     if (!W.phys) { LOG("[RED] [vk] no GPU can draw to this window"); return 0; }
     VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties_(W.phys, &pp);
     snprintf(W.devname, sizeof W.devname, "%s", pp.deviceName);
