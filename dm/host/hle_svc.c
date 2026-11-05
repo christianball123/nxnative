@@ -151,6 +151,13 @@ static int guest_files_map(const char *dir, size_t chunk, int n, struct statfs *
     const char *sep = dir[0] && dir[strlen(dir) - 1] == '/' ? "" : "/";
     for (int k = 0; ok && k < n; k++) {
         snprintf(path, sizeof path, "%s%sguest-%d-%d.mem", dir, sep, (int)getpid(), k);
+#ifdef __linux__
+        if (!strcmp(dir, "memfd")) {   // Linux's default: a memory file of no folder, RAM like anonymous memory, shared, sized by RAM and swap rather than a tmpfs mount's size
+            snprintf(path, sizeof path, "guest-%d", k);
+            if ((g_gf_tab[k] = memfd_create(path, MFD_CLOEXEC)) < 0) { snprintf(why, nwhy, "memfd_create, errno %d", errno); ok = 0; break; }
+            made++; continue;
+        }
+#endif
         if ((g_gf_tab[k] = guest_file_open(path)) < 0) { snprintf(why, nwhy, "cannot create %s, errno %d", path, errno); ok = 0; break; }
         made++;
         if (unlink(path)) { snprintf(why, nwhy, "cannot unlink %s, errno %d", path, errno); ok = 0; break; }
@@ -159,6 +166,10 @@ static int guest_files_map(const char *dir, size_t chunk, int n, struct statfs *
 #endif
     }
     if (ok && fstatfs(g_gf_tab[0], fs)) { snprintf(why, nwhy, "cannot read their disk's free space, errno %d", errno); ok = 0; }
+#ifdef __linux__
+    if (ok && !strcmp(dir, "memfd")) { g_gf_min_free = 0; memset(fs, 0, sizeof *fs); fs->f_type = 0x01021994; }   // tmpfs with no size: no free-space check (guest_file_thread skips it at 0)
+    else
+#endif
     if (ok) {
 #if TARGET_OS_IPHONE
         uint64_t want = g_gf_min_free;   // under it guest_file_thread would stop the game at once
@@ -196,7 +207,11 @@ static void guest_file_init(void) {
     if ((g_reserve + chunk - 1) / chunk > GF_MAX) chunk = ((g_reserve + GF_MAX - 1) / GF_MAX + 0xfffff) & ~(size_t)0xfffff;
     int n = (int)((g_reserve + chunk - 1) / chunk); char dir[1024] = "", why[1400]; struct statfs fs;
     if (d && *d) snprintf(dir, sizeof dir, "%s", d);
+#ifdef __linux__
+    else snprintf(dir, sizeof dir, "memfd");   // DM_GUEST_FILE_DIR=<folder> puts them in files there instead
+#else
     else if (!confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir)) { LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: no temporary folder, errno %d)", errno); return; }
+#endif
     if (!guest_files_map(dir, chunk, n, &fs, why, sizeof why)) { LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: %s)", why); return; }
     g_gf_n = n;
     LOG("[mem] guest memory: %d files of %.2f GB in %s (unlinked, sparse, shared), %.2f GB in all, on the %s volume, %.1f GB free on it", n, chunk / G, dir, g_reserve / G, DM_FSTYPENAME(&fs), (double)fs.f_bavail * fs.f_bsize / G);
