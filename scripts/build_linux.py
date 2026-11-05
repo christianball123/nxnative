@@ -39,10 +39,6 @@ def check_tools():
         import capstone
         if capstone.cs_version()[0] != 5: die(f'capstone {capstone.__version__} found; the rewriter needs 5.x: {sys.executable} -m pip install --user "capstone>=5,<6"')
     except ImportError: die(f'capstone is not installed: {sys.executable} -m pip install --user "capstone>=5,<6"')
-    try: from compression import zstd   # noqa: F401
-    except ImportError:
-        try: from backports import zstd   # noqa: F401
-        except ImportError: die(f'no zstd module: use Python 3.14, or {sys.executable} -m pip install --user backports.zstd')
     for t in ('clang', 'make'):
         if not shutil.which(t): die(f'{t} is not installed (inside the toolbox: sudo dnf install -y clang lld make)')
 
@@ -50,6 +46,7 @@ def check_tools():
 def unpack(game, version, work):
     import pack_nup, pack_dump
     if game.is_file() and pack_nup.is_nup(game) or game.is_dir() and any(p.suffix.lower() == '.nup' for p in game.iterdir()):
+        if pack_nup.zstd is None: die(f'reading a .nup needs the zstd module: use Python 3.14, or {sys.executable} -m pip install --user backports.zstd')
         nup = game if game.is_file() else next(p for p in game.iterdir() if p.suffix.lower() == '.nup')
         with pack_nup.Nup(nup) as n:
             app, base, vers, dlc = pack_nup.scan(n)
