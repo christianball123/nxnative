@@ -254,6 +254,12 @@ static void cv_open(cv_dec *d) {   // (re)creates the codec state: a new stream 
 #endif
     vpx_codec_dec_cfg_t cfg = {.threads = thr ? thr : 1, .w = d->w, .h = d->h};
     d->vpx_ok = vpx_codec_dec_init(&d->vpx, d->codec == CV_VP8 ? vpx_codec_vp8_dx() : vpx_codec_vp9_dx(), &cfg, 0) == VPX_CODEC_OK;
+#ifdef __linux__
+    // VP9 row multithreading and the faster loop filter: a key frame decodes on one thread per tile column otherwise, and on the AYN Thor Mario Tennis Fever's 2560x1440 intro took
+    // 30-41 ms for those once a second (7-9 ms on average): the movie fell behind at each, and its player paused the sound to wait (DM_VPX_ROW_MT=0 turns it off)
+    const char *rm = getenv("DM_VPX_ROW_MT");
+    if (d->vpx_ok && d->codec == CV_VP9 && !(rm && *rm == '0')) { vpx_codec_control(&d->vpx, VP9D_SET_ROW_MT, 1); vpx_codec_control(&d->vpx, VP9D_SET_LOOP_FILTER_OPT, 1); }
+#endif
     if (!d->vpx_ok) LOG("[RED] nn::codec %s decoder: libvpx init failed", k_cv_name[d->codec]);
 }
 static Result cv_dec_init(void *t, int codec, uint16_t w, uint16_t h, uint32_t in, uint32_t out, const void *csd, uint64_t csd_n) {
