@@ -16,7 +16,7 @@
 # Then run the script it prints, and send the log (<work>/linux/log.txt).
 #
 # Needs: python3 (3.14, or pip install backports.zstd), capstone 5 (pip install 'capstone>=5,<6'), clang, lld, make. On ArmadaOS do this inside a toolbox:
-#   toolbox create nxnative && toolbox enter nxnative && sudo dnf install -y clang lld make python3-pip git && pip install --user 'capstone>=5,<6'
+#   toolbox create nxnative && toolbox enter nxnative && sudo dnf install -y clang lld make python3-pip git && pip install --user 'capstone>=5,<6' lz4 zbic
 import argparse, os, platform, shutil, subprocess, sys
 from pathlib import Path
 
@@ -39,6 +39,8 @@ def check_tools():
         import capstone
         if capstone.cs_version()[0] != 5: die(f'capstone {capstone.__version__} found; the rewriter needs 5.x: {sys.executable} -m pip install --user "capstone>=5,<6"')
     except ImportError: die(f'capstone is not installed: {sys.executable} -m pip install --user "capstone>=5,<6"')
+    try: import lz4.block   # noqa: F401  (the code modules' LZ4 segments)
+    except ImportError: die(f'lz4 is not installed: {sys.executable} -m pip install --user lz4 zbic')
     for t in ('clang', 'make'):
         if not shutil.which(t): die(f'{t} is not installed (inside the toolbox: sudo dnf install -y clang lld make)')
 

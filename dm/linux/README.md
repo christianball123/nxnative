@@ -20,7 +20,7 @@ On the Thor, inside a toolbox (ArmadaOS is read-only):
 ```
 toolbox create nxnative && toolbox enter nxnative
 sudo dnf install -y clang lld make git python3-pip
-pip install --user 'capstone>=5,<6'
+pip install --user 'capstone>=5,<6' lz4 zbic
 git clone -b linux-arm64 https://github.com/christianball123/nxnative && cd nxnative
 python3 scripts/build_linux.py ~/Games/MarioTennisFever.nup
 ```
