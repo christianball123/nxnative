@@ -106,7 +106,13 @@ static void *guest_file_thread(void *arg) {
     return NULL;
 }
 // Whether the guest goes in files: DM_GUEST_FILE when it is set, otherwise when the game's memory pool does not fit the room to the memory limit (room 0: no limit known, as on the Mac)
+#ifdef __linux__
+// Linux: on unless DM_GUEST_FILE=0. Only shared pages can be mapped a second time (mremap of a shared mapping: the virtual pools' MapVirtual, the cheats' writable view), and the
+// files give the guest shared pages; in /dev/shm (tmpfs) they are RAM, as anonymous memory is (dm/linux/compat.c dm_confstr)
+static int guest_file_wanted(const char *e, uint64_t pool, uint64_t room) { (void)pool; (void)room; return !(e && *e) || atoi(e) > 0; }
+#else
 static int guest_file_wanted(const char *e, uint64_t pool, uint64_t room) { return e && *e ? atoi(e) > 0 : room && pool > room; }
+#endif
 // A new file of this process's own, never a link's target (O_EXCL, O_NOFOLLOW): one a dead process with the same number left is replaced
 static int guest_file_open(const char *path) {
     const int fl = O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC;
@@ -181,7 +187,11 @@ static void guest_file_init(void) {
     int want = guest_file_wanted(e, DM_GAME_APP_POOL, 0);
 #endif
     if (!want) return;
+#ifdef __linux__
+    g_gf_min_free = mf && *mf ? env_size("DM_GUEST_FILE_MIN_FREE", 0, 0x100000) : (uint64_t)1 << 30;   // tmpfs: its free space is RAM, which the game's own pages take as it runs
+#else
     g_gf_min_free = mf && *mf ? env_size("DM_GUEST_FILE_MIN_FREE", 0, 0x100000) : (uint64_t)5 << 30;
+#endif
     size_t chunk = env_size("DM_GUEST_FILE_CHUNK", (size_t)64 << 20, 0x100000); if (!chunk) chunk = (size_t)1 << 30;
     if ((g_reserve + chunk - 1) / chunk > GF_MAX) chunk = ((g_reserve + GF_MAX - 1) / GF_MAX + 0xfffff) & ~(size_t)0xfffff;
     int n = (int)((g_reserve + chunk - 1) / chunk); char dir[1024] = "", why[1400]; struct statfs fs;
