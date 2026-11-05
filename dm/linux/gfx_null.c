@@ -4,6 +4,7 @@
 #include "dm.h"
 #include "../gfx/nvn/nvn_obj.h"
 #include "front.h"
+#include "gfx_vk.h"
 #include <stdatomic.h>
 #include <time.h>
 
@@ -23,11 +24,13 @@ static uint64_t g_shown_until, g_first_ns, g_last_present_ns;
 static double g_times[64];
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     (void)t; (void)crop;
+    if (vkw_wanted()) vkw_present(atomic_load(&g_presents) + 1);   // the window's FIFO swapchain paces the game (the display's vsync), as the Switch's display does
+    int win = vkw_active();
     pthread_mutex_lock(&g_pmu);
     uint64_t now = now_mono();
-    if (g_shown_until > now) { struct timespec ts = {(time_t)(g_shown_until / 1000000000ull), (long)(g_shown_until % 1000000000ull)}; pthread_mutex_unlock(&g_pmu); clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL); pthread_mutex_lock(&g_pmu); now = now_mono(); }
+    if (!win && g_shown_until > now) { struct timespec ts = {(time_t)(g_shown_until / 1000000000ull), (long)(g_shown_until % 1000000000ull)}; pthread_mutex_unlock(&g_pmu); clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL); pthread_mutex_lock(&g_pmu); now = now_mono(); }
     if (period_s <= 0) period_s = 1.0 / 60;
-    g_shown_until = now + (uint64_t)(period_s * 1e9);
+    g_shown_until = win ? 0 : now + (uint64_t)(period_s * 1e9);
     if (!g_first_ns) g_first_ns = now;
     uint64_t n = atomic_fetch_add(&g_presents, 1) + 1;
     g_times[n % 64] = (double)(now - g_first_ns) / 1e9;
@@ -43,8 +46,8 @@ int mtl_fps_target(void) {
     static int env = -2; if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; }
     int nvn_game_fps(void); int g = nvn_game_fps(); return env > 0 ? env : g == 30 || g == 120 ? g : 60;
 }
-int mtl_display_hz(void) { return 0; }   // no window
-int mtl_has_window(void) { return 0; }
+int mtl_display_hz(void) { return vkw_active() ? 60 : 0; }
+int mtl_has_window(void) { return vkw_active(); }
 int mtl_link_active(void) { return 0; }
 int mtl_link_rate(void) { return 60; }
 int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) { (void)timeout_ns; struct timespec t = {0, (long)(vsyncs > 0 ? vsyncs : 1) * 16666667L}; nanosleep(&t, NULL); return 1; }
@@ -54,7 +57,7 @@ uint64_t mtl_snap_acquire_wait(void) { return 0; }
 void dm_gfx_shot_at(long k, const char *path) { (void)k; (void)path; LOG("[null gfx] screenshot requested: the null graphics device has no picture"); }
 
 // The front end: headless (front_mac.m runs the guest on the main thread when DM_WINDOW is not set, which is all this does). The window comes with the Vulkan backend
-void front_run(void (*guest)(void)) { if (getenv("DM_WINDOW")) LOG("[RED] front end: no window on Linux yet (null graphics device): running headless"); guest(); }
+void front_run(void (*guest)(void)) { guest(); }   // the window (DM_WINDOW=1) is made by the first present (gfx_vk_window.c)
 int front_screen_max_fps(void) { return 60; }
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
     (void)title; (void)sub; (void)guide; (void)max_chars;
