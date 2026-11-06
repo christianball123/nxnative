@@ -99,7 +99,37 @@ void mtl_tex_cpu_written(const tex_t *t) {
 int mtl_tex_gpu_owned(uint64_t serial) { pthread_mutex_lock(&g_tex_mu); vtex *v = tex_slot(serial, 0); int r = v && v->gpu; pthread_mutex_unlock(&g_tex_mu); return r; }
 
 // ---------------------------------------------------------------- texture contents from guest memory
-static uint64_t g_up_tex, g_up_bytes, g_up_fail;
+static uint64_t g_up_tex, g_up_bytes, g_up_fail, g_reup;
+// Textures uploaded from guest memory and small enough to watch: the CPU may keep writing them without telling NVN (a font's glyph cache gets letters as text first needs them),
+// so each one's storage is checksummed again now and then (a budget per submission, round robin) and re-uploaded at its next use when the checksum changed
+#define WATCH_MAX_BYTES (8u << 20)
+#define WATCH_BUDGET (24u << 20)
+typedef struct { uint64_t serial; const uint8_t *mem; uint64_t size, sum; } watched;
+static watched *g_wt; static int g_nwt, g_cwt, g_wt_cur;
+static uint64_t storage_sum(const uint8_t *p, uint64_t n) {
+    uint64_t a = 0x9E3779B97F4A7C15ull, b = 0, w; uint64_t i = 0;
+    for (; i + 8 <= n; i += 8) { memcpy(&w, p + i, 8); a = (a ^ w) * 0x100000001B3ull; b += w; }
+    for (; i < n; i++) a = (a ^ p[i]) * 0x100000001B3ull;
+    return a ^ (b * 0xff51afd7ed558ccdull);
+}
+static void watch_add(const tex_t *t, uint64_t size) {
+    if (!size || size > WATCH_MAX_BYTES) return;
+    for (int i = 0; i < g_nwt; i++) if (g_wt[i].serial == t->serial) { g_wt[i].mem = t->mem; g_wt[i].size = size; g_wt[i].sum = storage_sum(t->mem, size); return; }
+    if (g_nwt == g_cwt) { g_cwt = g_cwt ? 2 * g_cwt : 64; g_wt = realloc(g_wt, g_cwt * sizeof *g_wt); }
+    g_wt[g_nwt++] = (watched){t->serial, t->mem, size, storage_sum(t->mem, size)};
+}
+static void watch_poll(void) {
+    uint64_t done = 0;
+    for (int k = 0; k < g_nwt && done < WATCH_BUDGET; k++) {
+        if (g_wt_cur >= g_nwt) g_wt_cur = 0;
+        watched *w = &g_wt[g_wt_cur];
+        pthread_mutex_lock(&g_tex_mu); vtex *v = tex_slot(w->serial, 0); int alive = v && v->img && !v->gpu; pthread_mutex_unlock(&g_tex_mu);
+        if (!alive) { g_wt[g_wt_cur] = g_wt[--g_nwt]; continue; }   // released, or the GPU writes it now
+        uint64_t s = storage_sum(w->mem, w->size); done += w->size;
+        if (s != w->sum) { w->sum = s; pthread_mutex_lock(&g_tex_mu); if (v->uploaded) { v->uploaded = 0; g_reup++; } pthread_mutex_unlock(&g_tex_mu); }
+        g_wt_cur++;
+    }
+}
 static void tex_fill(vtex *v, const tex_t *t) {
     if (!v || v->gpu || v->uploaded || !t || !t->mem || v->samples > 1) return;
     v->uploaded = 1;
@@ -131,6 +161,8 @@ static void tex_fill(vtex *v, const tex_t *t) {
     vkCmdCopyBufferToImage_(g_cb, s->b, v->img, VK_IMAGE_LAYOUT_GENERAL, nb, bic);
     full_barrier();
     g_up_tex++; g_up_bytes += total;
+    nvn_texlayout L = t->L; if (!L.size) nvn_tex_layout(&t->d, &L);
+    watch_add(t, L.size);
 }
 
 // ---------------------------------------------------------------- samplers
@@ -886,6 +918,7 @@ static void dispatch_op(const p_dispatch *d) {
 
 // ---------------------------------------------------------------- the submission's end: the ring and descriptor pools start over
 static void draw_submitted(void) {
+    watch_poll();
     for (int i = 0; i < g_nwb; i++) { memcpy((void *)(uintptr_t)g_wb[i].addr, RG.p + g_wb[i].off, g_wb[i].size); g_wb_bytes += g_wb[i].size; }
     g_nwb = 0;
     RG.used = 0; DZ.support_off = 0;
@@ -894,8 +927,8 @@ static void draw_submitted(void) {
     g_dp_cur = 0;
 }
 static void draw_summary(char *out, size_t n) {
-    int o = snprintf(out, n, "drawn %llu (%llu of them quads), dispatched %llu, pipelines %llu, textures uploaded %llu (%.0f MB, %llu failed)", (unsigned long long)g_drawn, (unsigned long long)g_quads, (unsigned long long)g_disp_done,
-                     (unsigned long long)g_pipes, (unsigned long long)g_up_tex, g_up_bytes / 1048576.0, (unsigned long long)g_up_fail);
+    int o = snprintf(out, n, "drawn %llu (%llu of them quads), dispatched %llu, pipelines %llu, textures uploaded %llu (%.0f MB, %llu failed, %llu again after CPU writes, %d watched)", (unsigned long long)g_drawn, (unsigned long long)g_quads, (unsigned long long)g_disp_done,
+                     (unsigned long long)g_pipes, (unsigned long long)g_up_tex, g_up_bytes / 1048576.0, (unsigned long long)g_up_fail, (unsigned long long)g_reup, g_nwt);
     for (int i = 0; i < SK_N && o < (int)n; i++) if (g_skip[i]) o += snprintf(out + o, n - o, "; skipped (%s) %llu", k_sk[i], (unsigned long long)g_skip[i]);
     if (g_tex_missing && o < (int)n) o += snprintf(out + o, n - o, "; texture bindings without a usable view %llu", (unsigned long long)g_tex_missing);
     if (g_unsup_sbuf_ubo && o < (int)n) snprintf(out + o, n - o, "; storage buffers addressed through uniforms (not bound) %llu", (unsigned long long)g_unsup_sbuf_ubo);
