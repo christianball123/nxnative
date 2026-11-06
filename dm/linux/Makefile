@@ -51,7 +51,7 @@ $(B)/asm/%.S: $(G)/nvn/%.S tools/asm_elf.py
 	@mkdir -p $(dir $@); python3 tools/asm_elf.py $< $@
 $(B)/asm/%.o: $(B)/asm/%.S
 	$(CC) $(TARGET) -c $< -o $@
-$(B)/obj/%.o: %.c $(GAME_H) $(wildcard include/*.h include/*/*.h) $(H)/dm.h
+$(B)/obj/%.o: %.c $(GAME_H) $(wildcard include/*.h include/*/*.h *.inc gfx_vk.h) $(H)/dm.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(INC) -c $< -o $@
 $(B)/vpx/%.o: $(VPX)/%.c
