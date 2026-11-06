@@ -578,7 +578,18 @@ static VkPipeline pipe_make(const vks_prog *pr, const pkey *k) {
     if (!g_pcache) { VkPipelineCacheCreateInfo pc = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, 0, NULL}; vkCreatePipelineCache_(VK.dev, &pc, NULL, &g_pcache); }
     VkPipeline p = VK_NULL_HANDLE;
     VkResult r = vkCreateGraphicsPipelines_(VK.dev, g_pcache, 1, &ci, NULL, &p);
-    if (r) { static int n; if (n++ < 10) LOG("[RED] [vk] a graphics pipeline was refused (%d): shaders %016llx / %016llx", r, pr->st[VKS_VS] ? (unsigned long long)pr->st[VKS_VS]->key : 0ull, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull); return VK_NULL_HANDLE; }
+    if (r) {
+        static int n; if (n++ < 10) {
+            char va_s[256] = ""; int o = 0;
+            for (uint32_t i = 0; i < k->nva && o < 220; i++) o += snprintf(va_s + o, sizeof va_s - o, " %u:%u@%u/b%u", k->va[i].loc, k->va[i].fmt, k->va[i].offset, k->va[i].binding);
+            LOG("[RED] [vk] a graphics pipeline was refused (%d): shaders %016llx / %016llx%s; colour formats %d %d %d %d (%u), depth format %d, %u samples, topology %u, cull %u mode %u, "
+                "depth test %u write %u func %u bias %u clamp %u, stencil %u, blend %#x mask %#x, a2c %u, discard %u, GL depth %u; inputs%s", r,
+                pr->st[VKS_VS] ? (unsigned long long)pr->st[VKS_VS]->key : 0ull, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull, pr->st[VKS_GS] ? " +geometry" : "",
+                k->cf[0], k->cf[1], k->cf[2], k->cf[3], k->ncol, k->df, k->samples, k->topo, (unsigned)k->poly.cull, (unsigned)k->poly.mode, (unsigned)k->ds.dt, (unsigned)k->ds.dw, (unsigned)k->ds.df,
+                (unsigned)k->poly.offset_en, k->depth_clamp, (unsigned)k->ds.st, k->blend_en, k->chmask, k->a2c, k->rast_discard, k->depth_gl, va_s);
+        }
+        return VK_NULL_HANDLE;
+    }
     g_pipes++;
     return p;
 }
