@@ -83,7 +83,8 @@ static struct {
     VkSwapchainKHR sc; VkFormat fmt; VkExtent2D ext; uint32_t nimg; VkImage img[SWAP_MAX];
     VkSemaphore acquired[SWAP_MAX], done[SWAP_MAX]; VkCommandPool pool; VkCommandBuffer cb[SWAP_MAX]; VkFence fence[SWAP_MAX]; uint32_t slot;
     int ok, failed, resized; uint64_t frames; double t0; char devname[256]; int ext_host_mem, ext_push, ext_dcc; int want_srgb, srgb;
-    VkImage mid; VkDeviceMemory mid_mem; VkExtent2D mid_ext; VkFormat mid_fmt;   // an sRGB image of the window's size (sRGB game images when the window has no sRGB format)
+    VkImage mid; VkDeviceMemory mid_mem; VkExtent2D mid_ext; VkFormat mid_fmt;
+    VkImage noa; VkDeviceMemory noa_mem; VkExtent2D noa_ext; int noa_bad;   // the game's picture without its alpha (noa_image)   // an sRGB image of the window's size (sRGB game images when the window has no sRGB format)
 } W;
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
@@ -109,7 +110,9 @@ static int swapchain_make(void) {
     if (old) { vkDeviceWaitIdle_(VK.dev); vkDestroySwapchainKHR_(VK.dev, old, NULL); }
     if (r) { LOG("[RED] [vk] vkCreateSwapchainKHR %dx%d failed (%d)", e.width, e.height, r); W.sc = VK_NULL_HANDLE; return 0; }
     W.fmt = pick.format; W.ext = e; W.nimg = SWAP_MAX; vkGetSwapchainImagesKHR_(VK.dev, W.sc, &W.nimg, W.img);
-    LOG("[vk] swapchain %ux%u, %u images, format %d%s, FIFO (vsync)", e.width, e.height, W.nimg, pick.format, W.srgb ? " (sRGB, as the game's image)" : "");
+    LOG("[vk] swapchain %ux%u, %u images, format %d%s, FIFO (vsync); window alpha modes %#x, using %#x (1 = opaque)", e.width, e.height, W.nimg, pick.format, W.srgb ? " (sRGB, as the game's image)" : "",
+        cap.supportedCompositeAlpha, ci.compositeAlpha);
+    { static int once; if (!once++) { const char *vd = getenv("SDL_VIDEODRIVER"), *wd = getenv("WAYLAND_DISPLAY"), *xd = getenv("DISPLAY"); LOG("[vk] window system: SDL_VIDEODRIVER=%s WAYLAND_DISPLAY=%s DISPLAY=%s", vd ? vd : "(unset)", wd ? wd : "(unset)", xd ? xd : "(unset)"); } }
     return 1;
 }
 
@@ -367,6 +370,38 @@ int vkw_init(void) {
     return W.ok;
 }
 
+// The game's picture without its alpha, the window's size: the game leaves alpha 0 where its 3D scene is (only its menus write alpha), and a desktop that
+// blends windows by their alpha shows those parts as black (or see-through). A blit into a format with no alpha channel and on into the window's image gives
+// alpha 1 everywhere. B10G11R11 float keeps the colours (in linear light, the blits decode and encode sRGB)
+static VkImage noa_image(void) {
+    if (W.noa_bad) return VK_NULL_HANDLE;
+    if (W.noa && W.noa_ext.width == W.ext.width && W.noa_ext.height == W.ext.height) return W.noa;
+    const VkFormat f = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties_(VK.phys, f, &fp);
+    VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    if ((fp.optimalTilingFeatures & need) != need) { W.noa_bad = 1; LOG("[vk] B10G11R11 cannot be blitted here: the game's alpha goes to the window as it is"); return VK_NULL_HANDLE; }
+    if (W.noa) { vkDeviceWaitIdle_(VK.dev); vkDestroyImage_(VK.dev, W.noa, NULL); vkFreeMemory_(VK.dev, W.noa_mem, NULL); W.noa = VK_NULL_HANDLE; }
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, f, {W.ext.width, W.ext.height, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    if (vkCreateImage_(VK.dev, &ci, NULL, &W.noa)) { W.noa = VK_NULL_HANDLE; W.noa_bad = 1; return VK_NULL_HANDLE; }
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements_(VK.dev, W.noa, &mr);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+    if (ai.memoryTypeIndex == ~0u || vkAllocateMemory_(VK.dev, &ai, NULL, &W.noa_mem)) { vkDestroyImage_(VK.dev, W.noa, NULL); W.noa = VK_NULL_HANDLE; W.noa_bad = 1; return VK_NULL_HANDLE; }
+    vkBindImageMemory_(VK.dev, W.noa, W.noa_mem, 0);
+    VkCommandBuffer cb = W.cb[(W.slot + 1) % W.nimg];
+    vkWaitForFences_(VK.dev, 1, &W.fence[(W.slot + 1) % W.nimg], VK_TRUE, UINT64_MAX);
+    vkResetCommandBuffer_(cb, 0);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+    vkBeginCommandBuffer_(cb, &bi);
+    barrier(cb, W.noa, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    vkEndCommandBuffer_(cb);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL};
+    vkQueueSubmit_(VK.q, 1, &si, VK_NULL_HANDLE); vkQueueWaitIdle_(VK.q);
+    W.noa_ext = W.ext;
+    LOG("[vk] the game's picture goes to the window without its alpha, through a %ux%u B10G11R11 image", W.ext.width, W.ext.height);
+    return W.noa;
+}
+
 // The sRGB image the window's size (made again when the window changes size or format): its format is the window's with sRGB encoding, so a raw copy keeps the channel order
 static VkImage mid_image(void) {
     VkFormat f = W.fmt == VK_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_SRGB : W.fmt == VK_FORMAT_R8G8B8A8_UNORM ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_UNDEFINED;
@@ -425,7 +460,23 @@ void vkw_present(uint64_t n, VkImage gimg, uint32_t gw, uint32_t gh, const int c
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
         vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         VkImage mid = W.want_srgb && !W.srgb ? mid_image() : VK_NULL_HANDLE;
-        if (mid) {
+        static int noa_on = -1; if (noa_on < 0) { const char *e = getenv("DM_VK_KEEP_ALPHA"); noa_on = !(e && *e == '1'); }
+        VkImage noa = noa_on ? noa_image() : VK_NULL_HANDLE;
+        if (noa) {
+            // the game's picture into the alpha-less image, then the whole of it on: into the window's image, or the sRGB image first (see mid_image)
+            VkImageSubresourceRange mr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage_(cb, noa, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &mr);
+            vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            vkCmdBlitImage_(cb, gimg, VK_IMAGE_LAYOUT_GENERAL, noa, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_LINEAR);
+            vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            VkImageBlit whole = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int)W.ext.width, (int)W.ext.height, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int)W.ext.width, (int)W.ext.height, 1}}};
+            if (mid) {
+                vkCmdBlitImage_(cb, noa, VK_IMAGE_LAYOUT_GENERAL, mid, VK_IMAGE_LAYOUT_GENERAL, 1, &whole, VK_FILTER_NEAREST);
+                vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+                VkImageCopy ic = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {W.ext.width, W.ext.height, 1}};
+                vkCmdCopyImage_(cb, mid, VK_IMAGE_LAYOUT_GENERAL, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+            } else vkCmdBlitImage_(cb, noa, VK_IMAGE_LAYOUT_GENERAL, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &whole, VK_FILTER_NEAREST);
+        } else if (mid) {
             // An sRGB game image and a window without an sRGB format: the blit (which filters in linear light) goes into an sRGB image of the window's size, encoding
             // the colours again, and those bytes are copied as they are into the window's image, which shows them as sRGB
             VkImageSubresourceRange mr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
