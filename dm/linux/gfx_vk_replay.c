@@ -66,7 +66,7 @@ struct vview;
 // linear: a LINEAR texture, which the CPU and GPU may both write: its guest memory stays the reference (GPU writes are read back into it after each submission: wrote)
 // tracked: its guest pages are write-protected since stamp (nvn_dirty.c), so a CPU write since its upload is seen (prep_tex) and it is uploaded again
 typedef struct { uint64_t serial; VkImage img; VkDeviceMemory mem; VkFormat fmt; uint32_t w, h, d, layers, levels, samples; int is3d, is1d, bad, gpu, uploaded, storage; struct vview *views;
-                 int linear, wrote, tracked; uint8_t *gmem; uint64_t gsize, stamp; const void *span; uint32_t stride, rowbytes, rows; uint64_t bytes; } vtex;
+                 int linear, wrote, tracked, mutable_fmt, cube; uint8_t *gmem; uint64_t gsize, stamp; const void *span; uint32_t stride, rowbytes, rows; uint64_t bytes; } vtex;
 static vtex **g_lw; static int g_nlw, g_clw;   // linear textures the GPU wrote in this submission
 static inline void gpu_wrote(vtex *v) {
     v->gpu = 1; v->uploaded = 1;   // the GPU's content is the newest now: nothing from guest memory goes over it (a linear texture's is read back at the submission's end)
@@ -112,6 +112,13 @@ static vtex *tex_get(const tex_t *t) {
     if (!(ff & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))) ci.usage &= ~(VkImageUsageFlags)(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
     if (!(ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) ci.usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_SAMPLED_BIT;
     if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && samples == 1) { ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT; v->storage = 1; }   // shader images (nvnCommandBufferBindImage)
+    // A texture registered as an image: a shader may read or write its texels as the other numeric kind (an R32_UINT target written with floats, no answer table to say
+    // otherwise): its views may take another format of the same size (gfx_vk_draw.inc tex_view), and a usage only that format has
+    if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !depth && !(f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK)) {
+        ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT; v->mutable_fmt = 1;
+        if (samples == 1 && !v->storage) { ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT; v->storage = 2; }   // storage through a view of another format (an sRGB target written as UNORM)
+    }
+    if (ci.imageType == VK_IMAGE_TYPE_2D && ci.arrayLayers >= 6 && ci.extent.width == ci.extent.height && samples == 1) { ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT; v->cube = 1; }
     if (samples > 1) ci.mipLevels = 1;
     if (!ff) { v->bad = 1; pthread_mutex_unlock(&g_tex_mu); static int once2; if (!once2++) LOG("[RED] [vk] the GPU has no support for Vulkan format %d (NVN %#x): such textures are skipped (BC formats on Adreno need a CPU decode)", f, t->d.format); return NULL; }
     VkResult r = vkCreateImage_(VK.dev, &ci, NULL, &v->img);
@@ -289,6 +296,13 @@ static void copy_t2b(const p_copy_t2t *c) {   // T2B reuses p_copy_t2t: src hold
     size_t wb = (size_t)((r->width + bw - 1) / bw) * bpb, rows = (size_t)(r->height + bh - 1) / bh;
     size_t row = R.copy_stride ? (size_t)R.copy_stride : wb; int nz = r->depth > 0 ? r->depth : 1;
     if (nz > 1) { static int w; if (!w++) LOG("[vk] a texture → buffer copy of %d layers copied the first only (stage B)", nz); }
+    {   // inside the image: a region past its level's extent or its layers is refused by Vulkan (and reads nothing on the Switch)
+        uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1;
+        if (r->xoffset < 0 || r->yoffset < 0 || (uint32_t)(r->xoffset + r->width) > lw || (uint32_t)(r->yoffset + r->height) > lh || (!v->is3d && l0 + (uint32_t)r->zoffset >= v->layers)) {
+            static int w2; if (w2++ < 5) LOG("[vk] a texture → buffer copy outside the texture (%d,%d %dx%d layer %d of a %ux%u level, %u layers) was skipped", r->xoffset, r->yoffset, r->width, r->height, r->zoffset, lw, lh, v->layers);
+            return;
+        }
+    }
     stage_t *s = stage_new(wb * rows); if (!s) return;
     s->rb_dst = (uint8_t *)(uintptr_t)dst; s->rb_row = row; s->rb_src_row = wb; s->rb_rows = rows; s->rb_n = wb;
     VkBufferImageCopy bic = {0, 0, 0, {fmt_aspects(v->fmt) & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT), lv, v->is3d ? 0 : l0 + (uint32_t)r->zoffset, 1},

@@ -186,17 +186,42 @@ static VkSampler sampler_for(const samp_par *p) {
 }
 
 // ---------------------------------------------------------------- image views (per texture, by what the binding asks: view type, levels, layers, swizzle, aspect)
+// The same-size format whose texels read as the other numeric kind (integers ↔ floats), for a view a shader takes of a texture with MUTABLE_FORMAT; 0 = none
+static VkFormat other_kind(VkFormat f, int want_int) {
+    static const VkFormat pairs[][3] = {   // float / normalized, unsigned, signed
+        {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT}, {VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_SINT},
+        {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT}, {VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16_UINT, VK_FORMAT_R16_SINT},
+        {VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_SINT}, {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_UINT, VK_FORMAT_R16G16B16A16_SINT},
+        {VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT}, {VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_UINT, VK_FORMAT_R8G8_SINT},
+        {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_SINT}, {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2B10G10R10_UINT_PACK32, 0},
+        {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_SINT}, {VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT},
+        {VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UINT, VK_FORMAT_R16_SINT}, {VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_SINT},
+        {VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_UINT, VK_FORMAT_R16G16B16A16_SINT}, {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UINT, 0}};
+    for (size_t i = 0; i < sizeof pairs / sizeof *pairs; i++) {
+        if (pairs[i][0] == f) return want_int ? pairs[i][1] : 0;
+        if (pairs[i][1] == f || (pairs[i][2] && pairs[i][2] == f)) return want_int ? 0 : pairs[i][0];
+    }
+    return 0;
+}
+// A storage view's format: sRGB formats cannot be shader images, their UNORM twin can (the shader writes encoded values, as NVN's image view of an sRGB texture does)
+static VkFormat storage_twin(VkFormat f) {
+    switch (f) { case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM; case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM; case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32; default: return f; }
+}
 typedef struct vview { struct vview *next; VkImageViewType type; VkFormat fmt; uint32_t lv, nl, l0, nlay; VkComponentMapping sw; VkImageAspectFlags asp; int storage; VkImageView view; } vview;
 static void vk_views_drop(vtex *v) { for (vview *w = v->views, *n; w; w = n) { n = w->next; vkDestroyImageView_(VK.dev, w->view, NULL); free(w); } v->views = NULL; }
+static VkImageView view_get_fmt(vtex *v, VkFormat fmt, VkImageViewType type, uint32_t lv, uint32_t nl, uint32_t l0, uint32_t nlay, VkComponentMapping sw, VkImageAspectFlags asp, int storage);
 static VkImageView view_get(vtex *v, VkImageViewType type, uint32_t lv, uint32_t nl, uint32_t l0, uint32_t nlay, VkComponentMapping sw, VkImageAspectFlags asp, int storage) {
+    return view_get_fmt(v, v->fmt, type, lv, nl, l0, nlay, sw, asp, storage);
+}
+static VkImageView view_get_fmt(vtex *v, VkFormat fmt, VkImageViewType type, uint32_t lv, uint32_t nl, uint32_t l0, uint32_t nlay, VkComponentMapping sw, VkImageAspectFlags asp, int storage) {
     for (vview *w = v->views; w; w = w->next)
-        if (w->type == type && w->lv == lv && w->nl == nl && w->l0 == l0 && w->nlay == nlay && !memcmp(&w->sw, &sw, sizeof sw) && w->asp == asp && w->storage == storage) return w->view;
+        if (w->type == type && w->fmt == fmt && w->lv == lv && w->nl == nl && w->l0 == l0 && w->nlay == nlay && !memcmp(&w->sw, &sw, sizeof sw) && w->asp == asp && w->storage == storage) return w->view;
     VkImageViewUsageCreateInfo use = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
-    VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &use, 0, v->img, type, v->fmt, sw, {asp, lv, nl, l0, nlay}};
+    VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &use, 0, v->img, type, fmt, sw, {asp, lv, nl, l0, nlay}};
     if (storage == 2) { use.usage = fmt_depth(v->fmt) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; }   // 2: an attachment view
     VkImageView iv = VK_NULL_HANDLE;
     if (vkCreateImageView_(VK.dev, &ci, NULL, &iv)) return VK_NULL_HANDLE;
-    vview *w = calloc(1, sizeof *w); *w = (vview){v->views, type, v->fmt, lv, nl, l0, nlay, sw, asp, storage, iv}; v->views = w;
+    vview *w = calloc(1, sizeof *w); *w = (vview){v->views, type, fmt, lv, nl, l0, nlay, sw, asp, storage, iv}; v->views = w;
     return iv;
 }
 // The view a shader binding takes of a texture: its type from the shader's image (SPIR-V Dim, arrayed, multisampled), clamped to what the texture has
@@ -209,7 +234,8 @@ static VkImageView tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_v
     case 0: if (!v->is1d) return VK_NULL_HANDLE; type = arr ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D; break;
     case 1: case 4: if (v->is1d || v->is3d) return VK_NULL_HANDLE; type = arr ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D; break;
     case 2: if (!v->is3d) return VK_NULL_HANDLE; type = VK_IMAGE_VIEW_TYPE_3D; l0 = 0; nlay = 1; break;
-    case 3: if (v->layers < 6) return VK_NULL_HANDLE; type = arr ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE; if (nlay < 6) { l0 = 0; nlay = 6; } if (!arr) nlay = 6; else nlay -= nlay % 6; break;
+    case 3: if (!v->cube || v->layers < 6) return VK_NULL_HANDLE;   // only an image made cube-compatible (square, 6+ layers)
+            type = arr ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE; if (nlay < 6) { l0 = 0; nlay = 6; } if (!arr) nlay = 6; else nlay -= nlay % 6; break;
     default: return VK_NULL_HANDLE;
     }
     if (!arr && dim != 3) nlay = 1;
@@ -225,7 +251,15 @@ static VkImageView tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_v
     if (storage) sw = (VkComponentMapping){0, 0, 0, 0};
     VkImageAspectFlags asp = fmt_aspects(v->fmt);
     if (asp == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) asp = (t->stencil || (has_vw && vw->set_dsmode && vw->dsmode)) ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
-    return view_get(v, type, lv, nl, l0, nlay, sw, asp, storage);
+    // the view's format: the shader's numeric kind of texel (the translator types a texel it has no answer for as float), and a storage-capable twin for sRGB shader images
+    VkFormat fmt = v->fmt;
+    if (v->mutable_fmt && !fmt_depth(fmt)) {
+        int want_int = (img >> 7) & 1;
+        if (want_int != fmt_int(fmt)) { VkFormat o = other_kind(fmt, want_int); if (o) fmt = o; }
+        if (storage) fmt = storage_twin(fmt);
+    }
+    if (storage && v->storage == 2 && fmt == v->fmt) return VK_NULL_HANDLE;   // its own format cannot be a shader image, only a twin can
+    return view_get_fmt(v, fmt, type, lv, nl, l0, nlay, sw, asp, storage);
 }
 
 // ---------------------------------------------------------------- stand-ins for unbound resources: zero buffers, a zero texel buffer, 1x1 zero images of each shape
@@ -498,6 +532,18 @@ static VkFormat vfmt(uint32_t f) {
         return VK_FORMAT_UNDEFINED;   // 32-bit integers read as floats: Vulkan has no scaled 32-bit formats
     default: return VK_FORMAT_UNDEFINED;
     }
+}
+// An integer vertex format read by a float shader input: its SCALED twin gives the same numbers as floats (the Switch converts them so; Vulkan wants the
+// format's numeric kind to match the input). 32-bit integers have no twin and stay as they are
+static VkFormat vfmt_for_input(VkFormat f, int ct) {
+    if (ct != 0) return f;
+    int base = -1, n = 7;
+    if (f >= VK_FORMAT_R8_UNORM && f <= VK_FORMAT_A8B8G8R8_SRGB_PACK32) base = 9;
+    else if (f >= VK_FORMAT_A2R10G10B10_UNORM_PACK32 && f <= VK_FORMAT_A2B10G10R10_SINT_PACK32) base = 58, n = 6;
+    else if (f >= VK_FORMAT_R16_UNORM && f <= VK_FORMAT_R16G16B16A16_SFLOAT) base = 70;
+    if (base < 0) return f;
+    int k = (f - base) % n;
+    return k == 4 || k == 5 ? (VkFormat)(f - 2) : f;   // UINT → USCALED, SINT → SSCALED
 }
 static int vfmt_ok(VkFormat f) { if (!f) return 0; VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties_(VK.phys, f, &fp); return (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0; }
 static VkPrimitiveTopology topo_of(int prim) {
@@ -786,7 +832,7 @@ static void do_draw(const draw_args *a) {
     for (int i = 0; vs && i < vs->nvin && k.nva < 32; i++) {
         uint8_t loc = vs->vin[2 * i], ct = vs->vin[2 * i + 1];
         va_st at; memset(&at, 0, sizeof at); if (loc < D.nattr) memcpy(&at, &D.vattr[loc], 4);
-        VkFormat f = at.fmt ? vfmt(at.fmt) : VK_FORMAT_UNDEFINED;
+        VkFormat f = at.fmt ? vfmt_for_input(vfmt(at.fmt), ct) : VK_FORMAT_UNDEFINED;
         static VkFormat okf[256]; static uint8_t okc[256];   // format support, asked once per format
         if (f && f < 256 && !okc[f]) { okc[f] = 1; okf[f] = vfmt_ok(f) ? f : 0; if (!okf[f]) LOG("[RED] [vk] vertex format %d (NVN %#x) is not supported by this GPU: those attributes read zero", f, at.fmt); }
         if (f && f < 256) f = okf[f];
@@ -864,6 +910,9 @@ static void do_draw(const draw_args *a) {
     for (uint32_t i = 0; i < nvp; i++) {
         float vx = D.vp[i][0], vy = D.vp[i][1], vw = D.vp[i][2], vh = D.vp[i][3];
         if (vw <= 0 || vh <= 0) { vx = 0; vy = 0; vw = (float)P.w; vh = (float)P.h; }
+        float mw = (float)VK.limits.maxViewportDimensions[0], mh = (float)VK.limits.maxViewportDimensions[1];
+        if (vw > mw) { vx += (vw - mw) / 2; vw = mw; }   // larger than the GPU allows (Vulkan refuses it): centred at the largest size
+        if (vh > mh) { vy += (vh - mh) / 2; vh = mh; }
         vps[i] = (VkViewport){vx, flip ? vy + vh : vy, vw, flip ? -vh : vh, D.dr[0], D.dr[1]};
         scs[i] = (VkRect2D){{sx, sy}, {sw, sh}};   // NVN's other scissors are not recorded (hle_nvn.c SetScissors keeps index 0)
     }

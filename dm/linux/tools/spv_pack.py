@@ -4,7 +4,7 @@
 #   index   count × {u64 key (the 16 hex digits read as a big-endian number), u32 offset, u32 length}, sorted by key
 #   entries u8 stage (SPIR-V execution model: 0 vertex 1 tess control 2 tess eval 3 geometry 4 fragment 5 compute), u8 bindings, u8 vertex inputs, u8 fragment output mask,
 #           u16 local size x, y, z (compute), u16 c1 bytes
-#           bindings × {u8 binding, u8 Vulkan descriptor type, u8 kind (KIND_*), u8 image (dim | arrayed << 4 | multisample << 5 | depth << 6), u32 reg, u16 count, u16 aux}
+#           bindings × {u8 binding, u8 Vulkan descriptor type, u8 kind (KIND_*), u8 image (dim | arrayed << 4 | multisample << 5 | depth << 6 | integer texels << 7), u32 reg, u16 count, u16 aux}
 #             KIND_CBUF: reg = the constant bank (0, 2 driver; 1 the shader's own c1; 3 + n uniform slot n)
 #             KIND_SBUF: reg = the byte its address is at in bank aux (aux 0: the stage's c0 table; aux >= 3: uniform slot aux - 3); image = 1 when the shader writes it
 #             KIND_TEX / KIND_IMG: reg = the translator's handle (bits 0-13 the handle word, 14-27 a separate sampler's word, 28-31 the handle type), aux = the bank the words are in
@@ -50,7 +50,8 @@ def reflect(words):
             if op == 27: op, a = types[a[0]]; vk = 1                    # sampled image: combined image sampler
             if op == 25:                                                # OpTypeImage: sampled type, dim, depth, arrayed, ms, sampled, format
                 dim, depth, arr, ms, sampled = a[1], a[2], a[3], a[4], a[5]
-                img = (dim & 15) | arr << 4 | ms << 5 | (depth == 1) << 6
+                integer = types.get(a[0], (0,))[0] == 21                 # its texels are read as integers (the host's view format follows: gfx_vk_draw.inc tex_view)
+                img = (dim & 15) | arr << 4 | ms << 5 | (depth == 1) << 6 | integer << 7
                 if types[bt][0] != 27: vk = (4 if sampled == 1 else 5) if dim == 5 else (2 if sampled == 1 else 3)
                 elif dim == 5: vk = 4
             elif op == 26: vk = 0                                       # sampler
@@ -88,6 +89,28 @@ def kind_of(res, binding):
             if b['binding'] == binding: return kind, b['handle'] & 0xffffffff, b['cbuf_slot'] & 0xffff, 0
     return KIND_UNKNOWN, 0, 0, 0
 
+def add_image_caps(words):
+    # Storage images without a format (the translator's, OpTypeImage ... Unknown) read or written need StorageImageReadWithoutFormat / WriteWithoutFormat, which the
+    # translator does not declare (Metal does not ask): a driver may read zeros without them (Turnip). Declared after the other capabilities when such an image is used
+    unknown_storage, have = False, set()
+    i = 5
+    while i < len(words):
+        n, op = words[i] >> 16, words[i] & 0xffff
+        if op == 17: have.add(words[i + 1])
+        if op == 25 and words[i + 7] == 2 and words[i + 8] == 0: unknown_storage = True   # OpTypeImage, Sampled 2 (storage), Format Unknown
+        i += n
+    if not unknown_storage: return words
+    add = [c for c in (55, 56) if c not in have]   # StorageImageReadWithoutFormat, StorageImageWriteWithoutFormat
+    if not add: return words
+    out = list(words[:5]); i = 5; done = False
+    while i < len(words):
+        n, op = words[i] >> 16, words[i] & 0xffff
+        if op != 17 and not done:
+            for c in add: out += [2 << 16 | 17, c]
+            done = True
+        out += words[i:i + n]; i += n
+    return out
+
 def strip_unused(words):
     # The translator declares Float64 and fragment shader interlock in every shader; Adreno's driver (Turnip) supports neither. Declarations a shader does not use are dropped
     used64 = interlock = False
@@ -114,7 +137,7 @@ def entry(spv_path, res_path, job_path=None):
     if spv_passthrough.is_passthrough(words):   # NVIDIA passthrough geometry shader → an ordinary one (spv_passthrough.py); one it cannot rewrite stays as it is
         try: words = spv_passthrough.rewrite(words)
         except Exception as e: print(f'[YELLOW] {Path(spv_path).stem}: passthrough geometry shader not rewritten ({e}): kept as it is', flush=True)
-    words = strip_unused(words); data = struct.pack(f'<{len(words)}I', *words)
+    words = add_image_caps(strip_unused(words)); data = struct.pack(f'<{len(words)}I', *words)
     model, binds, vin, fout, local = reflect(words)
     res = json.load(open(res_path)) if os.path.exists(res_path) else {}
     try: c1 = bytes.fromhex(json.load(open(job_path)).get('c1') or '') if job_path and os.path.exists(job_path) else b''
