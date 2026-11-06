@@ -237,14 +237,26 @@ exec ./dmhost "{patched}" "$@" 2>&1 | tee log.txt
             if line.startswith('name='): box = line.split('=', 1)[1].strip().strip('"')
     except OSError: pass
     play = lw / 'play.sh'
-    play.write_text(f'''#!/bin/sh
+    play.write_text(f'''#!/bin/bash
 # Starts {tid} full screen with controllers. Add this file to Steam: Games > Add a Non-Steam Game to My Library > Browse > this file.
-# Runs inside the toolbox "{box or 'none'}" (where it was built); the log is log.txt beside this file. DM_PAD_LAYOUT=xbox in Steam's launch options: A at the bottom
-if [ ! -f /run/.toolboxenv ] && [ ! -f /run/.containerenv ] && [ -n "{box}" ] && command -v toolbox >/dev/null; then
-    exec toolbox run -c "{box}" "$0" "$@"
+# Runs inside the toolbox "{box or 'none'}" (where it was built). What the launcher did goes to play.log beside this file, the game's log to log.txt.
+# DM_PAD_LAYOUT=xbox in Steam's launch options (DM_PAD_LAYOUT=xbox %command%): A at the bottom
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec >>"$here/play.log" 2>&1
+echo "=== $(date) play.sh in: $( [ -f /run/.containerenv ] && echo container || echo host ) ($( [ -f /.flatpak-info ] && echo flatpak ))"
+if [ -f /.flatpak-info ]; then   # Steam from Flathub: out of its sandbox first (needs: flatpak override --user --talk-name=org.freedesktop.Flatpak com.valvesoftware.Steam)
+    exec flatpak-spawn --host "$here/play.sh" "$@"
 fi
-cd "$(dirname "$0")"
+if [ ! -f /run/.containerenv ] && [ -n "{box}" ]; then
+    # Steam's own environment (its runtime's libraries, the overlay) does not belong in the toolbox
+    unset LD_PRELOAD LD_LIBRARY_PATH
+    tb="$(command -v toolbox || echo /usr/bin/toolbox)"
+    echo "entering toolbox {box} with $tb"
+    exec "$tb" run -c "{box}" "$here/play.sh" "$@"
+fi
+cd "$here"
 export DM_WINDOW=1 DM_FULLSCREEN="${{DM_FULLSCREEN:-1}}"
+echo "starting the game (DISPLAY=$DISPLAY WAYLAND_DISPLAY=$WAYLAND_DISPLAY XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR)"
 exec ./run.sh "$@"
 ''')
     play.chmod(0o755)
