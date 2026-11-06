@@ -18,7 +18,7 @@
 static struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; uint64_t used; int full_warned; } RG;
 typedef struct { uint64_t addr, size, off; } ring_hit;
 #define RH_CAP 8192
-static ring_hit g_rh[RH_CAP]; static int g_nrh_used;   // (address, size) → ring offset for this submission (open addressing, cleared at the submission's end)
+static ring_hit g_rh[RH_CAP]; static int g_nrh_used; static uint16_t g_rh_idx[RH_CAP];   // (address, size) → ring offset for this submission (open addressing, cleared at the submission's end)
 static uint64_t g_ring_bytes, g_ring_full;
 static int ring_init(void) {
     if (RG.b) return 1;
@@ -51,8 +51,19 @@ static uint64_t ring_put(uint64_t addr, uint64_t size) {
     }
     uint64_t off = ring_alloc(size); if (off == ~0ull) return off;
     if (addr) memcpy(RG.p + off, (const void *)(uintptr_t)addr, size); else memset(RG.p + off, 0, size);
-    if (addr && !g_rh[i].addr) { g_rh[i] = (ring_hit){addr, size, off}; g_nrh_used++; }
+    if (addr && !g_rh[i].addr && g_nrh_used < RH_CAP) { g_rh[i] = (ring_hit){addr, size, off}; g_rh_idx[g_nrh_used++] = (uint16_t)i; }
     return off;
+}
+// Guest bytes the command stream changes as it goes (nvnCommandBufferUpdateUniformBuffer, buffer copies and clears): copies of them made earlier in this submission
+// are not reused, so the draws after the change see the new bytes. Particle effects update one uniform buffer between their emitters' draws: every emitter drew
+// with the first one's constants, and their alpha curves and colours came out as solid shapes
+static uint64_t g_ring_forgot;
+void ring_forget(uint64_t addr, uint64_t n) {
+    if (!g_nrh_used || !n) return;
+    for (int k = 0; k < g_nrh_used; k++) {
+        ring_hit *h = &g_rh[g_rh_idx[k]];
+        if (h->addr && h->addr < addr + n && addr < h->addr + h->size) { h->addr = 0; h->size = 0; g_ring_forgot++; }   // later lookups past this slot miss and copy again
+    }
 }
 // Storage buffers shaders wrote in this submission: copied back into guest memory when it completes, so the game (and the next submission's copies) see the results
 typedef struct { uint64_t addr, size, off; } wback;
@@ -1249,6 +1260,7 @@ static void draw_summary(char *out, size_t n) {
     if (g_tex_missing && o < (int)n) o += snprintf(out + o, n - o, "; texture bindings without a usable view %llu", (unsigned long long)g_tex_missing);
     if (g_storage_unsup && o < (int)n) o += snprintf(out + o, n - o, "; shader images in a format that cannot be written %llu", (unsigned long long)g_storage_unsup);
     if (g_tex_unreg && o < (int)n) o += snprintf(out + o, n - o, "; bound texture IDs not registered %llu", (unsigned long long)g_tex_unreg);
+    if (g_ring_forgot && o < (int)n) o += snprintf(out + o, n - o, "; copies made again after the command stream changed their bytes %llu", (unsigned long long)g_ring_forgot);
     if ((g_tbuf_n || g_tbuf_miss) && o < (int)n) o += snprintf(out + o, n - o, "; texture buffers bound %llu, unusable %llu", (unsigned long long)g_tbuf_n, (unsigned long long)g_tbuf_miss);
     if (g_tex_unres && o < (int)n) o += snprintf(out + o, n - o, "; texture handles not decoded %llu", (unsigned long long)g_tex_unres);
     if (g_unsup_sbuf_ubo && o < (int)n) snprintf(out + o, n - o, "; storage buffers addressed through uniforms (not bound) %llu", (unsigned long long)g_unsup_sbuf_ubo);

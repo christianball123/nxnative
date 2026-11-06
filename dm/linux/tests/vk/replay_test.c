@@ -105,6 +105,7 @@ int main(int argc, char **argv) {
       d = rec(OP_DRAW, sizeof *d); d->prim = NVN_DRAW_PRIMITIVE_QUADS; d->count = 4; d->instances = 1;
       bs = rec(OP_BIND_STATE, sizeof *bs); bs->kind = 1; cs = (color_st){0, NVN_LOGIC_OP_COPY, NVN_ALPHA_FUNC_ALWAYS}; memcpy(bs->bytes, &cs, sizeof cs); }
     { static float q4[4][12] = {{0.75f, -1, 0, 1, 0, 0, 0, 0}, {1, -1, 0, 1, 1, 0, 0, 0}, {1, -0.75f, 0, 1, 1, 1, 0, 0}, {0.75f, -0.75f, 0, 1, 0, 1, 0, 0}};
+      { uint8_t *up = rec(OP_UPDATE_UB, 16 + 16); uint64_t dst = (uint64_t)(uintptr_t)ubo, nn = 16; float half[4] = {0.5f, 0.5f, 0.5f, 1}; memcpy(up, &dst, 8); memcpy(up + 8, &nn, 8); memcpy(up + 16, half, 16); }   /* the uniform buffer changed between draws */
       p_bind_tex1 *b6 = rec(OP_BIND_TEX1, 16); b6->stage = 1 | BIND_TEX1_NOBASE; b6->slot = 0; b6->h = 6 | (3u << 20);
       vb = rec(OP_BIND_VBUF1, sizeof *vb); vb->index = 0; vb->size = sizeof q4; vb->addr = (uint64_t)(uintptr_t)q4;
       d = rec(OP_DRAW, sizeof *d); d->prim = NVN_DRAW_PRIMITIVE_QUADS; d->count = 4; d->instances = 1; }
@@ -122,7 +123,7 @@ int main(int argc, char **argv) {
     p_copy_t2t *c = rec(OP_COPY_T2B, sizeof *c); c->src = (const tex_t *)(void *)px; c->dst = &rt; c->dr.width = 64; c->dr.height = 64; c->dr.depth = 1;
     rec(OP_END, 0);
     mtl_sub_begin(); mtl_exec(cmd); mtl_sub_commit();
-    LOG("view swizzle: row 63 col 63 %08x (80400000 expected: b = one x 0.25, a = r x 1)", px[63 * 64 + 63]);
+    LOG("view swizzle: row 63 col 63 %08x (80800000 expected: b = one x 0.5 after the uniform update, a = r x 1)", px[63 * 64 + 63]);
     LOG("alpha test: row 50 col 40 %08x (discarded: ffff0000), row 50 col 56 %08x (drawn: 80202020)", px[50 * 64 + 40], px[50 * 64 + 56]);
     LOG("pixels: row 0 %08x, row 20 %08x, row 40 %08x, row 63 %08x; quad: row 50 col 5 %08x, row 50 col 50 %08x", px[0], px[20 * 64 + 5], px[40 * 64 + 5], px[63 * 64 + 5], px[50 * 64 + 5], px[50 * 64 + 50]);
     { const uint32_t *g = (const uint32_t *)rt.mem; LOG("linear target's guest memory: row 0 %08x, row 50 col 5 %08x, row 50 col 50 %08x", g[0], g[50 * 64 + 5], g[50 * 64 + 50]); }

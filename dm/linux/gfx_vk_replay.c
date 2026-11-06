@@ -319,6 +319,7 @@ static void stages_done(void) {
     g_nstage = 0;
 }
 
+void ring_forget(uint64_t addr, uint64_t n);   // gfx_vk_draw.inc: guest bytes changed mid-submission
 static void tex_fill(vtex *v, const tex_t *t);   // gfx_vk_draw.inc: a texture the GPU has not written gets its guest-memory content
 
 // ---------------------------------------------------------------- operations
@@ -443,9 +444,9 @@ void mtl_exec(const uint8_t *p) {
         case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); post((post_op){1, val, m, v, 0, 0}); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); post((post_op){2, NULL, 0, 0, ad, (uint32_t)t}); break; }
         case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = atomic_load(&g_fence) + 1; s->fenced = 1; break; }
-        case OP_CLEAR_BUF: { const p_clear_buf *c = (const p_clear_buf *)a; uint32_t *d = (uint32_t *)(uintptr_t)c->addr; for (uint64_t i = 0; i < c->size / 4; i++) d[i] = c->value; break; }
-        case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); memmove((void *)(uintptr_t)d, (const void *)(uintptr_t)s_, n); break; }
-        case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); memcpy((void *)(uintptr_t)d, a + 16, n); break; }
+        case OP_CLEAR_BUF: { const p_clear_buf *c = (const p_clear_buf *)a; uint32_t *d = (uint32_t *)(uintptr_t)c->addr; for (uint64_t i = 0; i < c->size / 4; i++) d[i] = c->value; ring_forget(c->addr, c->size); break; }
+        case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); memmove((void *)(uintptr_t)d, (const void *)(uintptr_t)s_, n); ring_forget(d, n); break; }
+        case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); memcpy((void *)(uintptr_t)d, a + 16, n); ring_forget(d, n); break; }
         case OP_COPY_STRIDE: { const p_copy_stride *cs = (const p_copy_stride *)a; if (cs->image) R.copy_img_stride = cs->stride; else R.copy_stride = cs->stride; break; }
         case OP_SET_RT: if (VK.ok) pass_end(); R.rt = *(const p_set_rt *)a; R.has_rt = 1; break;
         case OP_CLEAR_COLOR: if (VK.ok) { pass_end(); clear_color((const p_clear_color *)a); } break;
