@@ -1160,7 +1160,15 @@ static void dump_pass(void) {
 }
 // Each submission's end: a request starts a dump of the next 8 submissions
 static void dump_submitted(void) {
-    if (g_dump_subs) { if (!--g_dump_subs) LOG("[vk] dump finished: %d passes, %d pictures in %s", g_dump_pass, g_dump_files, g_dump_dir); return; }
+    if (g_dump_subs) {
+        if (!--g_dump_subs) {   // complete: it takes the place of the last one (a game closed during a dump keeps the one before)
+            char fin[400]; size_t l = strlen(g_dump_dir); snprintf(fin, sizeof fin, "%.*s", (int)(l > 4 ? l - 4 : l), g_dump_dir);
+            char cmd[900]; snprintf(cmd, sizeof cmd, "rm -rf '%s' && mv '%s' '%s'", fin, g_dump_dir, fin);
+            if (system(cmd)) LOG("[vk] dump: could not move %s to %s", g_dump_dir, fin);
+            LOG("[vk] dump finished: %d passes, %d pictures in %s", g_dump_pass, g_dump_files, fin);
+        }
+        return;
+    }
     static double at = -2; static uint64_t t0;
     if (at == -2) { const char *e = getenv("DM_VK_DUMP_AT"); at = e && *e ? atof(e) : -1; }
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
@@ -1186,7 +1194,7 @@ static void dump_submitted(void) {
     if (!atomic_exchange(&vkw_dump_req, 0) && !timed && !file && !autod) return;
     if (timed) at = -1;
     const char *d = getenv("DM_VK_DUMP_DIR"), *home = getenv("HOME");
-    if (d && *d) snprintf(g_dump_dir, sizeof g_dump_dir, "%s", d); else snprintf(g_dump_dir, sizeof g_dump_dir, "%s/nxnative-dump", home ? home : "/tmp");
+    if (d && *d) snprintf(g_dump_dir, sizeof g_dump_dir, "%s.new", d); else snprintf(g_dump_dir, sizeof g_dump_dir, "%s/nxnative-dump.new", home ? home : "/tmp");   // renamed when complete
     char cmd[480]; snprintf(cmd, sizeof cmd, "rm -rf '%s' && mkdir -p '%s'", g_dump_dir, g_dump_dir);
     if (system(cmd)) LOG("[vk] dump: could not make %s", g_dump_dir);
     g_dump_light = auto_on && every < 10000000000ull;   // every few seconds: 3 submissions, the full-size pictures only, so the game keeps running
