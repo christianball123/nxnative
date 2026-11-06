@@ -181,7 +181,7 @@ static vtex *tex_get(const tex_t *t) {
             int shape = b->w == ci.extent.width && b->h == ci.extent.height && b->layers == ci.arrayLayers && b->levels >= ci.mipLevels && b->samples == samples && b->is3d == (ci.imageType == VK_IMAGE_TYPE_3D);
             if (shape && (f == b->fmt || (b->twin && f == fmt_twin(b->fmt)))) {
                 v->alias = b->serial;
-                static int n; if (n++ < 20) LOG("[vk] texture serial %llu (format %d) shares the image of serial %llu (format %d): the same storage", (unsigned long long)t->serial, f, (unsigned long long)b->serial, b->fmt);
+                static int n; if (n++ < 200) LOG("[vk] texture serial %llu (format %d) shares the image of serial %llu (format %d): the same storage", (unsigned long long)t->serial, f, (unsigned long long)b->serial, b->fmt);
                 pthread_mutex_unlock(&g_tex_mu); return b;
             }
             static int n2; if (n2++ < 30) LOG("[YELLOW] [vk] texture serial %llu (format %d %ux%u x%u levels %u) is over the storage of serial %llu (format %d %ux%u x%u levels %u) but cannot share its image: it gets its own",

@@ -438,7 +438,7 @@ static const char *k_sk[SK_N] = {"shaders not ready", "no render target", "tesse
 static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g_tex_missing, g_tex_unres, g_tex_unreg, g_storage_unsup;
 
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
-static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0; } P;
+static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0, cser[8]; VkFormat cvf[8]; } P;
 static void dump_pass(void);
 static int g_dump_subs, g_dump_pass, g_dump_lines;   // frame dumps (below)
 static void pass_end(void) { if (P.open) { vkCmdEndRendering_(g_cb); full_barrier(); P.open = 0; dump_pass(); } }
@@ -464,7 +464,7 @@ static int pass_begin(void) {
         VkFormat vf = tex_view_fmt(v, t);
         VkImageView iv = view_get_fmt(v, vf, v->is3d ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, v->is3d ? 0 : l0, 1, (VkComponentMapping){0, 0, 0, 0}, VK_IMAGE_ASPECT_COLOR_BIT, 2);
         if (!iv) continue;
-        gpu_wrote(v); ca[i].imageView = iv; P.cf[i] = vf; any = 1; P.cv[i] = v; P.clv[i] = lv; P.cl0[i] = v->is3d ? 0 : l0;
+        gpu_wrote(v); ca[i].imageView = iv; P.cf[i] = vf; P.cser[i] = t->serial; P.cvf[i] = vf; any = 1; P.cv[i] = v; P.clv[i] = lv; P.cl0[i] = v->is3d ? 0 : l0;
         uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1;
         if (lw < w) w = lw;
         if (lh < h) h = lh;
@@ -753,8 +753,9 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
             if (g_dump_subs && g_dump_lines < 4000 && b->vktype != VK_DESCRIPTOR_TYPE_SAMPLER) {
                 g_dump_lines++;
                 const treg *r = ok ? (storage ? ireg_get((int)(h & 0xfffff)) : treg_get((int)(h & 0xfffff))) : NULL;
-                if (iv && r) LOG("[vk] dump:   pass %d shader %016llx binding %u%s: texture serial %llu (%ux%u, NVN format %#x)", g_dump_pass, (unsigned long long)s->key, b->binding, storage ? " (image)" : "",
-                                 (unsigned long long)r->t.serial, r->t.d.width, r->t.d.height, r->t.d.format);
+                if (iv && r) { vtex *v2 = tex_get(&r->t);
+                    LOG("[vk] dump:   pass %d shader %016llx binding %u%s: texture serial %llu (%ux%u, NVN format %#x, read as format %d from the image of serial %llu format %d)", g_dump_pass, (unsigned long long)s->key, b->binding, storage ? " (image)" : "",
+                        (unsigned long long)r->t.serial, r->t.d.width, r->t.d.height, r->t.d.format, v2 ? tex_view_fmt(v2, &r->t) : 0, v2 ? (unsigned long long)v2->serial : 0ull, v2 ? v2->fmt : 0); }
                 else LOG("[vk] dump:   pass %d shader %016llx binding %u%s: EMPTY (%s; handle %#x bank %u)", g_dump_pass, (unsigned long long)s->key, b->binding, storage ? " (image)" : "",
                          !ok ? "handle not decoded" : !r ? "ID not registered" : "no usable view", b->reg, b->aux);
             }
@@ -1103,7 +1104,7 @@ static void dump_pass(void) {
     char tag[16];
     for (uint32_t i = 0; pics && i < P.ncol && i < 8; i++) if (P.cv[i]) { snprintf(tag, sizeof tag, "c%u", i); dump_tex(P.cv[i], P.clv[i], P.cl0[i], tag); }
     if (pics && P.dv) dump_tex(P.dv, P.dlv, P.dl0, "depth");
-    for (uint32_t i = 0; i < P.ncol && i < 8; i++) if (P.cv[i]) LOG("[vk] dump:   pass %d target c%u: serial %llu %ux%u format %d", g_dump_pass, i, (unsigned long long)P.cv[i]->serial, P.cv[i]->w, P.cv[i]->h, P.cv[i]->fmt);
+    for (uint32_t i = 0; i < P.ncol && i < 8; i++) if (P.cv[i]) LOG("[vk] dump:   pass %d target c%u: texture serial %llu, drawn as format %d into the image of serial %llu %ux%u format %d", g_dump_pass, i, (unsigned long long)P.cser[i], P.cvf[i], (unsigned long long)P.cv[i]->serial, P.cv[i]->w, P.cv[i]->h, P.cv[i]->fmt);
     full_barrier();
     g_dump_pass++;
 }
