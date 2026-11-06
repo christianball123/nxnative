@@ -130,7 +130,6 @@ static vks_prog *prog_build(const prog_t *p, uint64_t serial, int gs_class) {
         if (s->model == VKS_CS) r->compute = 1;
         r->st[s->model] = s;
     }
-    if (r->ok && r->has_gs && gs_class < 0) return r;   // the topology picks the real program at the draw (vks_prog_topology)
     if (r->ok) {
         int nset = 1;
         for (int m = 0; m < 6; m++) if (r->st[m] && vks_set_of(m) + 1 > nset) nset = vks_set_of(m) + 1;

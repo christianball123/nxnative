@@ -12,6 +12,8 @@
 # The descriptor types and image shapes come from the SPIR-V itself; what each binding means (which uniform slot, which texture handle) from the translator's reflection.
 # All bindings are in set 0 (dmsh_xlate Program.cs); binding 0 is the translator's support buffer.
 import json, os, struct, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import spv_passthrough
 from pathlib import Path
 
 KIND_SUPPORT, KIND_CBUF, KIND_SBUF, KIND_TEX, KIND_IMG, KIND_UNKNOWN = range(6)
@@ -109,6 +111,7 @@ def entry(spv_path, res_path, job_path=None):
     data = Path(spv_path).read_bytes()
     words = struct.unpack(f'<{len(data) // 4}I', data)
     if words[0] != 0x07230203: raise ValueError('not SPIR-V')
+    if spv_passthrough.is_passthrough(words): words = spv_passthrough.rewrite(words)   # NVIDIA passthrough geometry shader → an ordinary one (spv_passthrough.py)
     words = strip_unused(words); data = struct.pack(f'<{len(words)}I', *words)
     model, binds, vin, fout, local = reflect(words)
     res = json.load(open(res_path)) if os.path.exists(res_path) else {}
@@ -128,14 +131,12 @@ def main():
     if len(sys.argv) != 3: sys.exit('usage: spv_pack.py <spv dir> <out file>')
     src, dst = Path(sys.argv[1]), Path(sys.argv[2])
     keys = sorted(p.name[:-4] for p in os.scandir(src) if p.name.endswith('.spv') and len(p.name) >= 20)
-    # A geometry shader's base translation uses NVIDIA's passthrough geometry shaders, which other GPUs lack; the translator also makes one ordinary geometry shader per
-    # input topology (<key>_g0 .. _g4: points, lines, lines with adjacency, triangles, triangles with adjacency), packed under key ^ GVAR * (t + 1) (gfx_vk_shader.c)
+    # <key>_g0 .. _g4 are the Mac's geometry lowering (geometry shaders made compute kernels): not packed
     blobs, bad = [], 0
     for k in keys:
         try: key = int(k[:16], 16)
         except ValueError: continue
-        if len(k) == 19 and k[16:18] == '_g' and k[18] in '01234': key ^= (0x9E3779B97F4A7C15 * (int(k[18]) + 1)) & 0xffffffffffffffff
-        elif k != k[:16]: continue                                      # the Mac's geometry lowering's other outputs
+        if k != k[:16]: continue
         try: blobs.append((key, entry(src / f'{k}.spv', src / f'{k}.res.json', src / f'{k}.json')))
         except Exception as e:
             bad += 1

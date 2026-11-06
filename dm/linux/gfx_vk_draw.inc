@@ -579,8 +579,8 @@ static VkPipeline pipe_make(const vks_prog *pr, const pkey *k) {
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rci, 0, ns, st, &vi, &ia, NULL, &vp, &rs, &ms, &dss, &cbs, &ds, pr->layout, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, -1};
     if (!g_pcache) { VkPipelineCacheCreateInfo pc = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, 0, NULL}; vkCreatePipelineCache_(VK.dev, &pc, NULL, &g_pcache); }
     VkPipeline p = VK_NULL_HANDLE;
-    if (pr->st[VKS_GS]) { static int n; if (n++ < 30) { LOG("[vk] making a pipeline with geometry shader %016llx_g%d (vertex %016llx, fragment %016llx)",
-        (unsigned long long)(pr->st[VKS_GS]->key ^ (pr->gs_class >= 0 ? 0x9E3779B97F4A7C15ull * (uint64_t)(pr->gs_class + 1) : 0)), pr->gs_class, pr->st[VKS_VS] ? (unsigned long long)pr->st[VKS_VS]->key : 0ull, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull); fflush(stderr); } }
+    if (pr->st[VKS_GS]) { static int n; if (n++ < 30) { LOG("[vk] making a pipeline with geometry shader %016llx (vertex %016llx, fragment %016llx)",
+        (unsigned long long)pr->st[VKS_GS]->key, pr->st[VKS_VS] ? (unsigned long long)pr->st[VKS_VS]->key : 0ull, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull); fflush(stderr); } }
     VkResult r = vkCreateGraphicsPipelines_(VK.dev, g_pcache, 1, &ci, NULL, &p);
     if (r) {
         static int n; if (n++ < 10) {
@@ -750,13 +750,7 @@ static void do_draw(const draw_args *a) {
     if (pr->st[VKS_TCS] || pr->st[VKS_TES]) { g_skip[SK_TESS]++; return; }
     VkPrimitiveTopology topo = topo_of(a->prim);
     static int gs_on = -1; if (gs_on < 0) { const char *e = getenv("DM_VK_GEOMETRY"); gs_on = !(e && *e == '0'); if (!gs_on) LOG("[vk] DM_VK_GEOMETRY=0: draws with a geometry stage are skipped"); }
-    if (pr->has_gs && !gs_on) { g_skip[SK_TESS]++; return; }
-    if (pr->has_gs) {   // the geometry shader made for this topology's input primitive
-        int cls = topo == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ? 0 : topo <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ? 1 : topo <= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ? 3 :
-                  topo <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ? 2 : topo <= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY ? 4 : -1;
-        pr = vks_prog_topology(pr, cls);
-        if (!pr) { g_skip[SK_PIPE]++; return; }
-    }
+    if (pr->st[VKS_GS] && !gs_on) { g_skip[SK_TESS]++; return; }
     if (topo == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM || topo == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) { g_skip[SK_PRIM]++; return; }
     if (!a->count) return;
     if (!ring_init() || !dummies_init()) return;
