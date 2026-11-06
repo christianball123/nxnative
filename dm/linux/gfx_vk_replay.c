@@ -168,7 +168,10 @@ static vtex *tex_get(const tex_t *t) {
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties_(VK.phys, f, &fp); VkFormatFeatureFlags ff = fp.optimalTilingFeatures;
     if (!(ff & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))) ci.usage &= ~(VkImageUsageFlags)(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
     if (!(ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) ci.usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_SAMPLED_BIT;
-    if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && samples == 1) { ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT; v->storage = 1; }   // shader images (nvnCommandBufferBindImage)
+    // shader images (nvnCommandBufferBindImage): only textures made for it (NVN_TEXTURE_FLAGS_IMAGE, which NVN asks of a texture bound as an image). Storage use costs
+    // Adreno its framebuffer compression (UBWC) on most formats, and every render target paid for it. DM_VK_STORAGE_ALL=1: every texture whose format allows it, as before
+    static int sall = -1; if (sall < 0) { const char *e = getenv("DM_VK_STORAGE_ALL"); sall = e && *e == '1'; }
+    if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && samples == 1 && (sall || (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE))) { ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT; v->storage = 1; }
     // A texture registered as an image: a shader may read or write its texels as the other numeric kind (an R32_UINT target written with floats, no answer table to say
     // otherwise): its views may take another format of the same size (gfx_vk_draw.inc tex_view), and a usage only that format has
     if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !depth && !(f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK)) {
@@ -255,6 +258,7 @@ static stage_t *g_stage; static int g_nstage, g_stagecap;
 static void post(post_op o) { if (g_npost == g_postcap) { g_postcap = g_postcap ? g_postcap * 2 : 64; g_post = realloc(g_post, g_postcap * sizeof *g_post); } g_post[g_npost++] = o; }
 static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g = (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; } return nvn_timestamp_from_ns(g); }
 
+static void prof_cb_begin(void); static void prof_cb_end(void); static void prof_collect(void); static void prof_report(void);   // gfx_vk_draw.inc: the GPU profile
 static int cb_begin(void) {
     if (!VK.ok) return 0;
     if (!g_pool) {
@@ -267,7 +271,7 @@ static int cb_begin(void) {
     if (!g_cb_open) {
         vkResetCommandBuffer_(g_cb, 0);
         VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
-        vkBeginCommandBuffer_(g_cb, &bi); g_cb_open = 1; g_cb_ops = 0;
+        vkBeginCommandBuffer_(g_cb, &bi); g_cb_open = 1; g_cb_ops = 0; prof_cb_begin();
     }
     return 1;
 }
@@ -490,6 +494,7 @@ uint64_t mtl_sub_commit(void) {
         uint64_t t0 = mono_ns();
         pass_end();
         linear_readbacks();
+        prof_cb_end();
         vkEndCommandBuffer_(g_cb); g_cb_open = 0;
         VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &g_cb, 0, NULL};
         pthread_mutex_lock(&VK.qmu);
@@ -503,6 +508,7 @@ uint64_t mtl_sub_commit(void) {
             vkResetFences_(VK.dev, 1, &g_fence_vk);
         }
         uint64_t t2 = mono_ns(); g_t_wait += t2 - t1;
+        prof_collect();
         stages_done();
         linear_done();
         draw_submitted();
@@ -538,6 +544,7 @@ uint64_t mtl_sub_commit(void) {
         if (g_t_n) LOG("[vk] time per submission (last %llu): recording %.2f ms, submit %.2f ms, GPU wait %.2f ms, after %.2f ms; ring %.2f MB per submission",
             (unsigned long long)g_t_n, g_t_rec / 1e6 / g_t_n, g_t_submit / 1e6 / g_t_n, g_t_wait / 1e6 / g_t_n, g_t_done / 1e6 / g_t_n, ring_mb_per_sub(g_t_n));
         g_t_rec = g_t_submit = g_t_wait = g_t_done = g_t_n = 0;
+        prof_report();
     }
     return f;
 }

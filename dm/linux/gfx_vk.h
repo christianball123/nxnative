@@ -21,7 +21,8 @@
     X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkCreateBufferView) X(vkDestroyBufferView) X(vkCreateDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) \
     X(vkUpdateDescriptorSets) X(vkCreatePipelineCache) X(vkGetPipelineCacheData) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdDispatch) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetStencilReference) \
-    X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetBlendConstants) X(vkCmdSetDepthBias) X(vkFlushMappedMemoryRanges)
+    X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetBlendConstants) X(vkCmdSetDepthBias) X(vkFlushMappedMemoryRanges) \
+    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 #define VK_DECL(f) extern PFN_##f f##_;
 VKI_FUNCS(VK_DECL) VKD_FUNCS(VK_DECL)
 #undef VK_DECL

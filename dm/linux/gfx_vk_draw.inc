@@ -461,7 +461,9 @@ static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samp
 static void dump_pass(void);
 static int g_dump_subs, g_dump_pass, g_dump_lines, g_dump_light;
 static vtex *g_dump_tex[64]; static int g_ndump_tex; static uint64_t g_dump_saved[512]; static int g_ndump_saved;   // sampled textures to save after the pass (once per dump)   // frame dumps (below)
-static void pass_end(void) { if (P.open) { vkCmdEndRendering_(g_cb); full_barrier(); P.open = 0; dump_pass(); } }
+static void prof_mark(int begin, uint32_t w, uint32_t h, uint32_t ncol, uint32_t depth, uint32_t compute, uint64_t fs, uint64_t draws);
+static uint64_t g_pass_fs;
+static void pass_end(void) { if (P.open) { vkCmdEndRendering_(g_cb); prof_mark(0, P.w, P.h, P.ncol, P.dv != NULL, 0, g_pass_fs, g_drawn - P.draws0); full_barrier(); P.open = 0; dump_pass(); } }
 // A texture a draw reads, ready for it: its first use (layout, zero fill) and its guest content are command-buffer work outside a render pass, so a pass open then is ended first
 static vtex *prep_tex(const tex_t *t) {
     vtex *v = tex_get(t); if (!v) return NULL;
@@ -469,6 +471,72 @@ static vtex *prep_tex(const tex_t *t) {
     if (!(v->bad & 2) || ((!v->gpu || v->linear) && !v->uploaded && t->mem && v->samples == 1)) { pass_end(); if (!cb_begin()) return NULL; img_general(v); tex_fill(v, t); }
     return v;
 }
+
+// ---------------------------------------------------------------- GPU profile: timestamps around each render pass and dispatch, summed per kind of pass (size, targets,
+// first fragment shader) and logged with the replay summary: where the GPU's time goes. DM_VK_PROFILE=0 turns it off
+#define PQ_CAP 2048
+static VkQueryPool g_pq; static uint32_t g_npq; static int g_prof = -1;
+typedef struct { uint64_t key, fs; uint32_t w, h, ncol, depth, compute; double ms; uint64_t n, draws; } pkind;
+static pkind g_pk[512]; static int g_npk;
+typedef struct { uint32_t q0; uint64_t key, fs; uint32_t w, h, ncol, depth, compute; uint64_t draws; } pmark;
+static pmark g_pm[PQ_CAP / 2]; static int g_npm; static double g_prof_total_ms; static uint64_t g_prof_subs;
+static uint32_t g_pm_cur = ~0u;
+static int prof_on(void) {
+    if (g_prof < 0) { const char *e = getenv("DM_VK_PROFILE"); g_prof = !(e && *e == '0') && VK.limits.timestampPeriod > 0; }
+    if (g_prof && !g_pq) {
+        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, PQ_CAP, 0};
+        if (vkCreateQueryPool_(VK.dev, &qi, NULL, &g_pq)) { g_prof = 0; return 0; }
+    }
+    return g_prof;
+}
+static void prof_cb_begin(void) {   // at a command buffer's start: the queries reset, query 0 the start
+    if (!prof_on()) return;
+    vkCmdResetQueryPool_(g_cb, g_pq, 0, PQ_CAP); vkCmdWriteTimestamp_(g_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_pq, 0); g_npq = 1; g_npm = 0;
+}
+static void prof_mark(int begin, uint32_t w, uint32_t h, uint32_t ncol, uint32_t depth, uint32_t compute, uint64_t fs, uint64_t draws) {
+    if (!g_prof || !g_pq || g_npq + 2 >= PQ_CAP) return;
+    if (begin) {
+        g_pm_cur = g_npm < PQ_CAP / 2 ? (uint32_t)g_npm++ : ~0u; if (g_pm_cur == ~0u) return;
+        g_pm[g_pm_cur] = (pmark){g_npq, 0, fs, w, h, ncol, depth, compute, 0};
+        vkCmdWriteTimestamp_(g_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_pq, g_npq++);
+    } else if (g_pm_cur != ~0u) {
+        if (fs && !g_pm[g_pm_cur].fs) g_pm[g_pm_cur].fs = fs;
+        g_pm[g_pm_cur].draws = draws;
+        vkCmdWriteTimestamp_(g_cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_pq, g_npq++); g_pm_cur = ~0u;
+    }
+}
+static void prof_cb_end(void) { if (g_prof && g_pq && g_npq < PQ_CAP) vkCmdWriteTimestamp_(g_cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_pq, g_npq++); }
+static void prof_collect(void) {   // after the submission completed
+    if (!g_prof || !g_pq || g_npq < 2) return;
+    static uint64_t ts[PQ_CAP];
+    if (vkGetQueryPoolResults_(VK.dev, g_pq, 0, g_npq, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT)) return;
+    double per = VK.limits.timestampPeriod / 1e6;
+    g_prof_total_ms += (ts[g_npq - 1] - ts[0]) * per; g_prof_subs++;
+    for (int i = 0; i < g_npm; i++) {
+        pmark *m = &g_pm[i]; if (m->q0 + 1 >= g_npq) continue;
+        double ms = (ts[m->q0 + 1] - ts[m->q0]) * per; if (ms < 0 || ms > 1000) continue;
+        uint64_t key = (uint64_t)m->w << 40 ^ (uint64_t)m->h << 24 ^ m->ncol << 4 ^ m->depth << 2 ^ m->compute ^ m->fs * 31;
+        int k = 0; while (k < g_npk && g_pk[k].key != key) k++;
+        if (k == g_npk) { if (g_npk >= 512) continue; g_pk[g_npk++] = (pkind){key, m->fs, m->w, m->h, m->ncol, m->depth, m->compute, 0, 0, 0}; }
+        g_pk[k].ms += ms; g_pk[k].n++; g_pk[k].draws += m->draws;
+    }
+    g_npq = 0;
+}
+static void prof_report(void) {
+    if (!g_prof || !g_prof_subs) return;
+    double sum = 0; for (int i = 0; i < g_npk; i++) sum += g_pk[i].ms;
+    LOG("[vk] GPU profile (last %llu submissions): %.2f ms GPU per submission, %.2f ms of it in passes and dispatches; the most expensive kinds:", (unsigned long long)g_prof_subs, g_prof_total_ms / g_prof_subs, sum / g_prof_subs);
+    for (int r = 0; r < 14; r++) {
+        int b = -1; for (int i = 0; i < g_npk; i++) if (g_pk[i].n && (b < 0 || g_pk[i].ms > g_pk[b].ms)) b = i;
+        if (b < 0) break;
+        pkind *k = &g_pk[b];
+        LOG("[vk]   %5.2f ms per submission: %s %ux%u, %u colour%s, %llu times, %.0f draws each, first fragment shader %016llx", k->ms / g_prof_subs, k->compute ? "dispatch" : "pass", k->w, k->h, k->ncol, k->depth ? " + depth" : "",
+            (unsigned long long)k->n, k->n ? (double)k->draws / k->n : 0.0, (unsigned long long)k->fs);
+        k->n = 0;
+    }
+    g_npk = 0; g_prof_total_ms = 0; g_prof_subs = 0;
+}
+
 static int pass_begin(void) {
     if (P.open) return 1;
     if (!R.has_rt) return 0;
@@ -520,6 +588,7 @@ static int pass_begin(void) {
     if (!cb_begin()) return 0;
     P.w = w; P.h = h; P.samples = samples ? samples : 1; P.draws0 = g_drawn;
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, 1, 0, nc, ca, P.has_d ? &da : NULL, P.has_s ? &sa : NULL};
+    g_pass_fs = 0; prof_mark(1, w, h, nc, P.dv != NULL, 0, 0, 0);
     vkCmdBeginRendering_(g_cb, &ri);
     P.open = 1; g_cb_ops++;
     return 1;
@@ -888,6 +957,7 @@ static void do_draw(const draw_args *a) {
     // (the sets are allocated and written before the pass begins and bound inside it)
     if (!pass_begin()) { g_skip[SK_NORT]++; return; }
     pkey k; memset(&k, 0, sizeof k);
+    if (!g_pass_fs && pr->st[VKS_FS]) g_pass_fs = pr->st[VKS_FS]->key;
     k.prog = pr->serial; memcpy(k.cf, P.cf, sizeof k.cf); k.df = P.df; k.ncol = P.ncol; k.samples = P.samples;
     k.topo = topo;
     int ll = atomic_load(&g_origin_ll);
@@ -1063,7 +1133,7 @@ static void dispatch_op(const p_dispatch *d) {
     vkCmdBindPipeline_(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_cp[i].p);
     uint32_t x = (uint32_t)d->x, y = (uint32_t)d->y, z = (uint32_t)d->z;
     if (d->ind) { const uint32_t *g = (const uint32_t *)(uintptr_t)d->ind; x = g[0]; y = g[1]; z = g[2]; }
-    if (x && y && z) { vkCmdDispatch_(g_cb, x, y, z); full_barrier(); g_disp_done++; g_cb_ops++; }
+    if (x && y && z) { prof_mark(1, x, y, z, 0, 1, 0, 0); vkCmdDispatch_(g_cb, x, y, z); prof_mark(0, x, y, z, 0, 1, pr->st[VKS_CS] ? pr->st[VKS_CS]->key : 0, 1); full_barrier(); g_disp_done++; g_cb_ops++; }
 }
 
 
