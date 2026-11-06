@@ -270,7 +270,7 @@ void vkw_present(uint64_t n, VkImage gimg, uint32_t gw, uint32_t gh, const int c
     if (W.frames == 1) LOG("[vk] first frame in the window");
     if (W.frames % 60 == 0) {
         double t = now_s(); static double last; static uint64_t lastf;
-        if (last) { char title[200]; snprintf(title, sizeof title, "nxnative - %s - %.1f fps - frame %llu (graphics: stage B, clears and copies only)", W.devname, (W.frames - lastf) / (t - last), (unsigned long long)n); S.SetWindowTitle(W.win, title); }
+        if (last) { char title[200]; snprintf(title, sizeof title, "nxnative - %s - %.1f fps - frame %llu", W.devname, (W.frames - lastf) / (t - last), (unsigned long long)n); S.SetWindowTitle(W.win, title); }
         last = t; lastf = W.frames;
     }
 }
