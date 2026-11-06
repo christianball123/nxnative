@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds and runs the Vulkan replay test on this machine (x86_64 or arm64): needs clang, glslangValidator, a Vulkan loader + driver and the validation layer
 # (Ubuntu: apt install glslang-tools mesa-vulkan-drivers vulkan-validationlayers libvulkan-dev; Fedora: dnf install glslang mesa-vulkan-drivers vulkan-validation-layers vulkan-loader-devel)
-# Expected: "pixels: row 0 80202020, row 20 80202020, row 40 ffff0000, row 63 ffff0000; quad: row 50 col 5 80202020, row 50 col 50 ffff0000", "storage buffer after the submission: 7 8 9 10 ... 14", "validation errors: 0"
+# Expected: "pixels: row 0 80202020, row 20 80202020, row 40 ffff0000, row 63 ffff0000; quad: row 50 col 5 80202020, row 50 col 50 ffff0000", "linear target's guest memory: row 0 80202020, row 50 col 5 80202020, row 50 col 50 ffff0000", "storage buffer after the submission: 7 8 9 10 ... 14", "validation errors: 0"
 set -e
 cd "$(dirname "$0")/../.."
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
@@ -17,4 +17,4 @@ GEN=$(ls -d build/*/gen 2>/dev/null | head -1); [ -n "$GEN" ] || { echo "build t
 F="-O0 -g -fblocks -D_GNU_SOURCE -w -I $T/inc -I include -I ../host -I ../gfx/nvn/include -I ../third_party/vulkan-headers/include -I $GEN"
 for s in gfx_vk_replay.c gfx_vk_shader.c ../gfx/tex/nvn_fmt_mtl.c ../gfx/nvn/nvn_tex.c ../gfx/tex/nvn_deswizzle.c tests/vk/replay_test.c; do clang $F -c $s -o "$T/$(basename $s .c).o"; done
 clang -o "$T/t" "$T"/*.o -ldl -lpthread -lm
-"$T/t" 1111111111111111 2222222222222222 "$T/t.dmsp" 2>&1 | grep -v "missing vk"
+if [ -n "$DM_TEST_GDB" ]; then gdb -batch -ex run -ex bt --args "$T/t" 1111111111111111 2222222222222222 "$T/t.dmsp"; else "$T/t" 1111111111111111 2222222222222222 "$T/t.dmsp" 2>&1 | grep -v "missing vk"; fi

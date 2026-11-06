@@ -14,6 +14,7 @@
 #include "../gfx/nvn/nvn_timestamp.h"
 #include "../gfx/tex/nvn_fmt_mtl.h"
 #include "../gfx/tex/nvn_deswizzle.h"
+#include "../gfx/nvn/nvn_dirty.h"
 #include "gfx_vk.h"
 #include <stdatomic.h>
 
@@ -62,7 +63,15 @@ static int fmt_int(VkFormat f) {   // integer formats clear with integer values
 struct vview;
 // gpu: the GPU has written it (render target, clear, copy destination, shader image): its content lives here and is never replaced from guest memory;
 // uploaded: its guest-memory content was copied in (stage C uploads a texture the GPU has not written at its first sampling, and again after the CPU writes it: mtl_tex_cpu_written)
-typedef struct { uint64_t serial; VkImage img; VkDeviceMemory mem; VkFormat fmt; uint32_t w, h, d, layers, levels, samples; int is3d, is1d, bad, gpu, uploaded, storage; struct vview *views; } vtex;
+// linear: a LINEAR texture, which the CPU and GPU may both write: its guest memory stays the reference (GPU writes are read back into it after each submission: wrote)
+// tracked: its guest pages are write-protected since stamp (nvn_dirty.c), so a CPU write since its upload is seen (prep_tex) and it is uploaded again
+typedef struct { uint64_t serial; VkImage img; VkDeviceMemory mem; VkFormat fmt; uint32_t w, h, d, layers, levels, samples; int is3d, is1d, bad, gpu, uploaded, storage; struct vview *views;
+                 int linear, wrote, tracked; uint8_t *gmem; uint64_t gsize, stamp; const void *span; uint32_t stride, rowbytes, rows; } vtex;
+static vtex **g_lw; static int g_nlw, g_clw;   // linear textures the GPU wrote in this submission
+static inline void gpu_wrote(vtex *v) {
+    v->gpu = 1; v->uploaded = 1;   // the GPU's content is the newest now: nothing from guest memory goes over it (a linear texture's is read back at the submission's end)
+    if (v->linear && !v->wrote) { v->wrote = 1; if (g_nlw == g_clw) { g_clw = g_clw ? 2 * g_clw : 16; g_lw = realloc(g_lw, g_clw * sizeof *g_lw); } g_lw[g_nlw++] = v; }
+}
 #define TEX_CAP (1u << 16)
 static vtex g_tex[TEX_CAP];   // open addressing by serial
 static pthread_mutex_t g_tex_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -112,6 +121,14 @@ static vtex *tex_get(const tex_t *t) {
     if (ai.memoryTypeIndex == ~0u) ai.memoryTypeIndex = vk_mem_type(mr.memoryTypeBits, 0);
     if ((r = vkAllocateMemory_(VK.dev, &ai, NULL, &v->mem)) || (r = vkBindImageMemory_(VK.dev, v->img, v->mem, 0))) {
         LOG("[RED] [vk] texture memory (%.1f MB) failed (%d)", mr.size / 1048576.0, r); vkDestroyImage_(VK.dev, v->img, NULL); v->img = VK_NULL_HANDLE; v->bad = 1; pthread_mutex_unlock(&g_tex_mu); return NULL; }
+    // where its content lives in guest memory (uploads, CPU-write tracking, a linear texture's read-back)
+    if (t->mem) {
+        nvn_texlayout L = t->L; if (!L.size) nvn_tex_layout(&t->d, &L);
+        int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+        v->gmem = t->mem; v->gsize = L.size;
+        v->linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && ci.mipLevels == 1 && ci.arrayLayers == 1 && ci.imageType != VK_IMAGE_TYPE_3D && bpb && samples == 1;
+        if (v->linear) { v->rowbytes = (ci.extent.width + bw - 1) / bw * (uint32_t)bpb; v->rows = (ci.extent.height + bh - 1) / bh; v->stride = t->d.stride ? t->d.stride : v->rowbytes; if (!v->gsize) v->gsize = (uint64_t)v->stride * v->rows; }
+    }
     v->fmt = f; v->w = ci.extent.width; v->h = ci.extent.height; v->d = ci.extent.depth; v->layers = ci.arrayLayers; v->levels = ci.mipLevels; v->is3d = ci.imageType == VK_IMAGE_TYPE_3D; v->is1d = ci.imageType == VK_IMAGE_TYPE_1D; v->samples = samples;
     g_tex_made++; g_tex_bytes += mr.size;
     if (g_tex_made == 1 || g_tex_made % 500 == 0) LOG("[vk] textures made: %llu, %.0f MB", (unsigned long long)g_tex_made, g_tex_bytes / 1048576.0);
@@ -200,6 +217,7 @@ static stage_t *stage_new(uint64_t n) {
 static void stages_done(void) {
     for (int i = 0; i < g_nstage; i++) {
         stage_t *s = &g_stage[i];
+        if (s->rb_dst) dm_guest_write_prepare(s->rb_dst, (s->rb_rows - 1) * s->rb_row + s->rb_n);   // guest pages the dirty tracking protects are opened first
         if (s->rb_dst) for (size_t r = 0; r < s->rb_rows; r++) memcpy(s->rb_dst + r * s->rb_row, (uint8_t *)s->p + r * s->rb_src_row, s->rb_n);
         vkUnmapMemory_(VK.dev, s->m); vkDestroyBuffer_(VK.dev, s->b, NULL); vkFreeMemory_(VK.dev, s->m, NULL);
     }
@@ -212,7 +230,7 @@ static void tex_fill(vtex *v, const tex_t *t);   // gfx_vk_draw.inc: a texture t
 static void clear_color(const p_clear_color *c) {
     if (!R.has_rt || c->index < 0 || c->index >= R.rt.n || !R.rt.color[c->index]) return;
     vtex *v = use(R.rt.color[c->index]); if (!v) return;
-    v->gpu = 1;
+    gpu_wrote(v);
     static int warned; if (c->mask != 0xf && !warned++) LOG("[vk] a colour clear with channel mask %#x was done on all channels (stage B has no masked clears)", c->mask);
     uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.cview[c->index], R.rt.has_cview[c->index], &lv, &nl, &l0, &nlay);
     VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 1, l0, nlay};
@@ -223,7 +241,7 @@ static void clear_color(const p_clear_color *c) {
 static void clear_ds(const p_clear_ds *c) {
     if (!R.has_rt || !R.rt.depth) return;
     vtex *v = use(R.rt.depth); if (!v) return;
-    v->gpu = 1;
+    gpu_wrote(v);
     VkImageAspectFlags a = fmt_aspects(v->fmt) & ((c->depth_mask ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (c->stencil_mask ? VK_IMAGE_ASPECT_STENCIL_BIT : 0));
     if (!a) return;
     uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.dview, R.rt.has_dview, &lv, &nl, &l0, &nlay);
@@ -233,7 +251,7 @@ static void clear_ds(const p_clear_ds *c) {
 }
 static void clear_tex(const p_clear_tex *c) {
     vtex *v = use(c->tex); if (!v) return;
-    v->gpu = 1;
+    gpu_wrote(v);
     uint32_t lv, nl, l0, nlay; view_range(v, &c->view, c->has_view, &lv, &nl, &l0, &nlay);
     uint32_t w = v->w >> lv ? v->w >> lv : 1, h = v->h >> lv ? v->h >> lv : 1;
     static int warned; if ((c->r.xoffset || c->r.yoffset || (uint32_t)c->r.width < w || (uint32_t)c->r.height < h) && !warned++) LOG("[vk] a texture clear of part of a level was done on the whole level (stage B)");
@@ -245,7 +263,7 @@ static void clear_tex(const p_clear_tex *c) {
 }
 static void copy_b2t(const p_copy_b2t *c) {
     vtex *v = use(c->tex); if (!v) return;
-    tex_fill(v, c->tex); v->gpu = 1;   // a copy into part of a texture keeps the rest: its guest content goes in first
+    tex_fill(v, c->tex); gpu_wrote(v);   // a copy into part of a texture keeps the rest: its guest content goes in first
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh); if (!bpb) return;
     uint32_t lv, nl, l0, nlay; view_range(v, &c->view, c->has_view, &lv, &nl, &l0, &nlay);
     size_t wb = (size_t)((c->r.width + bw - 1) / bw) * bpb, rows = (size_t)(c->r.height + bh - 1) / bh;
@@ -280,7 +298,7 @@ static void copy_t2b(const p_copy_t2t *c) {   // T2B reuses p_copy_t2t: src hold
 }
 static void copy_t2t(const p_copy_t2t *c) {
     vtex *s = use(c->src), *d = use(c->dst); if (!s || !d) return;
-    tex_fill(s, c->src); tex_fill(d, c->dst); d->gpu = 1;
+    tex_fill(s, c->src); tex_fill(d, c->dst); gpu_wrote(d);
     uint32_t slv, snl, sl0, snlay, dlv, dnl, dl0, dnlay;
     view_range(s, &c->sv, c->has_sv, &slv, &snl, &sl0, &snlay); view_range(d, &c->dv, c->has_dv, &dlv, &dnl, &dl0, &dnlay);
     const NVNcopyRegion *a = &c->sr, *b = &c->dr;
@@ -357,6 +375,7 @@ void mtl_sub_begin(void) {
 uint64_t mtl_sub_commit(void) {
     if (g_cb_open) {
         pass_end();
+        linear_readbacks();
         vkEndCommandBuffer_(g_cb); g_cb_open = 0;
         VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &g_cb, 0, NULL};
         pthread_mutex_lock(&VK.qmu);
@@ -369,6 +388,7 @@ uint64_t mtl_sub_commit(void) {
             vkResetFences_(VK.dev, 1, &g_fence_vk);
         }
         stages_done();
+        linear_done();
         draw_submitted();
     }
     // The submission has completed: its events and counters land, in record order

@@ -10,6 +10,10 @@ VKI_FUNCS(VK_DEF) VKD_FUNCS(VK_DEF)
 vk_core VK;
 static int g_val_errors;
 uint64_t guest_ns(void) { return 0; }
+// the dirty-page tracker (nvn_dirty.c) is not part of the test: nothing is tracked
+int nvn_dirty_tracked(const void *a, size_t n) { return 0; } uint64_t nvn_dirty_now(void) { return 0; } void nvn_dirty_protect(const void *a, size_t n) {}
+const void *nvn_dirty_span(const void *a, size_t n) { return NULL; } int nvn_dirty_since_span(const void *s, const void *a, size_t n, uint64_t st) { return 0; }
+void dm_guest_write_prepare(void *a, size_t n) {}
 int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) { if (st >= p->nstage) return 0; memcpy(key, p->sd[st].control, 8); return 1; }
 int vkw_wanted(void) { return 1; }
 uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want) { for (uint32_t i = 0; i < VK.mem.memoryTypeCount; i++) if ((bits >> i & 1) && (VK.mem.memoryTypes[i].propertyFlags & want) == want) return i; return ~0u; }
@@ -62,7 +66,8 @@ int main(int argc, char **argv) {
     // render target 64x64 RGBA8, and a sampled 64x64 RGBA8 texture with block-linear storage (all 0x80)
     static tex_t rt, tx; memset(&rt, 0, sizeof rt);
     rt.d.target = NVN_TEXTURE_TARGET_2D; rt.d.format = NVN_FORMAT_RGBA8; rt.d.width = rt.d.height = 64; rt.d.depth = 1; rt.d.levels = 1; rt.serial = 1;
-    tx = rt; tx.serial = 2; nvn_tex_layout(&tx.d, &tx.L); tx.mem = malloc(tx.L.size); memset(tx.mem, 0x80, tx.L.size);
+    rt.d.flags = NVN_TEXTURE_FLAGS_LINEAR; rt.d.stride = 256; rt.mem = calloc(1, 256 * 64);   // a linear render target: drawn pixels are read back into its guest memory
+    tx = rt; tx.d.flags = 0; tx.d.stride = 0; tx.serial = 2; nvn_tex_layout(&tx.d, &tx.L); tx.mem = malloc(tx.L.size); memset(tx.mem, 0x80, tx.L.size);
     mtl_reg_tex(5, &tx, NULL);
     samp_par sp = {NVN_MIN_FILTER_LINEAR, NVN_MAG_FILTER_LINEAR, NVN_WRAP_MODE_REPEAT, NVN_WRAP_MODE_REPEAT, NVN_WRAP_MODE_REPEAT, 0, 0, 0, 0, 1000, 0, 1, {0}};
     mtl_reg_samp(3, &sp);
@@ -100,6 +105,7 @@ int main(int argc, char **argv) {
     rec(OP_END, 0);
     mtl_sub_begin(); mtl_exec(cmd); mtl_sub_commit();
     LOG("pixels: row 0 %08x, row 20 %08x, row 40 %08x, row 63 %08x; quad: row 50 col 5 %08x, row 50 col 50 %08x", px[0], px[20 * 64 + 5], px[40 * 64 + 5], px[63 * 64 + 5], px[50 * 64 + 5], px[50 * 64 + 50]);
+    { const uint32_t *g = (const uint32_t *)rt.mem; LOG("linear target's guest memory: row 0 %08x, row 50 col 5 %08x, row 50 col 50 %08x", g[0], g[50 * 64 + 5], g[50 * 64 + 50]); }
     LOG("storage buffer after the submission: %u %u %u %u ... %u", sbuf_p[0], sbuf_p[1], sbuf_p[2], sbuf_p[3], sbuf_p[7]);
     LOG("validation errors: %d", g_val_errors);
     return g_val_errors ? 1 : 0;

@@ -101,45 +101,22 @@ int mtl_tex_gpu_owned(uint64_t serial) { pthread_mutex_lock(&g_tex_mu); vtex *v 
 
 // ---------------------------------------------------------------- texture contents from guest memory
 static uint64_t g_up_tex, g_up_bytes, g_up_fail, g_reup;
-// Textures uploaded from guest memory and small enough to watch: the CPU may keep writing them without telling NVN (a font's glyph cache gets letters as text first needs them),
-// so each one's storage is checksummed again now and then (a budget per submission, round robin) and re-uploaded at its next use when the checksum changed
-#define WATCH_MAX_BYTES (32u << 20)   // Mario Tennis Fever's glyph sheets: 8192x2048 R8, 16 MB each
-#define WATCH_BUDGET (40u << 20)
-typedef struct { uint64_t serial; const uint8_t *mem; uint64_t size, sum; } watched;
-static watched *g_wt; static int g_nwt, g_cwt, g_wt_cur;
-static uint64_t storage_sum(const uint8_t *p, uint64_t n) {
-    uint64_t a = 0x9E3779B97F4A7C15ull, b = 0, w; uint64_t i = 0;
-    for (; i + 8 <= n; i += 8) { memcpy(&w, p + i, 8); a = (a ^ w) * 0x100000001B3ull; b += w; }
-    for (; i < n; i++) a = (a ^ p[i]) * 0x100000001B3ull;
-    return a ^ (b * 0xff51afd7ed558ccdull);
+// CPU writes after an upload: the texture's guest pages are write-protected (nvn_dirty.c, the pools are tracked ranges), so the game's next write there faults once and is
+// recorded; prep_tex sees it and the texture is uploaded again. NVN is not told about such writes (a font's glyph sheet, a movie's frames)
+static uint64_t g_untracked;
+static void track(vtex *v) {
+    if (!v->gmem || !v->gsize) return;
+    if (!nvn_dirty_tracked(v->gmem, v->gsize)) { v->tracked = 0; g_untracked++; return; }
+    v->stamp = nvn_dirty_now(); nvn_dirty_protect(v->gmem, v->gsize); v->span = nvn_dirty_span(v->gmem, v->gsize); v->tracked = 1;
 }
-static void watch_add(const tex_t *t, uint64_t size) {
-    if (!size || size > WATCH_MAX_BYTES) return;
-    for (int i = 0; i < g_nwt; i++) if (g_wt[i].serial == t->serial) { g_wt[i].mem = t->mem; g_wt[i].size = size; g_wt[i].sum = storage_sum(t->mem, size); return; }
-    if (g_nwt == g_cwt) { g_cwt = g_cwt ? 2 * g_cwt : 64; g_wt = realloc(g_wt, g_cwt * sizeof *g_wt); }
-    g_wt[g_nwt++] = (watched){t->serial, t->mem, size, storage_sum(t->mem, size)};
-}
-static uint64_t g_watch_ns;
-static void watch_poll(void) {
-    uint64_t done = 0; struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (int k = 0; k < g_nwt && done < WATCH_BUDGET; k++) {
-        if (g_wt_cur >= g_nwt) g_wt_cur = 0;
-        watched *w = &g_wt[g_wt_cur];
-        pthread_mutex_lock(&g_tex_mu); vtex *v = tex_slot(w->serial, 0); int alive = v && v->img && !v->gpu; pthread_mutex_unlock(&g_tex_mu);
-        if (!alive) { g_wt[g_wt_cur] = g_wt[--g_nwt]; continue; }   // released, or the GPU writes it now
-        uint64_t s = storage_sum(w->mem, w->size); done += w->size;
-        if (s != w->sum) { w->sum = s; pthread_mutex_lock(&g_tex_mu); if (v->uploaded) { v->uploaded = 0; g_reup++; } pthread_mutex_unlock(&g_tex_mu); }
-        g_wt_cur++;
-    }
-    clock_gettime(CLOCK_MONOTONIC, &t1); g_watch_ns += (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull + (t1.tv_nsec - t0.tv_nsec);
-}
+static int cpu_wrote(vtex *v) { return v->tracked && nvn_dirty_since_span(v->span, v->gmem, v->gsize, v->stamp); }
 // DM_VK_TEXLOG=1: one line per texture upload (and every failure is logged, the first 20)
 static int texlog(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_TEXLOG"); on = e && *e == '1'; } return on; }
 #define UPFAIL(why) do { g_up_fail++; static int nf_; if (nf_++ < 20 || texlog()) LOG("[RED] [vk] texture upload failed (%s): serial %llu format %#x target %d %ux%ux%u levels %u flags %#x samples %d", why, \
     (unsigned long long)t->serial, t->d.format, t->d.target, t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.flags, t->d.samples); } while (0)
 static void tex_fill(vtex *v, const tex_t *t) {
     if (v && !v->gpu && !v->uploaded && t && !t->mem && texlog()) { static int n; if (n++ < 50) LOG("[vk] texture serial %llu format %#x %ux%u has no storage pointer: not uploaded", (unsigned long long)t->serial, t->d.format, t->d.width, t->d.height); }
-    if (!v || v->gpu || v->uploaded || !t || !t->mem || v->samples > 1) return;
+    if (!v || (v->gpu && !v->linear) || v->uploaded || !t || !t->mem || v->samples > 1) return;
     v->uploaded = 1;
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); if (!bpb) { UPFAIL("unknown format size"); return; }
     int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;
@@ -172,8 +149,7 @@ static void tex_fill(vtex *v, const tex_t *t) {
     if (texlog()) LOG("[vk] texture upload: serial %llu format %#x (Vulkan %d) target %d %ux%ux%u levels %u layers %u flags %#x%s swizzle %s%#x, %.1f KB, first word %08x",
                       (unsigned long long)t->serial, t->d.format, v->fmt, t->d.target, t->d.width, t->d.height, t->d.depth, levels, layers, t->d.flags, linear ? " (linear)" : "",
                       t->set_swz ? "set " : "", t->swz, total / 1024.0, *(const uint32_t *)s->p);
-    nvn_texlayout L = t->L; if (!L.size) nvn_tex_layout(&t->d, &L);
-    watch_add(t, L.size);
+    track(v);
 }
 
 // ---------------------------------------------------------------- samplers
@@ -437,7 +413,8 @@ static void pass_end(void) { if (P.open) { vkCmdEndRendering_(g_cb); full_barrie
 // A texture a draw reads, ready for it: its first use (layout, zero fill) and its guest content are command-buffer work outside a render pass, so a pass open then is ended first
 static vtex *prep_tex(const tex_t *t) {
     vtex *v = tex_get(t); if (!v) return NULL;
-    if (!(v->bad & 2) || (!v->gpu && !v->uploaded && t->mem && v->samples == 1)) { pass_end(); if (!cb_begin()) return NULL; img_general(v); tex_fill(v, t); }
+    if (v->uploaded && cpu_wrote(v)) { v->uploaded = 0; g_reup++; }   // the CPU wrote its storage since the upload
+    if (!(v->bad & 2) || ((!v->gpu || v->linear) && !v->uploaded && t->mem && v->samples == 1)) { pass_end(); if (!cb_begin()) return NULL; img_general(v); tex_fill(v, t); }
     return v;
 }
 static int pass_begin(void) {
@@ -454,7 +431,7 @@ static int pass_begin(void) {
         uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.cview[i], R.rt.has_cview[i], &lv, &nl, &l0, &nlay);
         VkImageView iv = view_get(v, v->is3d ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, v->is3d ? 0 : l0, 1, (VkComponentMapping){0, 0, 0, 0}, VK_IMAGE_ASPECT_COLOR_BIT, 2);
         if (!iv) continue;
-        v->gpu = 1; ca[i].imageView = iv; P.cf[i] = v->fmt; any = 1;
+        gpu_wrote(v); ca[i].imageView = iv; P.cf[i] = v->fmt; any = 1;
         uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1;
         if (lw < w) w = lw;
         if (lh < h) h = lh;
@@ -470,7 +447,7 @@ static int pass_begin(void) {
             uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.dview, R.rt.has_dview, &lv, &nl, &l0, &nlay);
             VkImageView iv = view_get(v, VK_IMAGE_VIEW_TYPE_2D, lv, 1, l0, 1, (VkComponentMapping){0, 0, 0, 0}, fmt_aspects(v->fmt), 2);
             if (iv) {
-                v->gpu = 1; P.df = v->fmt; any = 1;
+                gpu_wrote(v); P.df = v->fmt; any = 1;
                 VkImageAspectFlags a = fmt_aspects(v->fmt);
                 if (a & VK_IMAGE_ASPECT_DEPTH_BIT) { da.imageView = iv; P.has_d = 1; }
                 if (a & VK_IMAGE_ASPECT_STENCIL_BIT) { sa.imageView = iv; P.has_s = 1; }
@@ -696,7 +673,7 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                 if (b->vktype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->vktype != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) { VkSampler x = sampler_for(sreg_get((int)(h >> 20))); if (x) sp = x; }
                 if (r && b->vktype != VK_DESCRIPTOR_TYPE_SAMPLER) {
                     vtex *v = prep_tex(&r->t);
-                    if (v && (!storage || v->storage)) { iv = tex_view(v, &r->t, &r->v, r->has_v, b->image, storage); if (storage && iv) v->gpu = 1; }
+                    if (v && (!storage || v->storage)) { iv = tex_view(v, &r->t, &r->v, r->has_v, b->image, storage); if (storage && iv) gpu_wrote(v); }
                 }
                 if (!iv && r) { g_tex_missing++; static int n; if (n++ < 10) LOG("[vk] shader %016llx binding %u: texture serial %llu (format %#x target %d, %u samples) has no view of the shader's image type %#x",
                     (unsigned long long)s->key, b->binding, (unsigned long long)r->t.serial, r->t.d.format, r->t.d.target, r->t.d.samples, b->image); }
@@ -930,8 +907,25 @@ static void dispatch_op(const p_dispatch *d) {
 }
 
 // ---------------------------------------------------------------- the submission's end: the ring and descriptor pools start over
+// Linear textures the GPU wrote: read back into guest memory with the submission (the CPU may read or keep writing them), then protected again
+static uint64_t g_lin_rb, g_lin_rb_bytes;
+static void linear_readbacks(void) {
+    for (int i = 0; i < g_nlw; i++) {
+        vtex *v = g_lw[i]; if (!v->img || !v->gmem || !v->rowbytes) continue;
+        stage_t *st = stage_new((uint64_t)v->rowbytes * v->rows); if (!st) continue;
+        st->rb_dst = v->gmem; st->rb_row = v->stride; st->rb_src_row = v->rowbytes; st->rb_rows = v->rows; st->rb_n = v->rowbytes;
+        VkBufferImageCopy bic = {0, 0, 0, {fmt_aspects(v->fmt) & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT), 0, 0, 1}, {0, 0, 0}, {v->w, v->h, 1}};
+        if (!bic.imageSubresource.aspectMask) bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+        vkCmdCopyImageToBuffer_(g_cb, v->img, VK_IMAGE_LAYOUT_GENERAL, st->b, 1, &bic);
+        g_lin_rb++; g_lin_rb_bytes += (uint64_t)v->rowbytes * v->rows;
+    }
+    if (g_nlw) full_barrier();
+}
+static void linear_done(void) {   // after the readbacks landed (stages_done): their storage is the content again
+    for (int i = 0; i < g_nlw; i++) { vtex *v = g_lw[i]; v->wrote = 0; if (v->img) { v->uploaded = 1; track(v); } }
+    g_nlw = 0;
+}
 static void draw_submitted(void) {
-    watch_poll();
     for (int i = 0; i < g_nwb; i++) { memcpy((void *)(uintptr_t)g_wb[i].addr, RG.p + g_wb[i].off, g_wb[i].size); g_wb_bytes += g_wb[i].size; }
     g_nwb = 0;
     RG.used = 0; DZ.support_off = 0;
@@ -940,8 +934,8 @@ static void draw_submitted(void) {
     g_dp_cur = 0;
 }
 static void draw_summary(char *out, size_t n) {
-    int o = snprintf(out, n, "drawn %llu (%llu of them quads), dispatched %llu, pipelines %llu, textures uploaded %llu (%.0f MB, %llu failed, %llu again after CPU writes, %d watched, %.1f s spent checking)", (unsigned long long)g_drawn, (unsigned long long)g_quads, (unsigned long long)g_disp_done,
-                     (unsigned long long)g_pipes, (unsigned long long)g_up_tex, g_up_bytes / 1048576.0, (unsigned long long)g_up_fail, (unsigned long long)g_reup, g_nwt, g_watch_ns / 1e9);
+    int o = snprintf(out, n, "drawn %llu (%llu of them quads), dispatched %llu, pipelines %llu, textures uploaded %llu (%.0f MB, %llu failed, %llu again after CPU writes, %llu untracked; linear textures read back %llu times, %.0f MB)", (unsigned long long)g_drawn, (unsigned long long)g_quads, (unsigned long long)g_disp_done,
+                     (unsigned long long)g_pipes, (unsigned long long)g_up_tex, g_up_bytes / 1048576.0, (unsigned long long)g_up_fail, (unsigned long long)g_reup, (unsigned long long)g_untracked, (unsigned long long)g_lin_rb, g_lin_rb_bytes / 1048576.0);
     for (int i = 0; i < SK_N && o < (int)n; i++) if (g_skip[i]) o += snprintf(out + o, n - o, "; skipped (%s) %llu", k_sk[i], (unsigned long long)g_skip[i]);
     if (g_tex_missing && o < (int)n) o += snprintf(out + o, n - o, "; texture bindings without a usable view %llu", (unsigned long long)g_tex_missing);
     if (g_tex_unreg && o < (int)n) o += snprintf(out + o, n - o, "; bound texture IDs not registered %llu", (unsigned long long)g_tex_unreg);
