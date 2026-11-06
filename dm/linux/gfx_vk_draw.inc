@@ -103,8 +103,8 @@ int mtl_tex_gpu_owned(uint64_t serial) { pthread_mutex_lock(&g_tex_mu); vtex *v 
 static uint64_t g_up_tex, g_up_bytes, g_up_fail, g_reup;
 // Textures uploaded from guest memory and small enough to watch: the CPU may keep writing them without telling NVN (a font's glyph cache gets letters as text first needs them),
 // so each one's storage is checksummed again now and then (a budget per submission, round robin) and re-uploaded at its next use when the checksum changed
-#define WATCH_MAX_BYTES (8u << 20)
-#define WATCH_BUDGET (24u << 20)
+#define WATCH_MAX_BYTES (32u << 20)   // Mario Tennis Fever's glyph sheets: 8192x2048 R8, 16 MB each
+#define WATCH_BUDGET (40u << 20)
 typedef struct { uint64_t serial; const uint8_t *mem; uint64_t size, sum; } watched;
 static watched *g_wt; static int g_nwt, g_cwt, g_wt_cur;
 static uint64_t storage_sum(const uint8_t *p, uint64_t n) {
@@ -119,8 +119,9 @@ static void watch_add(const tex_t *t, uint64_t size) {
     if (g_nwt == g_cwt) { g_cwt = g_cwt ? 2 * g_cwt : 64; g_wt = realloc(g_wt, g_cwt * sizeof *g_wt); }
     g_wt[g_nwt++] = (watched){t->serial, t->mem, size, storage_sum(t->mem, size)};
 }
+static uint64_t g_watch_ns;
 static void watch_poll(void) {
-    uint64_t done = 0;
+    uint64_t done = 0; struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int k = 0; k < g_nwt && done < WATCH_BUDGET; k++) {
         if (g_wt_cur >= g_nwt) g_wt_cur = 0;
         watched *w = &g_wt[g_wt_cur];
@@ -130,6 +131,7 @@ static void watch_poll(void) {
         if (s != w->sum) { w->sum = s; pthread_mutex_lock(&g_tex_mu); if (v->uploaded) { v->uploaded = 0; g_reup++; } pthread_mutex_unlock(&g_tex_mu); }
         g_wt_cur++;
     }
+    clock_gettime(CLOCK_MONOTONIC, &t1); g_watch_ns += (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull + (t1.tv_nsec - t0.tv_nsec);
 }
 // DM_VK_TEXLOG=1: one line per texture upload (and every failure is logged, the first 20)
 static int texlog(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_TEXLOG"); on = e && *e == '1'; } return on; }
@@ -938,8 +940,8 @@ static void draw_submitted(void) {
     g_dp_cur = 0;
 }
 static void draw_summary(char *out, size_t n) {
-    int o = snprintf(out, n, "drawn %llu (%llu of them quads), dispatched %llu, pipelines %llu, textures uploaded %llu (%.0f MB, %llu failed, %llu again after CPU writes, %d watched)", (unsigned long long)g_drawn, (unsigned long long)g_quads, (unsigned long long)g_disp_done,
-                     (unsigned long long)g_pipes, (unsigned long long)g_up_tex, g_up_bytes / 1048576.0, (unsigned long long)g_up_fail, (unsigned long long)g_reup, g_nwt);
+    int o = snprintf(out, n, "drawn %llu (%llu of them quads), dispatched %llu, pipelines %llu, textures uploaded %llu (%.0f MB, %llu failed, %llu again after CPU writes, %d watched, %.1f s spent checking)", (unsigned long long)g_drawn, (unsigned long long)g_quads, (unsigned long long)g_disp_done,
+                     (unsigned long long)g_pipes, (unsigned long long)g_up_tex, g_up_bytes / 1048576.0, (unsigned long long)g_up_fail, (unsigned long long)g_reup, g_nwt, g_watch_ns / 1e9);
     for (int i = 0; i < SK_N && o < (int)n; i++) if (g_skip[i]) o += snprintf(out + o, n - o, "; skipped (%s) %llu", k_sk[i], (unsigned long long)g_skip[i]);
     if (g_tex_missing && o < (int)n) o += snprintf(out + o, n - o, "; texture bindings without a usable view %llu", (unsigned long long)g_tex_missing);
     if (g_tex_unreg && o < (int)n) o += snprintf(out + o, n - o, "; bound texture IDs not registered %llu", (unsigned long long)g_tex_unreg);
