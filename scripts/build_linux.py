@@ -228,7 +228,28 @@ export DM_AUDIO="${{DM_AUDIO:-1}}"   # sound through SDL3 (DM_AUDIO=0: silent)
 exec ./dmhost "{patched}" "$@" 2>&1 | tee log.txt
 ''')
     script.chmod(0o755)
+    # play.sh: the launcher to add to Steam (Add a Non-Steam Game). Steam runs on the host, outside the toolbox the game was built in: the launcher enters the toolbox
+    # (its libraries: SDL3, Vulkan, .NET are not needed to play) and starts the game full screen with its window. Under Steam the controls come through Steam Input
+    # as an Xbox 360 pad, which also works where the handheld's own controls act as a mouse (desktop mode)
+    box = ''
+    try:
+        for line in open('/run/.containerenv'):
+            if line.startswith('name='): box = line.split('=', 1)[1].strip().strip('"')
+    except OSError: pass
+    play = lw / 'play.sh'
+    play.write_text(f'''#!/bin/sh
+# Starts {tid} full screen with controllers. Add this file to Steam: Games > Add a Non-Steam Game to My Library > Browse > this file.
+# Runs inside the toolbox "{box or 'none'}" (where it was built); the log is log.txt beside this file. DM_PAD_LAYOUT=xbox in Steam's launch options: A at the bottom
+if [ ! -f /run/.toolboxenv ] && [ ! -f /run/.containerenv ] && [ -n "{box}" ] && command -v toolbox >/dev/null; then
+    exec toolbox run -c "{box}" "$0" "$@"
+fi
+cd "$(dirname "$0")"
+export DM_WINDOW=1 DM_FULLSCREEN="${{DM_FULLSCREEN:-1}}"
+exec ./run.sh "$@"
+''')
+    play.chmod(0o755)
     say(f'\ndone. Run it with:\n  {script}\nthen send me {lw / "log.txt"}')
+    say(f'To play from Steam (controllers through Steam Input): add this as a non-Steam game:\n  {play}')
 
 
 if __name__ == '__main__':
