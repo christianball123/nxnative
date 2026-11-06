@@ -54,8 +54,7 @@ def rewrite(words):
     if nin < nout: raise ValueError('fewer input vertices than an output primitive has')
     def builtin(v): return next((d[1] for d in decos.get(v, []) if d[0] == DEC_BUILTIN), None)
     def pointee(v): return ptrs[vars_[v][0]][1]
-    mask_var = next((v for v in vars_ if builtin(v) == BI_VPMASK), None)
-    if mask_var is None: raise ValueError('no viewport mask output')
+    mask_var = next((v for v in vars_ if builtin(v) == BI_VPMASK), None)   # None: no mask, the primitive goes out once (its layer or other outputs as the shader set them)
     # the input and output gl_PerVertex blocks, and the passthrough user inputs (Location)
     in_block = out_block = None
     for v, (pt, sc) in vars_.items():
@@ -81,10 +80,11 @@ def rewrite(words):
         return cache[('p', sc, t)]
     # the mask: Private from now on (every pointer derived from it retyped)
     retype = {}
-    mask_ptr_old = vars_[mask_var][0]
-    retype[mask_var] = ptr(SC_PRIVATE, pointee(mask_var))
-    # gl_ViewportIndex output
-    vpi = new_id(); new_globals.append(ins_(59, ptr(SC_OUTPUT, int_t), vpi, SC_OUTPUT)); new_decos.append(ins_(71, vpi, DEC_BUILTIN, BI_VPINDEX))
+    vpi = None
+    if mask_var is not None:
+        retype[mask_var] = ptr(SC_PRIVATE, pointee(mask_var))
+        # gl_ViewportIndex output
+        vpi = new_id(); new_globals.append(ins_(59, ptr(SC_OUTPUT, int_t), vpi, SC_OUTPUT)); new_decos.append(ins_(71, vpi, DEC_BUILTIN, BI_VPINDEX))
     # outputs for the passthrough user inputs, at their locations
     user_out = []
     for v in user_in:
@@ -96,13 +96,15 @@ def rewrite(words):
     # the code emitted before each OpReturn of the entry function
     def emit_code():
         code = []
-        p = new_id(); code.append(ins_(65, ptr(SC_PRIVATE, int_t), p, mask_var, const(0)))
-        mask = new_id(); code.append(ins_(61, int_t, mask, p))
-        for b in range(NVP):
-            bit = new_id(); code.append(ins_(199, int_t, bit, mask, const(1 << b)))
-            cond = new_id(); code.append(ins_(171, bool_t, cond, bit, const(0)))
-            then, merge = new_id(), new_id()
-            code.append(ins_(247, merge, 0)); code.append(ins_(250, cond, then, merge)); code.append(ins_(248, then))
+        if mask_var is not None:
+            p = new_id(); code.append(ins_(65, ptr(SC_PRIVATE, int_t), p, mask_var, const(0)))
+            mask = new_id(); code.append(ins_(61, int_t, mask, p))
+        for b in range(NVP if mask_var is not None else 1):
+            if mask_var is not None:
+                bit = new_id(); code.append(ins_(199, int_t, bit, mask, const(1 << b)))
+                cond = new_id(); code.append(ins_(171, bool_t, cond, bit, const(0)))
+                then, merge = new_id(), new_id()
+                code.append(ins_(247, merge, 0)); code.append(ins_(250, cond, then, merge)); code.append(ins_(248, then))
             for vtx in range(nout):
                 if in_block and out_block:
                     iv, iel = in_block; ov, ot = out_block
@@ -116,10 +118,10 @@ def rewrite(words):
                 for v, o, el in user_out:
                     src = new_id(); code.append(ins_(65, ptr(SC_INPUT, el), src, v, const(vtx)))
                     val = new_id(); code.append(ins_(61, el, val, src)); code.append(ins_(62, o, val))
-                code.append(ins_(62, vpi, const(b)))
+                if vpi is not None: code.append(ins_(62, vpi, const(b)))
                 code.append(ins_(218))   # OpEmitVertex
             code.append(ins_(219))       # OpEndPrimitive
-            code.append(ins_(249, merge)); code.append(ins_(248, merge))
+            if mask_var is not None: code.append(ins_(249, merge)); code.append(ins_(248, merge))
         return code
     code = [x for c in emit_code() for x in c]
     def deps(t):
@@ -141,28 +143,28 @@ def rewrite(words):
     # rebuild
     out = words[:5]; in_fn = False; types_done = False; deco_done = False; cap_done = False
     has_mv = any(w[1] == CAP_MULTIVIEWPORT for _, o2, w in _ins(words) if o2 == 17)
-    derived = {mask_var}
+    derived = {mask_var} if mask_var is not None else set()
     for i, op, ins in _ins(words):
         ins = list(ins)
         if op == 17 and ins[1] in (CAP_PASSTHROUGH, CAP_VPMASK): continue
         if op == 10 and _str(ins[1:]) in ('SPV_NV_geometry_shader_passthrough', 'SPV_NV_viewport_array2'): continue
         if op == 72 and len(ins) > 3 and ins[3] == DEC_PASSTHROUGH: continue
         if op == 71 and ins[2] == DEC_PASSTHROUGH: continue
-        if op == 71 and ins[1] == mask_var and ins[2] == DEC_BUILTIN: continue
+        if op == 71 and mask_var is not None and ins[1] == mask_var and ins[2] == DEC_BUILTIN: continue
         if op != 17 and not cap_done:   # MultiViewport (gl_ViewportIndex in a geometry shader) after the other capabilities
             if not has_mv: out += ins_(17, CAP_MULTIVIEWPORT)
             cap_done = True
         if op == 15:   # the entry point's interface: the mask is no longer an output, the new outputs are
             nm_words = (len(_str(ins[3:]).encode()) // 4) + 1
-            iface = [x for x in ins[3 + nm_words:] if x != mask_var] + [vpi] + [o for _, o, _ in user_out]
+            iface = [x for x in ins[3 + nm_words:] if x != mask_var] + ([vpi] if vpi is not None else []) + [o for _, o, _ in user_out]
             ins = ins_(15, ins[1], ins[2], *ins[3:3 + nm_words], *iface)
-        if op == 16 and ins[2] == 26: ins = ins_(16, ins[1], 26, nout * NVP)   # OutputVertices: one primitive per viewport
+        if op == 16 and ins[2] == 26: ins = ins_(16, ins[1], 26, nout * (NVP if mask_var is not None else 1))   # OutputVertices: one primitive per viewport
         if op == 54 and not types_done:   # the first function: the new variables go before it
             flush(out)
             if pending: raise ValueError('a new type refers to an undefined id')
             for g in new_globals: out += g
             types_done = True
-        if op == 59 and ins[2] == mask_var:   # its Private pointer type must exist first
+        if op == 59 and mask_var is not None and ins[2] == mask_var:   # its Private pointer type must exist first
             ins[1] = retype[mask_var]; ins[3] = SC_PRIVATE
             flush(out)
         if op in (65, 66, 83) and len(ins) > 3 and ins[3] in derived:   # pointers derived from the mask: Private

@@ -111,7 +111,9 @@ def entry(spv_path, res_path, job_path=None):
     data = Path(spv_path).read_bytes()
     words = struct.unpack(f'<{len(data) // 4}I', data)
     if words[0] != 0x07230203: raise ValueError('not SPIR-V')
-    if spv_passthrough.is_passthrough(words): words = spv_passthrough.rewrite(words)   # NVIDIA passthrough geometry shader → an ordinary one (spv_passthrough.py)
+    if spv_passthrough.is_passthrough(words):   # NVIDIA passthrough geometry shader → an ordinary one (spv_passthrough.py); one it cannot rewrite stays as it is
+        try: words = spv_passthrough.rewrite(words)
+        except Exception as e: print(f'[YELLOW] {Path(spv_path).stem}: passthrough geometry shader not rewritten ({e}): kept as it is', flush=True)
     words = strip_unused(words); data = struct.pack(f'<{len(words)}I', *words)
     model, binds, vin, fout, local = reflect(words)
     res = json.load(open(res_path)) if os.path.exists(res_path) else {}
