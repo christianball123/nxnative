@@ -440,6 +440,7 @@ static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
 static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0; } P;
 static void dump_pass(void);
+static int g_dump_subs, g_dump_pass, g_dump_lines;   // frame dumps (below)
 static void pass_end(void) { if (P.open) { vkCmdEndRendering_(g_cb); full_barrier(); P.open = 0; dump_pass(); } }
 // A texture a draw reads, ready for it: its first use (layout, zero fill) and its guest content are command-buffer work outside a render pass, so a pass open then is ended first
 static vtex *prep_tex(const tex_t *t) {
@@ -748,6 +749,14 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                 }
                 if (!r && b->vktype != VK_DESCRIPTOR_TYPE_SAMPLER && (h & 0xfffff)) { g_tex_unreg++; static int n; if (n++ < 10) LOG("[vk] shader %016llx binding %u: %s ID %u is not registered", (unsigned long long)s->key, b->binding, storage ? "image" : "texture", h & 0xfffff); }
             } else { g_tex_unres++; static int n; if (n++ < 10) LOG("[vk] shader %016llx binding %u: handle %#x in bank %u is not one this layer reads (texture slots, images, separate samplers; uniform buffers)", (unsigned long long)s->key, b->binding, b->reg, b->aux); }
+            if (g_dump_subs && g_dump_lines < 4000 && b->vktype != VK_DESCRIPTOR_TYPE_SAMPLER) {
+                g_dump_lines++;
+                const treg *r = ok ? (storage ? ireg_get((int)(h & 0xfffff)) : treg_get((int)(h & 0xfffff))) : NULL;
+                if (iv && r) LOG("[vk] dump:   pass %d shader %016llx binding %u%s: texture serial %llu (%ux%u, NVN format %#x)", g_dump_pass, (unsigned long long)s->key, b->binding, storage ? " (image)" : "",
+                                 (unsigned long long)r->t.serial, r->t.d.width, r->t.d.height, r->t.d.format);
+                else LOG("[vk] dump:   pass %d shader %016llx binding %u%s: EMPTY (%s; handle %#x bank %u)", g_dump_pass, (unsigned long long)s->key, b->binding, storage ? " (image)" : "",
+                         !ok ? "handle not decoded" : !r ? "ID not registered" : "no usable view", b->reg, b->aux);
+            }
             if (!iv) iv = dummy_view(b->image);
             for (uint32_t k = 0; k < n; k++) ii[k] = (VkDescriptorImageInfo){sp, iv, VK_IMAGE_LAYOUT_GENERAL};
             break;
@@ -915,6 +924,10 @@ static void do_draw(const draw_args *a) {
     }
     vkCmdSetViewport_(g_cb, 0, nvp, vps);
     vkCmdSetScissor_(g_cb, 0, nvp, scs);
+    if (g_dump_subs && g_dump_lines < 4000) { g_dump_lines++;
+        LOG("[vk] dump:   pass %d draw: vertex %016llx fragment %016llx, %u vertices × %u (prim %d), viewport %.0f,%.0f %.0fx%.0f (asked %.0f,%.0f %.0fx%.0f), scissor %d,%d %ux%u, colour mask %#x, blend %#x, depth test %d write %d",
+            g_dump_pass, pr->st[VKS_VS] ? (unsigned long long)pr->st[VKS_VS]->key : 0ull, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull, a->count, a->instances, a->prim,
+            vps[0].x, vps[0].y, vps[0].width, vps[0].height, D.vp[0][0], D.vp[0][1], D.vp[0][2], D.vp[0][3], sx, sy, sw, sh, (unsigned)D.chmask.mask, (unsigned)D.color.blend_en, (int)k.ds.dt, (int)k.ds.dw); }
     vkCmdSetStencilCompareMask_(g_cb, VK_STENCIL_FACE_FRONT_BIT, D.st_vmask[0]); vkCmdSetStencilCompareMask_(g_cb, VK_STENCIL_FACE_BACK_BIT, D.st_vmask[1]);
     vkCmdSetStencilWriteMask_(g_cb, VK_STENCIL_FACE_FRONT_BIT, D.st_wmask[0]); vkCmdSetStencilWriteMask_(g_cb, VK_STENCIL_FACE_BACK_BIT, D.st_wmask[1]);
     vkCmdSetStencilReference_(g_cb, VK_STENCIL_FACE_FRONT_BIT, D.st_ref[0]); vkCmdSetStencilReference_(g_cb, VK_STENCIL_FACE_BACK_BIT, D.st_ref[1]);
@@ -988,7 +1001,7 @@ static void dispatch_op(const p_dispatch *d) {
 // Asked for with L3 + R3 held together, F12, or DM_VK_DUMP_AT=<seconds after the first frame>. Each pass's colour targets and depth are copied out when the pass ends
 // and written as .ppm pictures (at most 800 pixels wide) into ~/nxnative-dump (DM_VK_DUMP_DIR), named <pass>_<target>_<format>.ppm, with a list in the log
 _Atomic int vkw_dump_req;   // set by the window (gfx_vk_window.c input_poll)
-static int g_dump_subs, g_dump_pass, g_dump_files; static char g_dump_dir[400];
+static int g_dump_files; static char g_dump_dir[400];
 static uint32_t dump_bpp(VkFormat f) {
     switch (f) {
     case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_A8B8G8R8_UNORM_PACK32: case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
@@ -1083,11 +1096,13 @@ static void dump_tex(vtex *v, uint32_t lv, uint32_t l0, const char *tag) {
 }
 static void dump_pass(void) {
     if (!g_dump_subs) return;
-    if (g_dump_pass >= 150) return;
+    if (g_dump_pass >= 600) return;
+    int pics = g_dump_pass < 40 || P.w >= 256;
     LOG("[vk] dump: pass %d: %llu draws, %ux%u, %u colour targets%s", g_dump_pass, (unsigned long long)(g_drawn - P.draws0), P.w, P.h, P.ncol, P.dv ? " + depth" : "");
     char tag[16];
-    for (uint32_t i = 0; i < P.ncol && i < 8; i++) if (P.cv[i]) { snprintf(tag, sizeof tag, "c%u", i); dump_tex(P.cv[i], P.clv[i], P.cl0[i], tag); }
-    if (P.dv) dump_tex(P.dv, P.dlv, P.dl0, "depth");
+    for (uint32_t i = 0; pics && i < P.ncol && i < 8; i++) if (P.cv[i]) { snprintf(tag, sizeof tag, "c%u", i); dump_tex(P.cv[i], P.clv[i], P.cl0[i], tag); }
+    if (pics && P.dv) dump_tex(P.dv, P.dlv, P.dl0, "depth");
+    for (uint32_t i = 0; i < P.ncol && i < 8; i++) if (P.cv[i]) LOG("[vk] dump:   pass %d target c%u: serial %llu %ux%u format %d", g_dump_pass, i, (unsigned long long)P.cv[i]->serial, P.cv[i]->w, P.cv[i]->h, P.cv[i]->fmt);
     full_barrier();
     g_dump_pass++;
 }
@@ -1118,7 +1133,7 @@ static void dump_submitted(void) {
     if (d && *d) snprintf(g_dump_dir, sizeof g_dump_dir, "%s", d); else snprintf(g_dump_dir, sizeof g_dump_dir, "%s/nxnative-dump", home ? home : "/tmp");
     char cmd[480]; snprintf(cmd, sizeof cmd, "rm -rf '%s' && mkdir -p '%s'", g_dump_dir, g_dump_dir);
     if (system(cmd)) LOG("[vk] dump: could not make %s", g_dump_dir);
-    g_dump_subs = 8; g_dump_pass = 0; g_dump_files = 0;
+    g_dump_subs = 8; g_dump_pass = 0; g_dump_files = 0; g_dump_lines = 0;
     LOG("[vk] dump: saving the render passes of the next 8 submissions into %s", g_dump_dir);
 }
 
