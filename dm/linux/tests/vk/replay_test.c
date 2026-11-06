@@ -63,6 +63,7 @@ int main(int argc, char **argv) {
     setenv("DM_SHADERS", argc > 3 ? argv[3] : "/tmp/spvs.dmsp", 1); mtl_set_origin_lower_left(0);   /* upper left, as Mario Tennis */
     const char *vsk = argc > 1 ? argv[1] : "83477ae89102633b", *fsk = argc > 2 ? argv[2] : "831a03da67ed2702";
     mtl_sub_begin();
+    if (getenv("DM_VK_DUMP_AT")) mtl_sub_commit();   // the frame dump starts with the submission after this empty one
     // render target 64x64 RGBA8, and a sampled 64x64 RGBA8 texture with block-linear storage (all 0x80)
     static tex_t rt, tx; memset(&rt, 0, sizeof rt);
     rt.d.target = NVN_TEXTURE_TARGET_2D; rt.d.format = NVN_FORMAT_RGBA8; rt.d.width = rt.d.height = 64; rt.d.depth = 1; rt.d.levels = 1; rt.serial = 1;

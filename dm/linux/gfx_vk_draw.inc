@@ -188,15 +188,11 @@ static VkSampler sampler_for(const samp_par *p) {
 // ---------------------------------------------------------------- image views (per texture, by what the binding asks: view type, levels, layers, swizzle, aspect)
 // The same-size format whose texels read as the other numeric kind (integers ↔ floats), for a view a shader takes of a texture with MUTABLE_FORMAT; 0 = none
 static VkFormat other_kind(VkFormat f, int want_int) {
-    static const VkFormat pairs[][3] = {   // float / normalized, unsigned, signed
+    // only 32-bit channels: their texels keep their bits through a view of the other kind (the translator's shader bit-casts what it reads); a normalized or
+    // 16-bit float view would convert the values instead
+    static const VkFormat pairs[][3] = {   // float, unsigned, signed
         {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT}, {VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_SINT},
-        {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT}, {VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16_UINT, VK_FORMAT_R16_SINT},
-        {VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_SINT}, {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_UINT, VK_FORMAT_R16G16B16A16_SINT},
-        {VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT}, {VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_UINT, VK_FORMAT_R8G8_SINT},
-        {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_SINT}, {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2B10G10R10_UINT_PACK32, 0},
-        {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_SINT}, {VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT},
-        {VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UINT, VK_FORMAT_R16_SINT}, {VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_SINT},
-        {VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_UINT, VK_FORMAT_R16G16B16A16_SINT}, {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UINT, 0}};
+        {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT}};
     for (size_t i = 0; i < sizeof pairs / sizeof *pairs; i++) {
         if (pairs[i][0] == f) return want_int ? pairs[i][1] : 0;
         if (pairs[i][1] == f || (pairs[i][2] && pairs[i][2] == f)) return want_int ? 0 : pairs[i][0];
@@ -442,8 +438,9 @@ static const char *k_sk[SK_N] = {"shaders not ready", "no render target", "tesse
 static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g_tex_missing, g_tex_unres, g_tex_unreg, g_storage_unsup;
 
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
-static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; } P;
-static void pass_end(void) { if (P.open) { vkCmdEndRendering_(g_cb); full_barrier(); P.open = 0; } }
+static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0; } P;
+static void dump_pass(void);
+static void pass_end(void) { if (P.open) { vkCmdEndRendering_(g_cb); full_barrier(); P.open = 0; dump_pass(); } }
 // A texture a draw reads, ready for it: its first use (layout, zero fill) and its guest content are command-buffer work outside a render pass, so a pass open then is ended first
 static vtex *prep_tex(const tex_t *t) {
     vtex *v = tex_get(t); if (!v) return NULL;
@@ -465,7 +462,7 @@ static int pass_begin(void) {
         uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.cview[i], R.rt.has_cview[i], &lv, &nl, &l0, &nlay);
         VkImageView iv = view_get(v, v->is3d ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, v->is3d ? 0 : l0, 1, (VkComponentMapping){0, 0, 0, 0}, VK_IMAGE_ASPECT_COLOR_BIT, 2);
         if (!iv) continue;
-        gpu_wrote(v); ca[i].imageView = iv; P.cf[i] = v->fmt; any = 1;
+        gpu_wrote(v); ca[i].imageView = iv; P.cf[i] = v->fmt; any = 1; P.cv[i] = v; P.clv[i] = lv; P.cl0[i] = v->is3d ? 0 : l0;
         uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1;
         if (lw < w) w = lw;
         if (lh < h) h = lh;
@@ -481,7 +478,7 @@ static int pass_begin(void) {
             uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.dview, R.rt.has_dview, &lv, &nl, &l0, &nlay);
             VkImageView iv = view_get(v, VK_IMAGE_VIEW_TYPE_2D, lv, 1, l0, 1, (VkComponentMapping){0, 0, 0, 0}, fmt_aspects(v->fmt), 2);
             if (iv) {
-                gpu_wrote(v); P.df = v->fmt; any = 1;
+                gpu_wrote(v); P.df = v->fmt; any = 1; P.dv = v; P.dlv = lv; P.dl0 = l0;
                 VkImageAspectFlags a = fmt_aspects(v->fmt);
                 if (a & VK_IMAGE_ASPECT_DEPTH_BIT) { da.imageView = iv; P.has_d = 1; }
                 if (a & VK_IMAGE_ASPECT_STENCIL_BIT) { sa.imageView = iv; P.has_s = 1; }
@@ -494,7 +491,7 @@ static int pass_begin(void) {
     }
     if (!any) return 0;
     if (!cb_begin()) return 0;
-    P.w = w; P.h = h; P.samples = samples ? samples : 1;
+    P.w = w; P.h = h; P.samples = samples ? samples : 1; P.draws0 = g_drawn;
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, 1, 0, nc, ca, P.has_d ? &da : NULL, P.has_s ? &sa : NULL};
     vkCmdBeginRendering_(g_cb, &ri);
     P.open = 1; g_cb_ops++;
@@ -832,7 +829,7 @@ static void do_draw(const draw_args *a) {
     for (int i = 0; vs && i < vs->nvin && k.nva < 32; i++) {
         uint8_t loc = vs->vin[2 * i], ct = vs->vin[2 * i + 1];
         va_st at; memset(&at, 0, sizeof at); if (loc < D.nattr) memcpy(&at, &D.vattr[loc], 4);
-        VkFormat f = at.fmt ? vfmt_for_input(vfmt(at.fmt), ct) : VK_FORMAT_UNDEFINED;
+        VkFormat f = at.fmt ? vfmt(at.fmt) : VK_FORMAT_UNDEFINED;
         static VkFormat okf[256]; static uint8_t okc[256];   // format support, asked once per format
         if (f && f < 256 && !okc[f]) { okc[f] = 1; okf[f] = vfmt_ok(f) ? f : 0; if (!okf[f]) LOG("[RED] [vk] vertex format %d (NVN %#x) is not supported by this GPU: those attributes read zero", f, at.fmt); }
         if (f && f < 256) f = okf[f];
@@ -984,6 +981,132 @@ static void dispatch_op(const p_dispatch *d) {
     uint32_t x = (uint32_t)d->x, y = (uint32_t)d->y, z = (uint32_t)d->z;
     if (d->ind) { const uint32_t *g = (const uint32_t *)(uintptr_t)d->ind; x = g[0]; y = g[1]; z = g[2]; }
     if (x && y && z) { vkCmdDispatch_(g_cb, x, y, z); full_barrier(); g_disp_done++; g_cb_ops++; }
+}
+
+
+// ---------------------------------------------------------------- frame dumps (debugging): every render pass of the next few submissions saved as a picture
+// Asked for with L3 + R3 held together, F12, or DM_VK_DUMP_AT=<seconds after the first frame>. Each pass's colour targets and depth are copied out when the pass ends
+// and written as .ppm pictures (at most 800 pixels wide) into ~/nxnative-dump (DM_VK_DUMP_DIR), named <pass>_<target>_<format>.ppm, with a list in the log
+_Atomic int vkw_dump_req;   // set by the window (gfx_vk_window.c input_poll)
+static int g_dump_subs, g_dump_pass, g_dump_files; static char g_dump_dir[400];
+static uint32_t dump_bpp(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_A8B8G8R8_UNORM_PACK32: case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32: case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_D32_SFLOAT: case VK_FORMAT_D32_SFLOAT_S8_UINT: case VK_FORMAT_X8_D24_UNORM_PACK32: case VK_FORMAT_D24_UNORM_S8_UINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: return 4;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R32G32_SFLOAT: return 8;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
+    case VK_FORMAT_R8_UNORM: return 1;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_D16_UNORM: return 2;
+    default: return 0;
+    }
+}
+static float half_f(uint16_t h) {
+    uint32_t e = (h >> 10) & 31, m = h & 1023; float v;
+    if (!e) v = m / 16777216.0f; else if (e == 31) v = m ? 0 : 65504.0f; else v = ldexpf(1.0f + m / 1024.0f, (int)e - 15);
+    return h & 0x8000 ? -v : v;
+}
+static float uf11(uint32_t x, int mb) {   // the small unsigned floats of B10G11R11 (mb mantissa bits, 5 exponent bits)
+    uint32_t e = x >> mb, m = x & ((1u << mb) - 1);
+    if (!e) return ldexpf((float)m / (1u << mb), -14); if (e == 31) return 65504.0f;
+    return ldexpf(1.0f + (float)m / (1u << mb), (int)e - 15);
+}
+static void dump_texel(VkFormat f, const uint8_t *p, float o[4]) {
+    uint32_t u; memcpy(&u, p, 4 <= dump_bpp(f) ? 4 : dump_bpp(f)); const uint16_t *h = (const uint16_t *)p; const float *fl = (const float *)p;
+    o[0] = o[1] = o[2] = 0; o[3] = 1;
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_A8B8G8R8_UNORM_PACK32: case VK_FORMAT_A8B8G8R8_SRGB_PACK32: case VK_FORMAT_R8G8B8A8_UINT:
+        for (int i = 0; i < 4; i++) o[i] = p[i] / 255.0f; break;
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: o[0] = p[2] / 255.0f; o[1] = p[1] / 255.0f; o[2] = p[0] / 255.0f; o[3] = p[3] / 255.0f; break;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: o[0] = (u & 1023) / 1023.0f; o[1] = (u >> 10 & 1023) / 1023.0f; o[2] = (u >> 20 & 1023) / 1023.0f; break;
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32: o[2] = (u & 1023) / 1023.0f; o[1] = (u >> 10 & 1023) / 1023.0f; o[0] = (u >> 20 & 1023) / 1023.0f; break;
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: o[0] = uf11(u & 2047, 6); o[1] = uf11(u >> 11 & 2047, 6); o[2] = uf11(u >> 22, 5); break;
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: { float sc = ldexpf(1, (int)(u >> 27) - 24); o[0] = (u & 511) * sc; o[1] = (u >> 9 & 511) * sc; o[2] = (u >> 18 & 511) * sc; break; }
+    case VK_FORMAT_R16G16B16A16_SFLOAT: for (int i = 0; i < 4; i++) o[i] = half_f(h[i]); break;
+    case VK_FORMAT_R16G16B16A16_UNORM: for (int i = 0; i < 4; i++) o[i] = h[i] / 65535.0f; break;
+    case VK_FORMAT_R16G16_SFLOAT: o[0] = half_f(h[0]); o[1] = half_f(h[1]); break;
+    case VK_FORMAT_R16G16_UNORM: o[0] = h[0] / 65535.0f; o[1] = h[1] / 65535.0f; break;
+    case VK_FORMAT_R32G32_SFLOAT: o[0] = fl[0]; o[1] = fl[1]; break;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: for (int i = 0; i < 4; i++) o[i] = fl[i]; break;
+    case VK_FORMAT_R8_UNORM: o[0] = o[1] = o[2] = p[0] / 255.0f; break;
+    case VK_FORMAT_R8G8_UNORM: o[0] = p[0] / 255.0f; o[1] = p[1] / 255.0f; break;
+    case VK_FORMAT_R16_SFLOAT: o[0] = o[1] = o[2] = half_f(h[0]); break;
+    case VK_FORMAT_R16_UNORM: case VK_FORMAT_D16_UNORM: o[0] = o[1] = o[2] = h[0] / 65535.0f; break;
+    case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_D32_SFLOAT: case VK_FORMAT_D32_SFLOAT_S8_UINT: o[0] = o[1] = o[2] = fl[0]; break;
+    case VK_FORMAT_R32_UINT: o[0] = o[1] = o[2] = (float)u; break;
+    case VK_FORMAT_X8_D24_UNORM_PACK32: case VK_FORMAT_D24_UNORM_S8_UINT: o[0] = o[1] = o[2] = (u & 0xffffff) / 16777215.0f; break;
+    default: break;
+    }
+}
+// Written after the submission completed: scaled to at most 800 pixels wide. Colours beyond 0..1 (HDR) are squeezed (x / (1 + x)) when any texel is above 1;
+// one-channel images (depth, masks) are stretched from their smallest to their largest value, so a nearly flat depth buffer still shows its shapes
+static void dump_write(const stage_t *s) {
+    uint32_t bpp = dump_bpp((VkFormat)s->dump_fmt), w = s->dw, h = s->dh, step = (w + 799) / 800, ow, oh;
+    if (step < 1) step = 1;
+    ow = (w + step - 1) / step; oh = (h + step - 1) / step;
+    float mx = 0, mn = 1e30f, hi = -1e30f; int mono = 0; VkFormat f = (VkFormat)s->dump_fmt;
+    switch (f) { case VK_FORMAT_R8_UNORM: case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_D16_UNORM: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_D32_SFLOAT:
+                 case VK_FORMAT_D32_SFLOAT_S8_UINT: case VK_FORMAT_R32_UINT: case VK_FORMAT_X8_D24_UNORM_PACK32: case VK_FORMAT_D24_UNORM_S8_UINT: mono = 1; break; default: break; }
+    for (uint32_t y = 0; y < h; y += step) for (uint32_t x = 0; x < w; x += step) {
+        float o[4]; dump_texel(f, (const uint8_t *)s->p + ((uint64_t)y * w + x) * bpp, o);
+        for (int c = 0; c < 3; c++) { if (o[c] > mx) mx = o[c]; if (o[c] < mn) mn = o[c]; if (o[c] > hi) hi = o[c]; }
+    }
+    FILE *fp = fopen(s->dump_name, "wb"); if (!fp) { LOG("[vk] dump: cannot write %s", s->dump_name); return; }
+    fprintf(fp, "P6\n%u %u\n255\n", ow, oh);
+    uint8_t *row = malloc(ow * 3);
+    for (uint32_t y = 0; y < h; y += step) {
+        uint32_t ox = 0;
+        for (uint32_t x = 0; x < w; x += step, ox++) {
+            float o[4]; dump_texel(f, (const uint8_t *)s->p + ((uint64_t)y * w + x) * bpp, o);
+            for (int c = 0; c < 3; c++) {
+                float v = o[c];
+                if (mono) v = hi > mn ? (v - mn) / (hi - mn) : 0;
+                else if (mx > 1.0f) v = v > 0 ? v / (1 + v) : 0;
+                row[ox * 3 + c] = (uint8_t)(v <= 0 ? 0 : v >= 1 ? 255 : v * 255 + 0.5f);
+            }
+        }
+        fwrite(row, 1, ow * 3, fp);
+    }
+    free(row); fclose(fp); g_dump_files++;
+    LOG("[vk] dump: %s (%ux%u, values %.3g .. %.3g)", s->dump_name, w, h, mn, mx);
+}
+static void dump_tex(vtex *v, uint32_t lv, uint32_t l0, const char *tag) {
+    uint32_t bpp = dump_bpp(v->fmt);
+    if (!bpp || v->samples > 1 || !v->img) { LOG("[vk] dump: pass %d %s: serial %u format %d, %u samples: not saved (format or multisampling)", g_dump_pass, tag, (unsigned)v->serial, v->fmt, v->samples); return; }
+    uint32_t w = v->w >> lv ? v->w >> lv : 1, h = v->h >> lv ? v->h >> lv : 1;
+    stage_t *st = stage_new((uint64_t)w * h * bpp); if (!st) return;
+    st->dump_fmt = v->fmt; st->dw = w; st->dh = h;
+    snprintf(st->dump_name, sizeof st->dump_name, "%s/%03d_%s_s%u_f%d.ppm", g_dump_dir, g_dump_pass, tag, (unsigned)v->serial, v->fmt);
+    VkImageAspectFlags a = fmt_aspects(v->fmt); a = a & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+    VkBufferImageCopy bic = {0, 0, 0, {a, lv, v->is3d ? 0 : l0, 1}, {0, 0, 0}, {w, h, 1}};
+    vkCmdCopyImageToBuffer_(g_cb, v->img, VK_IMAGE_LAYOUT_GENERAL, st->b, 1, &bic);
+}
+static void dump_pass(void) {
+    if (!g_dump_subs) return;
+    if (g_dump_pass >= 150) return;
+    LOG("[vk] dump: pass %d: %llu draws, %ux%u, %u colour targets%s", g_dump_pass, (unsigned long long)(g_drawn - P.draws0), P.w, P.h, P.ncol, P.dv ? " + depth" : "");
+    char tag[16];
+    for (uint32_t i = 0; i < P.ncol && i < 8; i++) if (P.cv[i]) { snprintf(tag, sizeof tag, "c%u", i); dump_tex(P.cv[i], P.clv[i], P.cl0[i], tag); }
+    if (P.dv) dump_tex(P.dv, P.dlv, P.dl0, "depth");
+    full_barrier();
+    g_dump_pass++;
+}
+// Each submission's end: a request starts a dump of the next 8 submissions
+static void dump_submitted(void) {
+    if (g_dump_subs) { if (!--g_dump_subs) LOG("[vk] dump finished: %d passes, %d pictures in %s", g_dump_pass, g_dump_files, g_dump_dir); return; }
+    static double at = -2; static uint64_t t0;
+    if (at == -2) { const char *e = getenv("DM_VK_DUMP_AT"); at = e && *e ? atof(e) : -1; }
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    if (!t0) t0 = now;
+    int timed = at >= 0 && (now - t0) / 1e9 >= at;
+    if (!atomic_exchange(&vkw_dump_req, 0) && !timed) return;
+    if (timed) at = -1;
+    const char *d = getenv("DM_VK_DUMP_DIR"), *home = getenv("HOME");
+    if (d && *d) snprintf(g_dump_dir, sizeof g_dump_dir, "%s", d); else snprintf(g_dump_dir, sizeof g_dump_dir, "%s/nxnative-dump", home ? home : "/tmp");
+    char cmd[480]; snprintf(cmd, sizeof cmd, "rm -rf '%s' && mkdir -p '%s'", g_dump_dir, g_dump_dir);
+    if (system(cmd)) LOG("[vk] dump: could not make %s", g_dump_dir);
+    g_dump_subs = 8; g_dump_pass = 0; g_dump_files = 0;
+    LOG("[vk] dump: saving the render passes of the next 8 submissions into %s", g_dump_dir);
 }
 
 // ---------------------------------------------------------------- the submission's end: the ring and descriptor pools start over

@@ -263,8 +263,11 @@ static void pads_scan(void) {
     dm_pad_players(g_npad > 1 ? (1u << g_npad) - 1 : 1);
 }
 static int32_t stick(int16_t v) { return v < -DM_STICK_MAX ? -DM_STICK_MAX : v; }
+extern _Atomic int vkw_dump_req;   // a frame dump asked for (gfx_vk_draw.inc dump_submitted): L3 + R3 together, or F12
 static void input_poll(void) {
     if (!S.GetGamepadButton) return;
+    static int dump_held;
+    int dump_now = 0;
     if (g_xbox < 0) { const char *e = getenv("DM_PAD_LAYOUT"); g_xbox = e && !strcmp(e, "xbox"); }
     if (g_pad_scan) pads_scan();
     for (int p = 0; p < g_npad; p++) {
@@ -283,6 +286,7 @@ static void input_poll(void) {
             if (JB(9)) b |= DM_BTN_LS;
             if (JB(10)) b |= DM_BTN_RS;
             #undef JB
+            if ((b & DM_BTN_LS) && (b & DM_BTN_RS)) dump_now = 1;
             if (hat & 1) b |= DM_BTN_UP;
             if (hat & 2) b |= DM_BTN_RIGHT;
             if (hat & 4) b |= DM_BTN_DOWN;
@@ -312,6 +316,7 @@ static void input_poll(void) {
         if (B(GP_LEFT)) b |= DM_BTN_LEFT;
         if (B(GP_RIGHT)) b |= DM_BTN_RIGHT;
         #undef B
+        if ((b & DM_BTN_LS) && (b & DM_BTN_RS)) dump_now = 1;
         if (S.GetGamepadAxis(g, GA_LT) > 12000) b |= DM_BTN_ZL;
         if (S.GetGamepadAxis(g, GA_RT) > 12000) b |= DM_BTN_ZR;
         int32_t lx = stick(S.GetGamepadAxis(g, GA_LX)), ly = -stick(S.GetGamepadAxis(g, GA_LY)), rx = stick(S.GetGamepadAxis(g, GA_RX)), ry = -stick(S.GetGamepadAxis(g, GA_RY));
@@ -327,7 +332,10 @@ static void input_poll(void) {
         if (k[82]) b |= DM_BTN_UP; if (k[81]) b |= DM_BTN_DOWN; if (k[80]) b |= DM_BTN_LEFT; if (k[79]) b |= DM_BTN_RIGHT;
         if (k[12]) ly += DM_STICK_MAX; if (k[14]) ly -= DM_STICK_MAX; if (k[13]) lx -= DM_STICK_MAX; if (k[15]) lx += DM_STICK_MAX;   // I K J L
         dm_input_set(b, lx, ly, 0, 0);
+        if (k[69]) dump_now = 1;   // F12
     }
+    if (dump_now && !dump_held) { vkw_dump_req = 1; LOG("[vk] frame dump asked for"); }
+    dump_held = dump_now;
 }
 
 static void events(void) {

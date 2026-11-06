@@ -17,6 +17,8 @@
 #include "../gfx/nvn/nvn_dirty.h"
 #include "gfx_vk.h"
 #include <stdatomic.h>
+#include <math.h>
+#include <time.h>
 
 uint64_t guest_ns(void);
 
@@ -162,7 +164,8 @@ typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t ad
 static post_op *g_post; static int g_npost, g_postcap;
 static struct { p_set_rt rt; int has_rt; int64_t copy_stride, copy_img_stride; } R;
 // Staging buffers of this submission (texture uploads and readbacks), freed at commit; readbacks copy into guest memory after the GPU finishes
-typedef struct { VkBuffer b; VkDeviceMemory m; void *p; uint64_t n; uint8_t *rb_dst; size_t rb_row, rb_src_row, rb_rows, rb_n; } stage_t;
+typedef struct { VkBuffer b; VkDeviceMemory m; void *p; uint64_t n; uint8_t *rb_dst; size_t rb_row, rb_src_row, rb_rows, rb_n; int dump_fmt; uint32_t dw, dh; char dump_name[160]; } stage_t;
+static void dump_write(const stage_t *s);   // gfx_vk_draw.inc: a frame dump's image (DM debug: L3 + R3 or F12)
 static stage_t *g_stage; static int g_nstage, g_stagecap;
 
 static void post(post_op o) { if (g_npost == g_postcap) { g_postcap = g_postcap ? g_postcap * 2 : 64; g_post = realloc(g_post, g_postcap * sizeof *g_post); } g_post[g_npost++] = o; }
@@ -226,6 +229,7 @@ static void stages_done(void) {
         stage_t *s = &g_stage[i];
         if (s->rb_dst) dm_guest_write_prepare(s->rb_dst, (s->rb_rows - 1) * s->rb_row + s->rb_n);   // guest pages the dirty tracking protects are opened first
         if (s->rb_dst) for (size_t r = 0; r < s->rb_rows; r++) memcpy(s->rb_dst + r * s->rb_row, (uint8_t *)s->p + r * s->rb_src_row, s->rb_n);
+        if (s->dump_fmt) dump_write(s);
         vkUnmapMemory_(VK.dev, s->m); vkDestroyBuffer_(VK.dev, s->b, NULL); vkFreeMemory_(VK.dev, s->m, NULL);
     }
     g_nstage = 0;
@@ -405,6 +409,7 @@ uint64_t mtl_sub_commit(void) {
         linear_done();
         draw_submitted();
     }
+    dump_submitted();
     // The submission has completed: its events and counters land, in record order
     uint64_t now = gpu_ticks();
     for (int i = 0; i < g_npost; i++) {
