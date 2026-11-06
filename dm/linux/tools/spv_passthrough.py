@@ -11,7 +11,11 @@ BI_VPMASK, BI_VPINDEX, BI_LAYER = 5253, 10, 9
 SC_INPUT, SC_OUTPUT, SC_PRIVATE = 1, 3, 6
 IN_VERTS = {19: 1, 20: 2, 21: 4, 22: 3, 23: 6}            # input primitive execution mode → vertices
 OUT_VERTS = {27: 1, 28: 2, 29: 3}                        # output primitive → vertices per emitted primitive
-NVP = 16
+import os
+# Viewports a primitive can go to: each one adds an unrolled emission and makes the shader's declared output larger, and a geometry shader's output size is
+# what costs on Adreno (Mario Tennis Fever's shadow cascades took 10 ms of each 16 ms submission with 16). Its cascades use viewports 0-3.
+# DM_SPV_VIEWPORTS=16 for a game whose mask reaches further (a bit past this count is not drawn)
+NVP = int(os.environ.get('DM_SPV_VIEWPORTS', '4'))
 
 def _ins(words):
     i = 5
