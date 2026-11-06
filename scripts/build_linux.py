@@ -79,7 +79,7 @@ def unpack(game, version, work):
     die(f'{game}: neither a .nup file nor a dump folder')
 
 
-def shaders(tid, ver, ext, exefs, nro_dir, lw, env, jobs):
+def shaders(tid, ver, ext, exefs, nro_dir, lw, env, jobs, retranslate=False):
     # Graphics stage C: the game's shaders split out of its files (dm/gfx/tools/shader_split.py, as the NSP script does) and translated to SPIR-V (dm/linux/tools/spv_build.py)
     if not shutil.which('dotnet'): die('the shader step needs the .NET 10 runtime: sudo dnf install -y dotnet-runtime-10.0 (in the toolbox), then build again')
     sh = lw / f'shaders_v{ver}'; pkg, tables, spv = sh / 'pkg', sh / 'tables', sh / 'spv'
@@ -93,8 +93,20 @@ def shaders(tid, ver, ext, exefs, nro_dir, lw, env, jobs):
             [tables / n for n in ('shader_map.tsv', 'shader_facts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv')], env=env)
         (sh / 'split.done').write_text('')
     else: say('shaders: already split')
-    say('translating the shaders to SPIR-V (can take 10+ minutes the first time)')
-    run([sys.executable, REPO / 'dm/linux/tools/spv_build.py', pkg, spv], env=env)
+    def translated():
+        try: return any(e.name.endswith('.res.json') for e in os.scandir(spv))
+        except OSError: return False
+    if not retranslate and ((sh / 'spv.done').is_file() or translated()): say('shaders: already translated (--retranslate does it again)')
+    else:
+        say('translating the shaders to SPIR-V (can take an hour on the Thor; it prints nothing while it works)')
+        run([sys.executable, REPO / 'dm/linux/tools/spv_build.py', pkg, spv], env=env)
+        (sh / 'spv.done').write_text('')
+    if not (sh / 'spv.done').is_file(): (sh / 'spv.done').write_text('')
+    pack = lw / 'shaders.dmsp'
+    if not pack.is_file() or pack.stat().st_mtime < (sh / 'spv.done').stat().st_mtime:
+        say('packing the shaders into one file (a few minutes)')
+        run([sys.executable, REPO / 'dm/linux/tools/spv_pack.py', spv, pack])
+    else: say(f'shaders: already packed ({pack})')
 
 def main():
     ap = argparse.ArgumentParser(description='Build a Switch / Switch 2 game for Linux aarch64 (null graphics: headless boot test)')
@@ -102,6 +114,7 @@ def main():
     ap.add_argument('--version', type=int, help='the update to build (default: the newest; 0 = the base game)')
     ap.add_argument('--work-dir', type=Path, help='the build folder (default: <title ID>_build beside the game)')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
+    ap.add_argument('--retranslate', action='store_true', help='translate the shaders again (after a translator change)')
     ap.add_argument('--shaders', action='store_true', help='also translate the game\'s shaders to SPIR-V (graphics stage C; needs the .NET 10 runtime, takes a while)')
     a = ap.parse_args()
     if platform.machine() not in ('aarch64', 'arm64'): say(f'[RED] this machine is {platform.machine()}: the build runs here, but the game only runs on arm64 Linux')
@@ -200,7 +213,7 @@ def main():
             import fontTools  # noqa: F401
             run([sys.executable, REPO / 'dm/tools/make_ext_font.py', font / 'nintendo_ext.ttf'] + ([font / 'standard.ttf'] if (font / 'standard.ttf').exists() else []))
         except ImportError: say(f'[YELLOW] no button-icon font: {sys.executable} -m pip install --user fonttools, then build again')
-    if a.shaders: shaders(tid, ver, ext, exefs, nro_dir, lw, renv, a.jobs)
+    if a.shaders or a.retranslate: shaders(tid, ver, ext, exefs, nro_dir, lw, renv, a.jobs, a.retranslate)
     aoc = work / 'aoc'
     script = lw / 'run.sh'
     script.write_text(f'''#!/bin/sh
@@ -209,6 +222,7 @@ def main():
 cd "$(dirname "$0")"
 export DM_ROOT="{lw}/run" DM_ROMFS="{ext / 'RomFS.img'}" DM_SAVE="{lw}/run/save" DM_TEMP="{lw}/run/temp" DM_FONT_DIR="{lw}/font"
 export DM_AUDIO="${{DM_AUDIO:-1}}"   # sound through SDL3 (DM_AUDIO=0: silent)
+{f'export DM_SHADERS="{lw / "shaders.dmsp"}"   # the translated shaders (stage C)' if (lw / 'shaders.dmsp').is_file() else '# no shader pack yet (build with --shaders)'}
 {f'export DM_AOC_DIR="{aoc}"' if aoc.is_dir() and any(aoc.iterdir()) else '# no DLC'}
 exec ./dmhost "{patched}" "$@" 2>&1 | tee log.txt
 ''')

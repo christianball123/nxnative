@@ -52,7 +52,7 @@ static struct {
     VkSurfaceKHR surf;
     VkSwapchainKHR sc; VkFormat fmt; VkExtent2D ext; uint32_t nimg; VkImage img[SWAP_MAX];
     VkSemaphore acquired[SWAP_MAX], done[SWAP_MAX]; VkCommandPool pool; VkCommandBuffer cb[SWAP_MAX]; VkFence fence[SWAP_MAX]; uint32_t slot;
-    int ok, failed, resized; uint64_t frames; double t0; char devname[256]; int ext_host_mem;
+    int ok, failed, resized; uint64_t frames; double t0; char devname[256]; int ext_host_mem, ext_push;
 } W;
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
@@ -90,7 +90,7 @@ static int window_init(void) {
     vkGetInstanceProcAddr_ = (PFN_vkGetInstanceProcAddr)S.Vulkan_GetVkGetInstanceProcAddr();
     vkCreateInstance_ = (PFN_vkCreateInstance)vkGetInstanceProcAddr_(NULL, "vkCreateInstance");
     uint32_t next = 0; const char *const *exts = S.Vulkan_GetInstanceExtensions(&next);
-    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "nxnative", 1, "nxnative", 1, VK_API_VERSION_1_1};
+    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "nxnative", 1, "nxnative", 1, VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, next, exts};
     VkResult r = vkCreateInstance_(&ici, NULL, &VK.inst);
     if (r) { LOG("[RED] [vk] vkCreateInstance failed (%d)", r); return 0; }
@@ -116,14 +116,29 @@ static int window_init(void) {
     snprintf(W.devname, sizeof W.devname, "%s", pp.deviceName);
     uint32_t ne = 0; vkEnumerateDeviceExtensionProperties_(VK.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep); vkEnumerateDeviceExtensionProperties_(VK.phys, NULL, &ne, ep);
-    for (uint32_t i = 0; i < ne; i++) if (!strcmp(ep[i].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) W.ext_host_mem = 1;
+    for (uint32_t i = 0; i < ne; i++) {
+        if (!strcmp(ep[i].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) W.ext_host_mem = 1;
+        if (!strcmp(ep[i].extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) W.ext_push = 1;
+    }
     free(ep);
     LOG("[vk] GPU %s, Vulkan %u.%u.%u, driver %#x; guest memory import (VK_EXT_external_memory_host): %s", pp.deviceName, VK_API_VERSION_MAJOR(pp.apiVersion), VK_API_VERSION_MINOR(pp.apiVersion),
         VK_API_VERSION_PATCH(pp.apiVersion), pp.driverVersion, W.ext_host_mem ? "yes" : "no (stage B will mirror pools instead)");
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, VK.qfam, 1, &prio};
-    const char *dext[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qci, 0, NULL, 1, dext, NULL};
+    // Stage C's shaders and pipelines: Vulkan 1.3 (dynamic rendering, extended dynamic state) with every feature the GPU has turned on (the translated shaders use what the game's do:
+    // image queries, gathers with offsets, subgroup ballots, texel buffers, storage image access without a format, …), and push descriptors when the driver has them
+    const char *dext[4] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME}; uint32_t ndext = 1;
+    if (VK_API_VERSION_MINOR(pp.apiVersion) < 3 && VK_API_VERSION_MAJOR(pp.apiVersion) == 1) LOG("[RED] [vk] this driver has Vulkan %u.%u: stage C needs 1.3", VK_API_VERSION_MAJOR(pp.apiVersion), VK_API_VERSION_MINOR(pp.apiVersion));
+    if (W.ext_push) { dext[ndext++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME; VK.push_desc = 1; }
+    static VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    static VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
+    static VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12};
+    static VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
+    PFN_vkGetPhysicalDeviceFeatures2 gpf2 = (PFN_vkGetPhysicalDeviceFeatures2)vkGetInstanceProcAddr_(VK.inst, "vkGetPhysicalDeviceFeatures2");
+    if (gpf2) gpf2(VK.phys, &f2);
+    f2.features.robustBufferAccess = 0;   // costs speed and the game does not ask for it
+    VK.f_dynrender = f13.dynamicRendering;
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, gpf2 ? &f2 : NULL, 0, 1, &qci, 0, NULL, ndext, dext, NULL};
     if ((r = vkCreateDevice_(VK.phys, &dci, NULL, &VK.dev))) { LOG("[RED] [vk] vkCreateDevice failed (%d)", r); return 0; }
 #define LD(f) f##_ = (PFN_##f)vkGetDeviceProcAddr_(VK.dev, #f); if (!f##_) { LOG("[RED] [vk] no " #f); return 0; }
     VKD_FUNCS(LD)

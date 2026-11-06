@@ -290,7 +290,8 @@ static void copy_t2t(const p_copy_t2t *c) {
 }
 
 // ---------------------------------------------------------------- the record walk
-static uint64_t g_draws, g_dispatches;
+static uint64_t g_draws, g_dispatches, g_draws_ready, g_disp_ready;
+static const vks_prog *g_gfx_prog, *g_cs_prog;   // the bound programs' shaders (stage C), NULL while a program's shaders are not known
 void mtl_exec(const uint8_t *p) {
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
@@ -313,8 +314,13 @@ void mtl_exec(const uint8_t *p) {
         case OP_COPY_B2T: if (VK.ok) copy_b2t((const p_copy_b2t *)a); break;
         case OP_COPY_T2B: if (VK.ok) copy_t2b((const p_copy_t2t *)a); break;
         case OP_COPY_T2T: if (VK.ok) copy_t2t((const p_copy_t2t *)a); break;
-        case OP_DRAW: case OP_DRAW_IDX: case OP_MULTI_DRAW: case OP_DRAW_TEX: g_draws++; break;
-        case OP_DISPATCH: g_dispatches++; break;
+        case OP_BIND_PROGRAM: if (VK.ok) {
+            const p_bind_program *b = (const p_bind_program *)a; const vks_prog *pr = vks_prog_get(b->prog);
+            if (pr && pr->compute) g_cs_prog = pr; else if (pr || !(b->stages & NVN_SHADER_STAGE_COMPUTE_BIT)) g_gfx_prog = pr; else g_cs_prog = NULL;
+        } break;
+        case OP_DRAW: case OP_DRAW_IDX: case OP_MULTI_DRAW: g_draws++; if (g_gfx_prog) g_draws_ready++; break;
+        case OP_DRAW_TEX: g_draws++; break;
+        case OP_DISPATCH: g_dispatches++; if (g_cs_prog) g_disp_ready++; break;
         default: break;   // state for draws and compute (stage C)
         }
         p += h.size;
@@ -352,7 +358,12 @@ uint64_t mtl_sub_commit(void) {
     g_npost = 0;
     static uint64_t reported;
     uint64_t f = atomic_fetch_add(&g_fence, 1) + 1;
-    if (f == 1 || f - reported >= 3600) { reported = f; LOG("[vk] replay: %llu submissions, %llu draws and %llu dispatches skipped so far (stage C draws them)", (unsigned long long)f, (unsigned long long)g_draws, (unsigned long long)g_dispatches); }
+    if (f == 1 || f - reported >= 600) {
+        reported = f; uint64_t np = 0, nm = 0, nf = 0; vks_stats(&np, &nm, &nf);
+        LOG("[vk] replay: %llu submissions; draws %llu (%llu with their shaders ready), dispatches %llu (%llu ready); programs %llu, shaders missing %llu, refused %llu — not drawn yet (stage C)",
+            (unsigned long long)f, (unsigned long long)g_draws, (unsigned long long)g_draws_ready, (unsigned long long)g_dispatches, (unsigned long long)g_disp_ready,
+            (unsigned long long)np, (unsigned long long)nm, (unsigned long long)nf);
+    }
     return f;
 }
 uint64_t mtl_last_fence(void) { return atomic_load(&g_fence); }

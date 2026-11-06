@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+# spv_build.py's output (<key>.spv + <key>.res.json per shader, over 100 000 small files) → one file the Linux host maps (dm/linux/gfx_vk_shader.c), shaders.dmsp:
+#   header  "DMSP" u32 version, u32 count, u32 0
+#   index   count × {u64 key (the 16 hex digits read as a big-endian number), u32 offset, u32 length}, sorted by key
+#   entries u8 stage (SPIR-V execution model: 0 vertex 1 tess control 2 tess eval 3 geometry 4 fragment 5 compute), u8 bindings, u8 vertex inputs, u8 fragment output mask,
+#           u16 local size x, y, z (compute), u16 0
+#           bindings × {u8 binding, u8 Vulkan descriptor type, u8 kind (KIND_*), u8 image (dim | arrayed << 4 | multisample << 5 | depth << 6), u16 reg, u16 count}
+#           vertex inputs × {u8 location, u8 component type (0 float 1 uint 2 int)}, padded to 4 bytes, then the SPIR-V words
+# The descriptor types and image shapes come from the SPIR-V itself; what each binding means (which uniform slot, which texture handle) from the translator's reflection.
+# All bindings are in set 0 (dmsh_xlate Program.cs); binding 0 is the translator's support buffer.
+import json, os, struct, sys
+from pathlib import Path
+
+KIND_SUPPORT, KIND_CBUF, KIND_SBUF, KIND_TEX, KIND_IMG, KIND_UNKNOWN = range(6)
+
+def reflect(words):
+    names = {}; dec = {}; types = {}; variables = []; entry = None; local = (0, 0, 0)
+    i = 5
+    while i < len(words):
+        n, op = words[i] >> 16, words[i] & 0xffff
+        o = words[i + 1:i + n]
+        if n == 0: raise ValueError('bad SPIR-V')
+        if op == 15: entry = o[0]                                        # OpEntryPoint
+        elif op == 16 and o[1] == 17: local = tuple(o[2:5])             # OpExecutionMode LocalSize
+        elif op == 71: dec.setdefault(o[0], {})[o[1]] = o[2] if len(o) > 2 else 1   # OpDecorate
+        elif op in (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 32): types[o[0]] = (op, o[1:])
+        elif op == 59: variables.append((o[0], o[1], o[2]))             # OpVariable type id storage
+        i += n
+    def base(t):
+        while True:
+            op, a = types[t]
+            if op == 32: t = a[1]                                       # pointer → pointee
+            elif op in (28, 29): t = a[0]                               # (runtime) array → element
+            else: return t
+    def count(t):
+        op, a = types[t]
+        if op == 32: return count(a[1])
+        return 1 if op != 28 else 0                                     # fixed arrays: filled in by the caller
+    binds, vin, fout = [], [], 0
+    for tid, vid, sc in variables:
+        d = dec.get(vid, {})
+        bt = base(tid); op, a = types[bt]
+        if sc in (0, 2, 12) and 33 in d:                                # UniformConstant / Uniform / StorageBuffer with a Binding
+            img = 0
+            if op == 27: op, a = types[a[0]]; vk = 1                    # sampled image: combined image sampler
+            if op == 25:                                                # OpTypeImage: sampled type, dim, depth, arrayed, ms, sampled, format
+                dim, depth, arr, ms, sampled = a[1], a[2], a[3], a[4], a[5]
+                img = (dim & 15) | arr << 4 | ms << 5 | (depth == 1) << 6
+                if types[bt][0] != 27: vk = (4 if sampled == 1 else 5) if dim == 5 else (2 if sampled == 1 else 3)
+                elif dim == 5: vk = 4
+            elif op == 26: vk = 0                                       # sampler
+            elif op == 30:
+                vk = 7 if sc == 12 or 3 in dec.get(bt, {}) else 6      # StorageBuffer storage, or BufferBlock (decoration 3) → storage; Block → uniform
+            else: raise ValueError(f'binding {d[33]}: type op {op}')
+            pt = types[tid][1][1]; n = 1
+            if types[pt][0] == 28:                                       # array of descriptors: its length is a constant; read below
+                n = ('const', types[pt][1][1])
+            binds.append([d[33], vk, img, n])
+        elif sc == 1 and 30 in d and 11 not in d:                       # Input with a Location, not a built-in
+            t = base(tid); top, ta = types[t]
+            if top == 23: t = ta[0]; top, ta = types[t]                 # vector → component
+            vin.append((d[30], 1 if top == 21 and ta[1] == 0 else 2 if top == 21 else 0))
+        elif sc == 3 and 30 in d and 11 not in d: fout |= 1 << d[30]
+    consts = {}
+    i = 5
+    while i < len(words):
+        n, op = words[i] >> 16, words[i] & 0xffff
+        if op == 43: consts[words[i + 2]] = words[i + 3]               # OpConstant
+        i += n
+    for b in binds:
+        if isinstance(b[3], tuple): b[3] = consts.get(b[3][1], 1)
+    model = words[[j for j in range(5, len(words)) if words[j] & 0xffff == 15][0] + 1]
+    return model, binds, vin, fout, local
+
+def kind_of(res, binding):
+    if binding == 0: return KIND_SUPPORT, 0
+    for b in res.get('cbufs', []):
+        if b['binding'] == binding: return KIND_CBUF, b['slot']
+    for b in res.get('sbufs', []):
+        if b['binding'] == binding: return KIND_SBUF, b['slot']
+    for b in res.get('textures', []):
+        if b['binding'] == binding: return KIND_TEX, b['handle'] if b['handle'] >= 0 else 0xffff
+    for b in res.get('images', []):
+        if b['binding'] == binding: return KIND_IMG, b['handle'] if b['handle'] >= 0 else 0xffff
+    return KIND_UNKNOWN, 0
+
+def strip_unused(words):
+    # The translator declares Float64 and fragment shader interlock in every shader; Adreno's driver (Turnip) supports neither. Declarations a shader does not use are dropped
+    used64 = interlock = False
+    i = 5
+    while i < len(words):
+        n, op = words[i] >> 16, words[i] & 0xffff
+        if op == 22 and words[i + 2] == 64: used64 = True                                  # OpTypeFloat 64
+        if op in (5364, 5365) or (op == 16 and 5366 <= words[i + 2] <= 5371): interlock = True   # Begin / EndInvocationInterlockEXT, the interlock execution modes
+        i += n
+    out = list(words[:5]); i = 5
+    while i < len(words):
+        n, op = words[i] >> 16, words[i] & 0xffff
+        ins = words[i:i + n]
+        drop = (op == 17 and ins[1] == 10 and not used64) or (op == 17 and ins[1] in (5378, 5379, 5380) and not interlock) or \
+               (op == 10 and not interlock and struct.pack(f'<{n - 1}I', *ins[1:]).rstrip(b'\0') == b'SPV_EXT_fragment_shader_interlock')
+        if not drop: out += ins
+        i += n
+    return out
+
+def entry(spv_path, res_path):
+    data = Path(spv_path).read_bytes()
+    words = struct.unpack(f'<{len(data) // 4}I', data)
+    if words[0] != 0x07230203: raise ValueError('not SPIR-V')
+    words = strip_unused(words); data = struct.pack(f'<{len(words)}I', *words)
+    model, binds, vin, fout, local = reflect(words)
+    res = json.load(open(res_path)) if os.path.exists(res_path) else {}
+    out = bytearray(struct.pack('<BBBB3HH', model, len(binds), len(vin), fout & 0xff, *[min(x, 0xffff) for x in local], 0))
+    for b, vk, img, n in sorted(binds):
+        k, reg = kind_of(res, b)
+        out += struct.pack('<BBBBHH', b, vk, k, img, reg & 0xffff, n)
+    for loc, ct in sorted(vin): out += struct.pack('<BB', loc, ct)
+    out += b'\0' * (-len(out) % 4)
+    return bytes(out + data)
+
+def main():
+    if len(sys.argv) != 3: sys.exit('usage: spv_pack.py <spv dir> <out file>')
+    src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+    keys = sorted(p.name[:-4] for p in os.scandir(src) if p.name.endswith('.spv') and len(p.name) >= 20)
+    blobs, bad = [], 0
+    for k in keys:
+        try: key = int(k[:16], 16)
+        except ValueError: continue
+        if k != k[:16]: continue                                        # geometry variants (<key>_g<n>…) are for the Mac's geometry lowering
+        try: blobs.append((key, entry(src / f'{k}.spv', src / f'{k}.res.json')))
+        except Exception as e:
+            bad += 1
+            if bad <= 10: print(f'[RED] {k}: {e}')
+        if len(blobs) % 5000 == 0 and blobs: print(f'packed {len(blobs)}/{len(keys)}', flush=True)
+    off = 16 + 16 * len(blobs)
+    idx, body = bytearray(), bytearray()
+    for key, b in blobs:
+        idx += struct.pack('<QII', key, off + len(body), len(b)); body += b; body += b'\0' * (-len(body) % 8)
+    tmp = dst.with_suffix('.partial')
+    with open(tmp, 'wb') as f: f.write(b'DMSP' + struct.pack('<III', 1, len(blobs), 0)); f.write(idx); f.write(body)
+    tmp.replace(dst)
+    print(f'shader pack: {len(blobs)} shaders, {bad} unreadable, {(16 + len(idx) + len(body)) / 2**20:.1f} MB → {dst}')
+
+if __name__ == '__main__': main()
