@@ -321,6 +321,7 @@ static void input_poll(void) {
         if (S.GetGamepadAxis(g, GA_RT) > 12000) b |= DM_BTN_ZR;
         int32_t lx = stick(S.GetGamepadAxis(g, GA_LX)), ly = -stick(S.GetGamepadAxis(g, GA_LY)), rx = stick(S.GetGamepadAxis(g, GA_RX)), ry = -stick(S.GetGamepadAxis(g, GA_RY));
         dm_pad_set_player(p, b, lx, ly, rx, ry);
+        { static int seen; int m = (b & DM_BTN_LS ? 1 : 0) | (b & DM_BTN_RS ? 2 : 0); if (m & ~seen) { seen |= m; LOG("[input] %s stick click seen", m & 1 ? "left" : "right"); } }
     }
     // the keyboard: player 1's keyboard path (ORed with its gamepad)
     const bool *k = S.GetKeyboardState ? S.GetKeyboardState(NULL) : NULL;
@@ -334,7 +335,7 @@ static void input_poll(void) {
         dm_input_set(b, lx, ly, 0, 0);
         if (k[69]) dump_now = 1;   // F12
     }
-    if (dump_now && !dump_held) { vkw_dump_req = 1; LOG("[vk] frame dump asked for"); }
+    if (dump_now && !dump_held) { vkw_dump_req = 1; LOG("[vk] frame dump asked for (L3 + R3 or F12)"); }
     dump_held = dump_now;
 }
 

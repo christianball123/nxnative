@@ -1099,7 +1099,14 @@ static void dump_submitted(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
     if (!t0) t0 = now;
     int timed = at >= 0 && (now - t0) / 1e9 >= at;
-    if (!atomic_exchange(&vkw_dump_req, 0) && !timed) return;
+    // or a file: `touch ~/nxnative-dump-now` from a terminal while the game runs (checked twice a second)
+    static uint64_t last_chk; int file = 0;
+    if (now - last_chk > 500000000ull) {
+        last_chk = now; const char *home = getenv("HOME"); char fn[400];
+        snprintf(fn, sizeof fn, "%s/nxnative-dump-now", home ? home : "/tmp");
+        if (!access(fn, F_OK)) { unlink(fn); file = 1; LOG("[vk] frame dump asked for (%s)", fn); }
+    }
+    if (!atomic_exchange(&vkw_dump_req, 0) && !timed && !file) return;
     if (timed) at = -1;
     const char *d = getenv("DM_VK_DUMP_DIR"), *home = getenv("HOME");
     if (d && *d) snprintf(g_dump_dir, sizeof g_dump_dir, "%s", d); else snprintf(g_dump_dir, sizeof g_dump_dir, "%s/nxnative-dump", home ? home : "/tmp");
