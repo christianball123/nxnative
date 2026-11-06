@@ -130,10 +130,15 @@ static void watch_poll(void) {
         g_wt_cur++;
     }
 }
+// DM_VK_TEXLOG=1: one line per texture upload (and every failure is logged, the first 20)
+static int texlog(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_TEXLOG"); on = e && *e == '1'; } return on; }
+#define UPFAIL(why) do { g_up_fail++; static int nf_; if (nf_++ < 20 || texlog()) LOG("[RED] [vk] texture upload failed (%s): serial %llu format %#x target %d %ux%ux%u levels %u flags %#x samples %d", why, \
+    (unsigned long long)t->serial, t->d.format, t->d.target, t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.flags, t->d.samples); } while (0)
 static void tex_fill(vtex *v, const tex_t *t) {
+    if (v && !v->gpu && !v->uploaded && t && !t->mem && texlog()) { static int n; if (n++ < 50) LOG("[vk] texture serial %llu format %#x %ux%u has no storage pointer: not uploaded", (unsigned long long)t->serial, t->d.format, t->d.width, t->d.height); }
     if (!v || v->gpu || v->uploaded || !t || !t->mem || v->samples > 1) return;
     v->uploaded = 1;
-    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); if (!bpb) { g_up_fail++; return; }
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); if (!bpb) { UPFAIL("unknown format size"); return; }
     int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;
     uint32_t layers = v->is3d ? 1 : v->layers, levels = v->levels;
     if (linear) levels = 1;
@@ -143,17 +148,17 @@ static void tex_fill(vtex *v, const tex_t *t) {
         uint32_t w = v->w >> l ? v->w >> l : 1, h = v->h >> l ? v->h >> l : 1, d = v->is3d ? (v->d >> l ? v->d >> l : 1) : 1;
         total += (uint64_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * d * layers;
     }
-    stage_t *s = stage_new(total); if (!s) { g_up_fail++; return; }
+    stage_t *s = stage_new(total); if (!s) { UPFAIL("no staging memory"); return; }
     VkBufferImageCopy bic[32]; uint32_t nb = 0; uint64_t off = 0;
     VkImageAspectFlags asp = fmt_aspects(v->fmt);
-    if (asp == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) { g_up_fail++; return; }   // packed depth-stencil storage needs splitting into planes: not yet
+    if (asp == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) { UPFAIL("packed depth-stencil"); return; }   // packed depth-stencil storage needs splitting into planes: not yet
     for (uint32_t l = 0; l < levels && nb < 32; l++) {
         uint32_t w = v->w >> l ? v->w >> l : 1, h = v->h >> l ? v->h >> l : 1, d = v->is3d ? (v->d >> l ? v->d >> l : 1) : 1;
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh, lsz = pitch * rows * d;
         for (uint32_t a = 0; a < layers; a++) {
             uint8_t *dst = (uint8_t *)s->p + off + a * lsz;
             if (linear) { size_t st = t->d.stride ? t->d.stride : pitch; for (size_t r = 0; r < rows; r++) memcpy(dst + r * pitch, t->mem + r * st, pitch); }
-            else if (nvn_deswizzle(&t->d, l, a, t->mem, dst, pitch)) { memset(dst, 0, lsz); g_up_fail++; }
+            else if (nvn_deswizzle(&t->d, l, a, t->mem, dst, pitch)) { memset(dst, 0, lsz); UPFAIL("deswizzle"); }
         }
         bic[nb++] = (VkBufferImageCopy){off, 0, 0, {asp, l, 0, layers}, {0, 0, 0}, {w, h, d}};
         off += lsz * layers;
@@ -161,6 +166,9 @@ static void tex_fill(vtex *v, const tex_t *t) {
     vkCmdCopyBufferToImage_(g_cb, s->b, v->img, VK_IMAGE_LAYOUT_GENERAL, nb, bic);
     full_barrier();
     g_up_tex++; g_up_bytes += total;
+    if (texlog()) LOG("[vk] texture upload: serial %llu format %#x (Vulkan %d) target %d %ux%ux%u levels %u layers %u flags %#x%s swizzle %s%#x, %.1f KB, first word %08x",
+                      (unsigned long long)t->serial, t->d.format, v->fmt, t->d.target, t->d.width, t->d.height, t->d.depth, levels, layers, t->d.flags, linear ? " (linear)" : "",
+                      t->set_swz ? "set " : "", t->swz, total / 1024.0, *(const uint32_t *)s->p);
     nvn_texlayout L = t->L; if (!L.size) nvn_tex_layout(&t->d, &L);
     watch_add(t, L.size);
 }
@@ -418,7 +426,7 @@ static void state_op(uint32_t op, const uint8_t *a) {
 // ---------------------------------------------------------------- statistics (in the replay's summary line)
 enum { SK_NOPROG, SK_NORT, SK_TESS, SK_PIPE, SK_RING, SK_PRIM, SK_DESC, SK_N };
 static const char *k_sk[SK_N] = {"shaders not ready", "no render target", "tessellation", "pipeline refused", "upload ring full", "primitive type", "descriptors"};
-static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g_tex_missing;
+static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g_tex_missing, g_tex_unres, g_tex_unreg;
 
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
 static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; } P;
@@ -687,8 +695,10 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                     vtex *v = prep_tex(&r->t);
                     if (v && (!storage || v->storage)) { iv = tex_view(v, &r->t, &r->v, r->has_v, b->image, storage); if (storage && iv) v->gpu = 1; }
                 }
-                if (!iv && r) g_tex_missing++;
-            }
+                if (!iv && r) { g_tex_missing++; static int n; if (n++ < 10) LOG("[vk] shader %016llx binding %u: texture serial %llu (format %#x target %d, %u samples) has no view of the shader's image type %#x",
+                    (unsigned long long)s->key, b->binding, (unsigned long long)r->t.serial, r->t.d.format, r->t.d.target, r->t.d.samples, b->image); }
+                if (!r && b->vktype != VK_DESCRIPTOR_TYPE_SAMPLER && (h & 0xfffff)) { g_tex_unreg++; static int n; if (n++ < 10) LOG("[vk] shader %016llx binding %u: %s ID %u is not registered", (unsigned long long)s->key, b->binding, storage ? "image" : "texture", h & 0xfffff); }
+            } else { g_tex_unres++; static int n; if (n++ < 10) LOG("[vk] shader %016llx binding %u: handle %#x in bank %u is not one this layer reads (texture slots, images, separate samplers; uniform buffers)", (unsigned long long)s->key, b->binding, b->reg, b->aux); }
             if (!iv) iv = dummy_view(b->image);
             for (uint32_t k = 0; k < n; k++) ii[k] = (VkDescriptorImageInfo){sp, iv, VK_IMAGE_LAYOUT_GENERAL};
             break;
@@ -931,5 +941,7 @@ static void draw_summary(char *out, size_t n) {
                      (unsigned long long)g_pipes, (unsigned long long)g_up_tex, g_up_bytes / 1048576.0, (unsigned long long)g_up_fail, (unsigned long long)g_reup, g_nwt);
     for (int i = 0; i < SK_N && o < (int)n; i++) if (g_skip[i]) o += snprintf(out + o, n - o, "; skipped (%s) %llu", k_sk[i], (unsigned long long)g_skip[i]);
     if (g_tex_missing && o < (int)n) o += snprintf(out + o, n - o, "; texture bindings without a usable view %llu", (unsigned long long)g_tex_missing);
+    if (g_tex_unreg && o < (int)n) o += snprintf(out + o, n - o, "; bound texture IDs not registered %llu", (unsigned long long)g_tex_unreg);
+    if (g_tex_unres && o < (int)n) o += snprintf(out + o, n - o, "; texture handles not decoded %llu", (unsigned long long)g_tex_unres);
     if (g_unsup_sbuf_ubo && o < (int)n) snprintf(out + o, n - o, "; storage buffers addressed through uniforms (not bound) %llu", (unsigned long long)g_unsup_sbuf_ubo);
 }
