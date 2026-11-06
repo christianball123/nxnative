@@ -1106,7 +1106,13 @@ static void dump_submitted(void) {
         snprintf(fn, sizeof fn, "%s/nxnative-dump-now", home ? home : "/tmp");
         if (!access(fn, F_OK)) { unlink(fn); file = 1; LOG("[vk] frame dump asked for (%s)", fn); }
     }
-    if (!atomic_exchange(&vkw_dump_req, 0) && !timed && !file) return;
+    // or every 20 seconds while ~/nxnative-dump-auto exists (made before starting the game: each dump replaces the one before, so the last one is of what was on
+    // screen just before the game was closed)
+    static int auto_on = -1; static uint64_t auto_last;
+    if (auto_on < 0) { const char *home = getenv("HOME"); char fn[400]; snprintf(fn, sizeof fn, "%s/nxnative-dump-auto", home ? home : "/tmp"); auto_on = !access(fn, F_OK); if (auto_on) LOG("[vk] %s exists: a frame dump every 20 seconds", fn); }
+    int autod = auto_on && now - auto_last > 20000000000ull && now - t0 > 20000000000ull;
+    if (autod) auto_last = now;
+    if (!atomic_exchange(&vkw_dump_req, 0) && !timed && !file && !autod) return;
     if (timed) at = -1;
     const char *d = getenv("DM_VK_DUMP_DIR"), *home = getenv("HOME");
     if (d && *d) snprintf(g_dump_dir, sizeof g_dump_dir, "%s", d); else snprintf(g_dump_dir, sizeof g_dump_dir, "%s/nxnative-dump", home ? home : "/tmp");
