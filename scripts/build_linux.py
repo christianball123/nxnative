@@ -255,7 +255,7 @@ if [ ! -f /run/.containerenv ] && [ -n "{box}" ]; then
         for lib in libSDL3.so.0 libvulkan.so.1; do
             if ! ldconfig -p 2>/dev/null | grep -q "$lib"; then echo "the host has no $lib: through the toolbox"; need_box=1; fi
         done
-        if [ "$need_box" != 1 ] && ldd "$here/dmhost" 2>&1 | grep -q "not found\|version .* not found"; then echo "dmhost does not load on the host: through the toolbox"; ldd "$here/dmhost"; need_box=1; fi
+        if [ "$need_box" != 1 ] && ldd "$here/dmhost" 2>&1 | grep -q "not found\\|version .* not found"; then echo "dmhost does not load on the host: through the toolbox"; ldd "$here/dmhost"; need_box=1; fi
     fi
     if [ "$need_box" = 1 ]; then
         unset LD_PRELOAD LD_LIBRARY_PATH   # Steam's own environment does not belong in the toolbox
