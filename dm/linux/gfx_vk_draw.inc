@@ -405,7 +405,7 @@ static void state_op(uint32_t op, const uint8_t *a) {
 // ---------------------------------------------------------------- statistics (in the replay's summary line)
 enum { SK_NOPROG, SK_NORT, SK_TESS, SK_PIPE, SK_RING, SK_PRIM, SK_DESC, SK_N };
 static const char *k_sk[SK_N] = {"shaders not ready", "no render target", "tessellation / geometry off", "pipeline refused", "upload ring full", "primitive type", "descriptors"};
-static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g_tex_missing, g_tex_unres, g_tex_unreg;
+static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g_tex_missing, g_tex_unres, g_tex_unreg, g_storage_unsup;
 
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
 static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; } P;
@@ -686,12 +686,23 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
             if (ok) {
                 const treg *r = storage ? ireg_get((int)(h & 0xfffff)) : treg_get((int)(h & 0xfffff));
                 if (b->vktype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->vktype != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) { VkSampler x = sampler_for(sreg_get((int)(h >> 20))); if (x) sp = x; }
+                int why = 0;   // 1 no image (format or size refused), 2 the format cannot be a shader image (storage), 3 no view of the shader's image type
                 if (r && b->vktype != VK_DESCRIPTOR_TYPE_SAMPLER) {
                     vtex *v = prep_tex(&r->t);
-                    if (v && (!storage || v->storage)) { iv = tex_view(v, &r->t, &r->v, r->has_v, b->image, storage); if (storage && iv) gpu_wrote(v); }
+                    if (!v) why = 1;
+                    else if (storage && !v->storage) why = 2;
+                    else { iv = tex_view(v, &r->t, &r->v, r->has_v, b->image, storage); if (storage && iv) gpu_wrote(v); if (!iv) why = 3; }
                 }
-                if (!iv && r) { g_tex_missing++; static int n; if (n++ < 10) LOG("[vk] shader %016llx binding %u: texture serial %llu (format %#x target %d, %u samples) has no view of the shader's image type %#x",
-                    (unsigned long long)s->key, b->binding, (unsigned long long)r->t.serial, r->t.d.format, r->t.d.target, r->t.d.samples, b->image); }
+                if (!iv && r) {
+                    g_tex_missing++; if (why == 2) g_storage_unsup++;
+                    // each texture logged once (up to 40): a scene's missing pieces show up even when one texture misses at every draw
+                    static uint64_t seen[40]; static int nseen; int k = 0; while (k < nseen && seen[k] != r->t.serial) k++;
+                    if (k == nseen && nseen < 40) { seen[nseen++] = r->t.serial;
+                        LOG("[vk] shader %016llx binding %u: texture serial %llu (NVN format %#x target %d %ux%u, %u samples, flags %#x) %s (shader image type %#x%s)",
+                            (unsigned long long)s->key, b->binding, (unsigned long long)r->t.serial, r->t.d.format, r->t.d.target, r->t.d.width, r->t.d.height, r->t.d.samples, r->t.d.flags,
+                            why == 1 ? "has no Vulkan image" : why == 2 ? "cannot be a shader image in this format (written by the shader: its output is lost)" : "has no view of the shader's image type",
+                            b->image, storage ? ", storage" : ""); }
+                }
                 if (!r && b->vktype != VK_DESCRIPTOR_TYPE_SAMPLER && (h & 0xfffff)) { g_tex_unreg++; static int n; if (n++ < 10) LOG("[vk] shader %016llx binding %u: %s ID %u is not registered", (unsigned long long)s->key, b->binding, storage ? "image" : "texture", h & 0xfffff); }
             } else { g_tex_unres++; static int n; if (n++ < 10) LOG("[vk] shader %016llx binding %u: handle %#x in bank %u is not one this layer reads (texture slots, images, separate samplers; uniform buffers)", (unsigned long long)s->key, b->binding, b->reg, b->aux); }
             if (!iv) iv = dummy_view(b->image);
@@ -958,6 +969,7 @@ static void draw_summary(char *out, size_t n) {
                      (unsigned long long)g_pipes, (unsigned long long)g_up_tex, g_up_bytes / 1048576.0, (unsigned long long)g_up_fail, (unsigned long long)g_reup, (unsigned long long)g_untracked, (unsigned long long)g_lin_rb, g_lin_rb_bytes / 1048576.0);
     for (int i = 0; i < SK_N && o < (int)n; i++) if (g_skip[i]) o += snprintf(out + o, n - o, "; skipped (%s) %llu", k_sk[i], (unsigned long long)g_skip[i]);
     if (g_tex_missing && o < (int)n) o += snprintf(out + o, n - o, "; texture bindings without a usable view %llu", (unsigned long long)g_tex_missing);
+    if (g_storage_unsup && o < (int)n) o += snprintf(out + o, n - o, "; shader images in a format that cannot be written %llu", (unsigned long long)g_storage_unsup);
     if (g_tex_unreg && o < (int)n) o += snprintf(out + o, n - o, "; bound texture IDs not registered %llu", (unsigned long long)g_tex_unreg);
     if (g_tex_unres && o < (int)n) o += snprintf(out + o, n - o, "; texture handles not decoded %llu", (unsigned long long)g_tex_unres);
     if (g_unsup_sbuf_ubo && o < (int)n) snprintf(out + o, n - o, "; storage buffers addressed through uniforms (not bound) %llu", (unsigned long long)g_unsup_sbuf_ubo);
