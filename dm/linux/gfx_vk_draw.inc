@@ -554,7 +554,9 @@ static VkPipeline pipe_make(const vks_prog *pr, const pkey *k) {
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, (VkPrimitiveTopology)k->topo,
         k->prim_restart && k->topo != VK_PRIMITIVE_TOPOLOGY_POINT_LIST && k->topo != VK_PRIMITIVE_TOPOLOGY_LINE_LIST && k->topo != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
     VkPipelineViewportDepthClipControlCreateInfoEXT dcc = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, NULL, VK_TRUE};
-    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, k->depth_gl ? &dcc : NULL, 0, 1, NULL, 1, NULL};
+    // a geometry stage may pick the viewport (Mario Tennis Fever's shadow cascades: 4): all 16 then; otherwise 1
+    uint32_t nvp = pr->st[VKS_GS] && VK.limits.maxViewports > 1 ? (VK.limits.maxViewports < 16 ? VK.limits.maxViewports : 16) : 1;
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, k->depth_gl ? &dcc : NULL, 0, nvp, NULL, nvp, NULL};
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, k->depth_clamp, k->rast_discard,
         k->poly.mode == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : k->poly.mode == NVN_POLYGON_MODE_POINT ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_FILL,
         (VkCullModeFlags)(k->poly.cull & 3), k->front_ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE, k->poly.offset_en != 0, 0, 0, 0, 1.0f};
@@ -838,14 +840,11 @@ static void do_draw(const draw_args *a) {
     }
     (void)vbufs; (void)voffs; (void)nb;
     if (indexed) vkCmdBindIndexBuffer_(g_cb, RG.b, ib_off, it);
-    // viewport 0 (NVN x, y, w, h; depth range from SetDepthRange); upper-left origin: negative height (see the top of this file)
-    float vx = D.vp[0][0], vy = D.vp[0][1], vw = D.vp[0][2], vh = D.vp[0][3];
-    if (vw <= 0 || vh <= 0) { vx = 0; vy = 0; vw = (float)P.w; vh = (float)P.h; }
+    // the viewports (NVN x, y, w, h; depth range from SetDepthRange); upper-left origin: negative height (see the top of this file). One unless a geometry stage picks one
     static int flipy = -1; if (flipy < 0) { const char *e = getenv("DM_VK_FLIP_Y"); flipy = e && *e ? atoi(e) : -1; if (flipy < 0) flipy = 2; }
     int flip = flipy == 2 ? !ll : flipy;
-    VkViewport vp = {vx, flip ? vy + vh : vy, vw, flip ? -vh : vh, D.dr[0], D.dr[1]};
-    if (!k.depth_gl && !atomic_load(&g_depth_zero)) { /* no depth clip control: depth stays in [-1, 1] clipped to [0, 1] */ }
-    vkCmdSetViewport_(g_cb, 0, 1, &vp);
+    uint32_t nvp = pr->st[VKS_GS] && VK.limits.maxViewports > 1 ? (VK.limits.maxViewports < 16 ? VK.limits.maxViewports : 16) : 1;
+    VkViewport vps[16]; VkRect2D scs[16];
     int32_t sx = 0, sy = 0; uint32_t sw = P.w, sh = P.h;
     if (D.has_sc && D.sc.w >= 0 && D.sc.h >= 0) {
         int64_t x0 = D.sc.x > 0 ? D.sc.x : 0, y0 = D.sc.y > 0 ? D.sc.y : 0, x1 = (int64_t)D.sc.x + D.sc.w, y1 = (int64_t)D.sc.y + D.sc.h;
@@ -853,8 +852,14 @@ static void do_draw(const draw_args *a) {
         if (y1 > P.h) y1 = P.h;
         sx = (int32_t)x0; sy = (int32_t)y0; sw = x1 > x0 ? (uint32_t)(x1 - x0) : 0; sh = y1 > y0 ? (uint32_t)(y1 - y0) : 0;
     }
-    VkRect2D sc = {{sx, sy}, {sw, sh}};
-    vkCmdSetScissor_(g_cb, 0, 1, &sc);
+    for (uint32_t i = 0; i < nvp; i++) {
+        float vx = D.vp[i][0], vy = D.vp[i][1], vw = D.vp[i][2], vh = D.vp[i][3];
+        if (vw <= 0 || vh <= 0) { vx = 0; vy = 0; vw = (float)P.w; vh = (float)P.h; }
+        vps[i] = (VkViewport){vx, flip ? vy + vh : vy, vw, flip ? -vh : vh, D.dr[0], D.dr[1]};
+        scs[i] = (VkRect2D){{sx, sy}, {sw, sh}};   // NVN's other scissors are not recorded (hle_nvn.c SetScissors keeps index 0)
+    }
+    vkCmdSetViewport_(g_cb, 0, nvp, vps);
+    vkCmdSetScissor_(g_cb, 0, nvp, scs);
     vkCmdSetStencilCompareMask_(g_cb, VK_STENCIL_FACE_FRONT_BIT, D.st_vmask[0]); vkCmdSetStencilCompareMask_(g_cb, VK_STENCIL_FACE_BACK_BIT, D.st_vmask[1]);
     vkCmdSetStencilWriteMask_(g_cb, VK_STENCIL_FACE_FRONT_BIT, D.st_wmask[0]); vkCmdSetStencilWriteMask_(g_cb, VK_STENCIL_FACE_BACK_BIT, D.st_wmask[1]);
     vkCmdSetStencilReference_(g_cb, VK_STENCIL_FACE_FRONT_BIT, D.st_ref[0]); vkCmdSetStencilReference_(g_cb, VK_STENCIL_FACE_BACK_BIT, D.st_ref[1]);

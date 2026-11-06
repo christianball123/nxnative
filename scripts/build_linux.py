@@ -227,6 +227,7 @@ def main():
 cd "$(dirname "$0")"
 export DM_ROOT="{run_dir}" DM_ROMFS="{ext / 'RomFS.img'}" DM_SAVE="{run_dir}/save" DM_TEMP="{run_dir}/temp" DM_FONT_DIR="{lw}/font"
 export DM_AUDIO="${{DM_AUDIO:-1}}"   # sound through SDL3 (DM_AUDIO=0: silent)
+export DM_OPMODE="${{DM_OPMODE:-0}}"   # handheld mode: the game renders for a handheld screen (Switch 2 docked mode is 1440p: four times the render targets' memory and GPU time on a 1080p screen); DM_OPMODE=1 docked
 {f'export DM_SHADERS="{lw / "shaders.dmsp"}"   # the translated shaders (stage C)' if (lw / 'shaders.dmsp').is_file() else '# no shader pack yet (build with --shaders)'}
 {f'export DM_AOC_DIR="{aoc}"' if aoc.is_dir() and any(aoc.iterdir()) else '# no DLC'}
 exec ./dmhost "{patched}" "$@" 2>&1 | tee log.txt
