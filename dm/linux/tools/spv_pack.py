@@ -15,6 +15,7 @@ import json, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import spv_passthrough
 import spv_alpha
+import spv_outinit
 from pathlib import Path
 
 KIND_SUPPORT, KIND_CBUF, KIND_SBUF, KIND_TEX, KIND_IMG, KIND_UNKNOWN = range(6)
@@ -140,6 +141,7 @@ def entry(spv_path, res_path, job_path=None):
         except Exception as e: print(f'[YELLOW] {Path(spv_path).stem}: passthrough geometry shader not rewritten ({e}): kept as it is', flush=True)
     words = add_image_caps(strip_unused(words))
     words, _ = spv_alpha.add_alpha_test(words)   # fragment shaders: NVN's alpha test as code (spv_alpha.py)
+    words, _ = spv_outinit.init_outputs(words)   # vertex shaders: outputs start at Maxwell's (0, 0, 0, 1) (spv_outinit.py)
     data = struct.pack(f'<{len(words)}I', *words)
     model, binds, vin, fout, local = reflect(words)
     res = json.load(open(res_path)) if os.path.exists(res_path) else {}
