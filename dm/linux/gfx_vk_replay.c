@@ -433,7 +433,17 @@ static int g_draw_on = 1;   // DM_VK_DRAW=0: count draws without drawing (stage 
 #include "gfx_vk_draw.inc"
 
 // ---------------------------------------------------------------- the record walk
+// Where a submission's time goes (logged with the replay summary): recording (the command stream walked: descriptor writes, ring copies, uploads), the submit call,
+// the wait for the GPU, and the work after it (read-backs, write-backs, resets)
+static uint64_t g_t_rec, g_t_submit, g_t_wait, g_t_done, g_t_n; static int g_exec_depth; static uint64_t g_exec_t0;
+static uint64_t mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }
+static void mtl_exec_body(const uint8_t *p);
 void mtl_exec(const uint8_t *p) {
+    if (!g_exec_depth++) g_exec_t0 = mono_ns();
+    mtl_exec_body(p);
+    if (!--g_exec_depth) g_t_rec += mono_ns() - g_exec_t0;
+}
+static void mtl_exec_body(const uint8_t *p) {
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         const uint8_t *a = p + 8;
@@ -477,6 +487,7 @@ void mtl_sub_begin(void) {
 }
 uint64_t mtl_sub_commit(void) {
     if (g_cb_open) {
+        uint64_t t0 = mono_ns();
         pass_end();
         linear_readbacks();
         vkEndCommandBuffer_(g_cb); g_cb_open = 0;
@@ -484,15 +495,18 @@ uint64_t mtl_sub_commit(void) {
         pthread_mutex_lock(&VK.qmu);
         VkResult r = vkQueueSubmit_(VK.q, 1, &si, g_fence_vk);
         pthread_mutex_unlock(&VK.qmu);
+        uint64_t t1 = mono_ns(); g_t_submit += t1 - t0;
         if (r) LOG("[RED] [vk] submission failed (%d)", r);
         else {
             VkResult w = vkWaitForFences_(VK.dev, 1, &g_fence_vk, VK_TRUE, 5000000000ull);
             if (w) { LOG("[RED] [vk] the GPU did not finish a submission in 5 s (%d): device lost or hung", w); vkDeviceWaitIdle_(VK.dev); }
             vkResetFences_(VK.dev, 1, &g_fence_vk);
         }
+        uint64_t t2 = mono_ns(); g_t_wait += t2 - t1;
         stages_done();
         linear_done();
         draw_submitted();
+        g_t_done += mono_ns() - t2; g_t_n++;
     }
     dump_submitted();
     // The submission has completed: its events and counters land, in record order
@@ -521,6 +535,9 @@ uint64_t mtl_sub_commit(void) {
         LOG("[vk] replay: %llu submissions; draws %llu (%llu with their shaders ready), dispatches %llu (%llu ready); programs %llu, shaders missing %llu, refused %llu; %s",
             (unsigned long long)f, (unsigned long long)g_draws, (unsigned long long)g_draws_ready, (unsigned long long)g_dispatches, (unsigned long long)g_disp_ready,
             (unsigned long long)np, (unsigned long long)nm, (unsigned long long)nf, ds);
+        if (g_t_n) LOG("[vk] time per submission (last %llu): recording %.2f ms, submit %.2f ms, GPU wait %.2f ms, after %.2f ms; ring %.2f MB per submission",
+            (unsigned long long)g_t_n, g_t_rec / 1e6 / g_t_n, g_t_submit / 1e6 / g_t_n, g_t_wait / 1e6 / g_t_n, g_t_done / 1e6 / g_t_n, ring_mb_per_sub(g_t_n));
+        g_t_rec = g_t_submit = g_t_wait = g_t_done = g_t_n = 0;
     }
     return f;
 }

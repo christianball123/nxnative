@@ -54,6 +54,7 @@ static uint64_t ring_put(uint64_t addr, uint64_t size) {
     if (addr && !g_rh[i].addr && g_nrh_used < RH_CAP) { g_rh[i] = (ring_hit){addr, size, off}; g_rh_idx[g_nrh_used++] = (uint16_t)i; }
     return off;
 }
+static double ring_mb_per_sub(uint64_t n) { static uint64_t last; double r = (g_ring_bytes - last) / 1048576.0 / (n ? n : 1); last = g_ring_bytes; return r; }
 // Guest bytes the command stream changes as it goes (nvnCommandBufferUpdateUniformBuffer, buffer copies and clears): copies of them made earlier in this submission
 // are not reused, so the draws after the change see the new bytes. Particle effects update one uniform buffer between their emitters' draws: every emitter drew
 // with the first one's constants, and their alpha curves and colours came out as solid shapes
