@@ -14,7 +14,7 @@
 # Names are the guest names: a host name chosen on a case collision (.dm-case-N) is replaced by the one in its xattr, as hle_fs.c's guest_name does.
 # Usage: romfs_image.py [--reuse] <RomFS folder> <out image>   (written to <out>.part, renamed at the end)
 # --reuse checks the source tree's names and file metadata, the packer's version and the image's identity before keeping a previous image.
-import argparse, hashlib, json, os, struct, subprocess
+import argparse, hashlib, json, os, struct, subprocess, sys
 from pathlib import Path
 
 MAGIC = b'DMROMFS1'
@@ -51,8 +51,27 @@ def entries(src):
     return ents
 
 
+_UNSTABLE_INO = {'exfat', 'vfat', 'msdos', 'fat', 'fuseblk', 'ntfs', 'ntfs3', 'sdcardfs'}
+_fs_cache = {}
+def _unstable_ino(path):
+    # exFAT / FAT / NTFS (an SD card or USB drive on Linux) have no inode numbers of their own: the kernel makes them up per inode cache entry, so a file's st_ino (and its
+    # ctime, set when the entry is rebuilt) can change between two stats while the file is untouched. There a file's identity is its size and modification time only
+    if sys.platform != 'linux': return False
+    d = os.path.dirname(os.path.realpath(path))
+    if d in _fs_cache: return _fs_cache[d]
+    best, fs = '', ''
+    try:
+        for line in open('/proc/self/mounts'):
+            f = line.split()
+            mp = f[1].replace('\\040', ' ')
+            if (d == mp or d.startswith(mp.rstrip('/') + '/')) and len(mp) >= len(best): best, fs = mp, f[2]
+    except OSError: pass
+    _fs_cache[d] = fs in _UNSTABLE_INO
+    return _fs_cache[d]
+
 def file_identity(path):
     s = os.stat(path)
+    if _unstable_ino(path): return [s.st_size, s.st_mtime_ns]
     return [s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns]
 
 
