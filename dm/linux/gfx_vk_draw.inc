@@ -404,7 +404,7 @@ static void state_op(uint32_t op, const uint8_t *a) {
 
 // ---------------------------------------------------------------- statistics (in the replay's summary line)
 enum { SK_NOPROG, SK_NORT, SK_TESS, SK_PIPE, SK_RING, SK_PRIM, SK_DESC, SK_N };
-static const char *k_sk[SK_N] = {"shaders not ready", "no render target", "tessellation", "pipeline refused", "upload ring full", "primitive type", "descriptors"};
+static const char *k_sk[SK_N] = {"shaders not ready", "no render target", "tessellation / geometry off", "pipeline refused", "upload ring full", "primitive type", "descriptors"};
 static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g_tex_missing, g_tex_unres, g_tex_unreg;
 
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
@@ -579,6 +579,8 @@ static VkPipeline pipe_make(const vks_prog *pr, const pkey *k) {
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rci, 0, ns, st, &vi, &ia, NULL, &vp, &rs, &ms, &dss, &cbs, &ds, pr->layout, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, -1};
     if (!g_pcache) { VkPipelineCacheCreateInfo pc = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, 0, NULL}; vkCreatePipelineCache_(VK.dev, &pc, NULL, &g_pcache); }
     VkPipeline p = VK_NULL_HANDLE;
+    if (pr->st[VKS_GS]) { static int n; if (n++ < 30) { LOG("[vk] making a pipeline with geometry shader %016llx (vertex %016llx, fragment %016llx, input topology %d)",
+        (unsigned long long)pr->st[VKS_GS]->key, pr->st[VKS_VS] ? (unsigned long long)pr->st[VKS_VS]->key : 0ull, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull, pr->gs_class); fflush(stderr); } }
     VkResult r = vkCreateGraphicsPipelines_(VK.dev, g_pcache, 1, &ci, NULL, &p);
     if (r) {
         static int n; if (n++ < 10) {
@@ -747,6 +749,8 @@ static void do_draw(const draw_args *a) {
     if (!pr) { g_skip[SK_NOPROG]++; return; }
     if (pr->st[VKS_TCS] || pr->st[VKS_TES]) { g_skip[SK_TESS]++; return; }
     VkPrimitiveTopology topo = topo_of(a->prim);
+    static int gs_on = -1; if (gs_on < 0) { const char *e = getenv("DM_VK_GEOMETRY"); gs_on = !(e && *e == '0'); if (!gs_on) LOG("[vk] DM_VK_GEOMETRY=0: draws with a geometry stage are skipped"); }
+    if (pr->has_gs && !gs_on) { g_skip[SK_TESS]++; return; }
     if (pr->has_gs) {   // the geometry shader made for this topology's input primitive
         int cls = topo == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ? 0 : topo <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ? 1 : topo <= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ? 3 :
                   topo <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ? 2 : topo <= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY ? 4 : -1;
