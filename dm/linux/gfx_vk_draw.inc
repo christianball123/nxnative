@@ -882,6 +882,7 @@ static void do_draw(const draw_args *a) {
     // NVN's alpha test (as OpenGL, none when colour 0 goes to an integer target): the pipeline turns the shader's test on, the support buffer holds function and reference
     g_at_func = D.color.alpha_func && D.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS && !(P.cf[0] && fmt_int(P.cf[0])) ? D.color.alpha_func : 0;
     k.atest = g_at_func != 0; g_at_ref = D.alpha_ref;
+    if (k.atest) { static int n; if (n++ < 10) LOG("[vk] alpha test: function %u reference %.3f, fragment shader %016llx", g_at_func, g_at_ref, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull); }
     for (int i = 0; i < 8; i++) k.blend[i].target = 0;
     // vertex inputs: each location the vertex shader reads gets NVN attribute <location>, or the zero buffer
     const vks_shader *vs = pr->st[VKS_VS];
@@ -976,9 +977,9 @@ static void do_draw(const draw_args *a) {
     vkCmdSetViewport_(g_cb, 0, nvp, vps);
     vkCmdSetScissor_(g_cb, 0, nvp, scs);
     if (g_dump_subs && g_dump_lines < 4000) { g_dump_lines++;
-        LOG("[vk] dump:   pass %d draw: vertex %016llx fragment %016llx, %u vertices × %u (prim %d), viewport %.0f,%.0f %.0fx%.0f (asked %.0f,%.0f %.0fx%.0f), scissor %d,%d %ux%u, colour mask %#x, blend %#x, depth test %d write %d",
+        LOG("[vk] dump:   pass %d draw: vertex %016llx fragment %016llx, %u vertices × %u (prim %d), viewport %.0f,%.0f %.0fx%.0f (asked %.0f,%.0f %.0fx%.0f), scissor %d,%d %ux%u, colour mask %#x, blend %#x (target 0: %u %u %u / %u %u %u), alpha test %u, depth test %d write %d",
             g_dump_pass, pr->st[VKS_VS] ? (unsigned long long)pr->st[VKS_VS]->key : 0ull, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull, a->count, a->instances, a->prim,
-            vps[0].x, vps[0].y, vps[0].width, vps[0].height, D.vp[0][0], D.vp[0][1], D.vp[0][2], D.vp[0][3], sx, sy, sw, sh, (unsigned)D.chmask.mask, (unsigned)D.color.blend_en, (int)k.ds.dt, (int)k.ds.dw); }
+            vps[0].x, vps[0].y, vps[0].width, vps[0].height, D.vp[0][0], D.vp[0][1], D.vp[0][2], D.vp[0][3], sx, sy, sw, sh, (unsigned)D.chmask.mask, (unsigned)D.color.blend_en, (unsigned)D.blend[0].src_rgb, (unsigned)D.blend[0].dst_rgb, (unsigned)D.blend[0].eq_rgb, (unsigned)D.blend[0].src_a, (unsigned)D.blend[0].dst_a, (unsigned)D.blend[0].eq_a, g_at_func, (int)k.ds.dt, (int)k.ds.dw); }
     vkCmdSetStencilCompareMask_(g_cb, VK_STENCIL_FACE_FRONT_BIT, D.st_vmask[0]); vkCmdSetStencilCompareMask_(g_cb, VK_STENCIL_FACE_BACK_BIT, D.st_vmask[1]);
     vkCmdSetStencilWriteMask_(g_cb, VK_STENCIL_FACE_FRONT_BIT, D.st_wmask[0]); vkCmdSetStencilWriteMask_(g_cb, VK_STENCIL_FACE_BACK_BIT, D.st_wmask[1]);
     vkCmdSetStencilReference_(g_cb, VK_STENCIL_FACE_FRONT_BIT, D.st_ref[0]); vkCmdSetStencilReference_(g_cb, VK_STENCIL_FACE_BACK_BIT, D.st_ref[1]);
@@ -1176,7 +1177,11 @@ static void dump_submitted(void) {
     // screen just before the game was closed)
     static int auto_on = -1; static uint64_t auto_last;
     if (auto_on < 0) { const char *home = getenv("HOME"); char fn[400]; snprintf(fn, sizeof fn, "%s/nxnative-dump-auto", home ? home : "/tmp"); auto_on = !access(fn, F_OK); if (auto_on) LOG("[vk] %s exists: a frame dump every 20 seconds", fn); }
-    int autod = auto_on && now - auto_last > 20000000000ull && now - t0 > 20000000000ull;
+    static uint64_t every = 20000000000ull;
+    if (auto_on == 1) { const char *home = getenv("HOME"); char fn[400]; snprintf(fn, sizeof fn, "%s/nxnative-dump-auto", home ? home : "/tmp");
+        FILE *fp = fopen(fn, "r"); double sec = 0; if (fp) { if (fscanf(fp, "%lf", &sec) != 1) sec = 0; fclose(fp); }
+        if (sec >= 1) { every = (uint64_t)(sec * 1e9); LOG("[vk] frame dumps every %.0f seconds", sec); } auto_on = 2; }
+    int autod = auto_on && now - auto_last > every && now - t0 > every;
     if (autod) auto_last = now;
     if (!atomic_exchange(&vkw_dump_req, 0) && !timed && !file && !autod) return;
     if (timed) at = -1;
