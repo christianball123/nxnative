@@ -13,7 +13,9 @@ typedef struct SDL_Window SDL_Window;
 typedef union { uint32_t type; uint8_t pad[128]; } SDL_Event;
 enum { SDL_INIT_VIDEO = 0x20, SDL_INIT_GAMEPAD = 0x2000, SDL_INIT_EVENTS = 0x4000 };
 enum { SDL_WINDOW_FULLSCREEN = 0x1, SDL_WINDOW_RESIZABLE = 0x20, SDL_WINDOW_VULKAN = 0x10000000 };
-enum { SDL_EVENT_QUIT = 0x100, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED = 0x207, SDL_EVENT_KEY_DOWN = 0x300 };
+enum { SDL_EVENT_QUIT = 0x100, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED = 0x207, SDL_EVENT_KEY_DOWN = 0x300, SDL_EVENT_GAMEPAD_ADDED = 0x653, SDL_EVENT_GAMEPAD_REMOVED = 0x654 };
+typedef struct SDL_Gamepad SDL_Gamepad;
+typedef uint32_t SDL_JoystickID;
 static struct {
     void *lib;
     bool (*Init)(uint32_t);
@@ -26,6 +28,15 @@ static struct {
     bool (*Vulkan_CreateSurface)(SDL_Window *, VkInstance, const VkAllocationCallbacks *, VkSurfaceKHR *);
     void *(*Vulkan_GetVkGetInstanceProcAddr)(void);
     bool (*Vulkan_LoadLibrary)(const char *);
+    SDL_JoystickID *(*GetGamepads)(int *);
+    SDL_Gamepad *(*OpenGamepad)(SDL_JoystickID);
+    void (*CloseGamepad)(SDL_Gamepad *);
+    bool (*GamepadConnected)(SDL_Gamepad *);
+    bool (*GetGamepadButton)(SDL_Gamepad *, int);
+    int16_t (*GetGamepadAxis)(SDL_Gamepad *, int);
+    const char *(*GetGamepadName)(SDL_Gamepad *);
+    const bool *(*GetKeyboardState)(int *);
+    void (*free)(void *);
 } S;
 
 static int sdl_load(void) {
@@ -35,6 +46,10 @@ static int sdl_load(void) {
 #define L(f) if (!(*(void **)&S.f = dlsym(S.lib, "SDL_" #f))) { LOG("[RED] [vk] window: SDL3 has no SDL_" #f); return 0; }
     L(Init) L(GetError) L(CreateWindow) L(SetWindowTitle) L(GetWindowSizeInPixels) L(PollEvent) L(Vulkan_GetInstanceExtensions) L(Vulkan_CreateSurface) L(Vulkan_GetVkGetInstanceProcAddr) L(Vulkan_LoadLibrary)
 #undef L
+    // the gamepad and keyboard functions: optional (no input without them, the game still runs)
+#define LO(f) *(void **)&S.f = dlsym(S.lib, "SDL_" #f);
+    LO(GetGamepads) LO(OpenGamepad) LO(CloseGamepad) LO(GamepadConnected) LO(GetGamepadButton) LO(GetGamepadAxis) LO(GetGamepadName) LO(GetKeyboardState) LO(free)
+#undef LO
     return 1;
 }
 
@@ -195,12 +210,79 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImage
     vkCmdPipelineBarrier_(cb, ss, ds, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
+// ---- input (stage E): SDL3 gamepads → the game's controllers (hle_hid.c dm_pad_set_player), player n = the n-th gamepad; the keyboard (window focused) adds to player 1.
+// Face buttons by position, as on a Switch: bottom B, right A, left Y, top X (the Thor's buttons are labelled that way). DM_PAD_LAYOUT=xbox maps by an Xbox pad's labels
+// instead (A at the bottom). Shoulders L / R, triggers ZL / ZR, Start +, Back -, stick clicks; the sticks with up positive, as the Switch reports them.
+// Keyboard: arrows = d-pad, X = A, Z = B, S = X, A = Y, Q = L, W = R, 1 = ZL, 2 = ZR, Enter = +, Backspace = -, I J K L = left stick
+#include "../host/dm_input.h"
+enum { GP_SOUTH, GP_EAST, GP_WEST, GP_NORTH, GP_BACK, GP_GUIDE, GP_START, GP_LSTICK, GP_RSTICK, GP_LSHOULDER, GP_RSHOULDER, GP_UP, GP_DOWN, GP_LEFT, GP_RIGHT };
+enum { GA_LX, GA_LY, GA_RX, GA_RY, GA_LT, GA_RT };
+static SDL_Gamepad *g_pad[DM_PLAYERS]; static int g_npad, g_pad_scan = 1, g_xbox = -1;
+static void pads_scan(void) {
+    g_pad_scan = 0;
+    for (int i = 0; i < g_npad; i++) if (g_pad[i]) S.CloseGamepad(g_pad[i]);
+    g_npad = 0;
+    int n = 0; SDL_JoystickID *ids = S.GetGamepads ? S.GetGamepads(&n) : NULL;
+    for (int i = 0; i < n && g_npad < DM_PLAYERS; i++) {
+        SDL_Gamepad *g = S.OpenGamepad(ids[i]); if (!g) continue;
+        g_pad[g_npad++] = g;
+        LOG("[input] player %d: %s", g_npad, S.GetGamepadName ? S.GetGamepadName(g) : "gamepad");
+    }
+    if (ids && S.free) S.free(ids);
+    if (!g_npad) LOG("[input] no gamepad found: the keyboard plays player 1 (arrows, X = A, Z = B, S = X, A = Y, Q / W = L / R, 1 / 2 = ZL / ZR, Enter = +, Backspace = -)");
+    dm_pad_players(g_npad > 1 ? (1u << g_npad) - 1 : 1);
+}
+static int32_t stick(int16_t v) { return v < -DM_STICK_MAX ? -DM_STICK_MAX : v; }
+static void input_poll(void) {
+    if (!S.GetGamepadButton) return;
+    if (g_xbox < 0) { const char *e = getenv("DM_PAD_LAYOUT"); g_xbox = e && !strcmp(e, "xbox"); }
+    if (g_pad_scan) pads_scan();
+    for (int p = 0; p < g_npad; p++) {
+        SDL_Gamepad *g = g_pad[p];
+        if (!g || (S.GamepadConnected && !S.GamepadConnected(g))) continue;
+        #define B(x) S.GetGamepadButton(g, x)
+        uint64_t b = 0;
+        if (B(g_xbox ? GP_SOUTH : GP_EAST)) b |= DM_BTN_A;
+        if (B(g_xbox ? GP_EAST : GP_SOUTH)) b |= DM_BTN_B;
+        if (B(g_xbox ? GP_NORTH : GP_WEST)) b |= DM_BTN_Y;
+        if (B(g_xbox ? GP_WEST : GP_NORTH)) b |= DM_BTN_X;
+        if (B(GP_LSHOULDER)) b |= DM_BTN_L;
+        if (B(GP_RSHOULDER)) b |= DM_BTN_R;
+        if (B(GP_START)) b |= DM_BTN_PLUS;
+        if (B(GP_BACK)) b |= DM_BTN_MINUS;
+        if (B(GP_LSTICK)) b |= DM_BTN_LS;
+        if (B(GP_RSTICK)) b |= DM_BTN_RS;
+        if (B(GP_UP)) b |= DM_BTN_UP;
+        if (B(GP_DOWN)) b |= DM_BTN_DOWN;
+        if (B(GP_LEFT)) b |= DM_BTN_LEFT;
+        if (B(GP_RIGHT)) b |= DM_BTN_RIGHT;
+        #undef B
+        if (S.GetGamepadAxis(g, GA_LT) > 12000) b |= DM_BTN_ZL;
+        if (S.GetGamepadAxis(g, GA_RT) > 12000) b |= DM_BTN_ZR;
+        int32_t lx = stick(S.GetGamepadAxis(g, GA_LX)), ly = -stick(S.GetGamepadAxis(g, GA_LY)), rx = stick(S.GetGamepadAxis(g, GA_RX)), ry = -stick(S.GetGamepadAxis(g, GA_RY));
+        dm_pad_set_player(p, b, lx, ly, rx, ry);
+    }
+    // the keyboard: player 1's keyboard path (ORed with its gamepad)
+    const bool *k = S.GetKeyboardState ? S.GetKeyboardState(NULL) : NULL;
+    if (k) {
+        uint64_t b = 0; int32_t lx = 0, ly = 0;
+        if (k[27]) b |= DM_BTN_A; if (k[29]) b |= DM_BTN_B; if (k[22]) b |= DM_BTN_X; if (k[4]) b |= DM_BTN_Y;
+        if (k[20]) b |= DM_BTN_L; if (k[26]) b |= DM_BTN_R; if (k[30]) b |= DM_BTN_ZL; if (k[31]) b |= DM_BTN_ZR;
+        if (k[40]) b |= DM_BTN_PLUS; if (k[42]) b |= DM_BTN_MINUS;
+        if (k[82]) b |= DM_BTN_UP; if (k[81]) b |= DM_BTN_DOWN; if (k[80]) b |= DM_BTN_LEFT; if (k[79]) b |= DM_BTN_RIGHT;
+        if (k[12]) ly += DM_STICK_MAX; if (k[14]) ly -= DM_STICK_MAX; if (k[13]) lx -= DM_STICK_MAX; if (k[15]) lx += DM_STICK_MAX;   // I K J L
+        dm_input_set(b, lx, ly, 0, 0);
+    }
+}
+
 static void events(void) {
     SDL_Event e;
     while (S.PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) { LOG("[vk] window closed: quitting"); fflush(NULL); _exit(0); }
         if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) W.resized = 1;
+        if (e.type == SDL_EVENT_GAMEPAD_ADDED || e.type == SDL_EVENT_GAMEPAD_REMOVED) g_pad_scan = 1;
     }
+    input_poll();
 }
 
 uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want) {

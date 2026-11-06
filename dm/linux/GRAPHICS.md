@@ -21,7 +21,7 @@ The Apple host replays NVN on Metal (`dm/gfx/nvn/nvn_mtl.m`, 13,700 lines) behin
 | B | the replay's CPU effects (events, counters, fence syncs, buffer copies / fills / uniform updates), textures as `VkImage`s, clears, texture and buffer copies, the game's swapchain image in the window (`gfx_vk_replay.c`) | first version: no memory pools on the GPU yet (no draws need them), no packaged texture uploads, no partial clears |
 | C | shaders: SPIR-V per key (`--shaders`: `spv_build.py`, `spv_pack.py`), pipelines, draws and dispatches (vertex streams, index buffers, uniform / storage buffers, textures and samplers, shader images) (`gfx_vk_shader.c`, `gfx_vk_draw.inc`) | first version: every Mario Tennis Fever shader found and accepted by Turnip; draws through an upload ring (copies per submission), textures uploaded from guest memory at first use; tested with `tests/vk/run.sh` (lavapipe + validation layer). Not yet: tessellation, transform feedback, texture buffers, quads, alpha test, logic ops |
 | D | the rest of Mario Tennis Fever's frame: depth / stencil, blending, compute, queries, the formats it uses | |
-| E | controller (SDL3 gamepad → `hle_hid.c`), audio out (SDL3) | |
+| E | controller (SDL3 gamepad → `hle_hid.c`), audio out (SDL3) | audio done (`host_audio_sdl.c`); gamepads and keyboard (`gfx_vk_window.c` input_poll, `DM_PAD_LAYOUT=xbox` for Xbox labels) |
 | F | performance: pipeline cache, prewarm lists, Adreno specifics | |
 
 Mario Tennis Fever is the test game: it plays on the Mac, so a difference is the Linux layer's.
