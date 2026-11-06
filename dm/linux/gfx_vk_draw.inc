@@ -329,11 +329,17 @@ static VkImageView dummy_view(uint8_t img) {
 }
 
 // The translator's support buffer (Ryujinx SupportBuffer.cs; nvn_mtl.m support_buf): render scale 1.0 everywhere, no BGRA swaps; written into the ring once per submission
+// The support buffer: render scales 1.0, and the alpha test's function and reference (tools/spv_alpha.py), one block per (function, reference) in a submission
+#define SUPPORT_SIZE 1408
+static uint32_t g_at_func; static float g_at_ref; static uint64_t g_support_n;
 static uint64_t support_buffer(void) {
-    if (DZ.support_off != ~0ull && DZ.support_off) return DZ.support_off;
-    uint8_t b[192 + 73 * 16]; memset(b, 0, sizeof b);
+    static uint32_t last_f; static float last_r; static uint64_t last_n = ~0ull;
+    float ref = g_at_func ? g_at_ref : 0.0f;
+    if (DZ.support_off != ~0ull && DZ.support_off && last_n == g_support_n && last_f == g_at_func && last_r == ref) return DZ.support_off;
+    uint8_t b[SUPPORT_SIZE]; memset(b, 0, sizeof b);
     for (int i = 0; i < 73; i++) { float one = 1.0f; memcpy(b + 192 + 16 * i, &one, 4); }
-    DZ.support_off = ring_bytes(b, sizeof b);
+    memcpy(b + 1392, &g_at_func, 4); memcpy(b + 1396, &ref, 4);
+    DZ.support_off = ring_bytes(b, sizeof b); last_f = g_at_func; last_r = ref; last_n = g_support_n;
     return DZ.support_off;
 }
 
@@ -369,7 +375,7 @@ static struct {
     uint64_t tex[NST][256], samp[NST][128], img[NST][32];
     float vp[16][4]; float dr[2]; p_scissor sc; int has_sc;
     uint32_t st_vmask[2], st_wmask[2], st_ref[2]; p_poly_offset po; float blend_color[4];
-    int depth_clamp, prim_restart; uint32_t restart_index; int rast_discard;
+    int depth_clamp, prim_restart; uint32_t restart_index; int rast_discard; float alpha_ref;
     int init;
 } D;
 static void state_init(void) {
@@ -426,6 +432,7 @@ static void state_op(uint32_t op, const uint8_t *a) {
     case OP_DEPTH_RANGE: { const p_depth_range *b = (const p_depth_range *)a; D.dr[0] = b->n; D.dr[1] = b->f; break; }
     case OP_DEPTH_CLAMP: D.depth_clamp = ((const p_depth_clamp *)a)->on; break;
     case OP_BLEND_COLOR: memcpy(D.blend_color, ((const p_blend_color *)a)->rgba, 16); break;
+    case OP_ALPHA_REF: D.alpha_ref = ((const p_alpha_ref *)a)->ref; break;
     case OP_PRIM_RESTART: { const p_prim_restart *b = (const p_prim_restart *)a; D.prim_restart = b->on != 0; D.restart_index = b->index; break; }
     case OP_RAST_DISCARD: D.rast_discard = *(const int32_t *)a != 0; break;
     default: break;
@@ -583,7 +590,7 @@ typedef struct {
     uint64_t prog;
     VkFormat cf[8], df; uint32_t ncol, samples;
     uint32_t topo, front_ccw, depth_gl, rast_discard, depth_clamp, prim_restart;
-    blend_st blend[8]; uint32_t blend_en, chmask; ds_st ds; poly_st poly; uint8_t a2c, pad[3];
+    blend_st blend[8]; uint32_t blend_en, chmask; ds_st ds; poly_st poly; uint8_t a2c, atest, pad[2];
     struct { uint8_t loc, binding, used, pad; uint32_t fmt, offset; } va[32]; uint32_t nva;
     struct { uint32_t stride, rate; } vb[17]; uint32_t vb_used;
 } pkey;
@@ -594,8 +601,11 @@ static VkPipelineCache g_pcache;
 static uint64_t pkey_hash(const pkey *k) { uint64_t h = 1469598103934665603ull; const uint8_t *p = (const uint8_t *)k; for (size_t i = 0; i < sizeof *k; i++) h = (h ^ p[i]) * 1099511628211ull; return h; }
 static VkPipeline pipe_make(const vks_prog *pr, const pkey *k) {
     VkPipelineShaderStageCreateInfo st[5]; uint32_t ns = 0;
+    // the alpha test's switch (tools/spv_alpha.py: a bool specialization constant, SpecId 200; a shader without it ignores the entry)
+    static const VkSpecializationMapEntry at_me = {200, 0, 4}; VkBool32 at_on = k->atest ? VK_TRUE : VK_FALSE;
+    VkSpecializationInfo at_si = {1, &at_me, 4, &at_on};
     for (int m = 0; m < VKS_NGFX; m++) if (pr->mod[m])
-        st[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, (VkShaderStageFlagBits)(1u << (m == VKS_FS ? 4 : m)), pr->mod[m], "main", NULL};
+        st[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, (VkShaderStageFlagBits)(1u << (m == VKS_FS ? 4 : m)), pr->mod[m], "main", m == VKS_FS && k->atest ? &at_si : NULL};
     VkVertexInputBindingDescription vb[17]; uint32_t nvb = 0;
     for (uint32_t b = 0; b < 17; b++) if (k->vb_used >> b & 1) vb[nvb++] = (VkVertexInputBindingDescription){b, k->vb[b].stride, (VkVertexInputRate)k->vb[b].rate};
     VkVertexInputAttributeDescription va[32]; uint32_t nva = 0;
@@ -731,7 +741,7 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
             int uni = b->vktype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; uint64_t lim = uni ? VK.limits.maxUniformBufferRange : (64ull << 20);
             if (lim > 65536 && uni) lim = 65536;
             uint64_t addr = 0, size = 0, off = ~0ull;
-            if (b->kind == VKS_SUPPORT) off = support_buffer(), size = 192 + 73 * 16;
+            if (b->kind == VKS_SUPPORT) off = support_buffer(), size = SUPPORT_SIZE;
             else if (b->kind == VKS_CBUF) {
                 if (b->reg == 1 && s->c1_len) { off = ring_put((uint64_t)(uintptr_t)s->c1, s->c1_len); size = (s->c1_len + 15) & ~15u; }
                 else if (b->reg >= 3 && b->reg - 3 < 18) { addr = D.ubo[st][b->reg - 3].addr; size = D.ubo[st][b->reg - 3].size; }
@@ -869,6 +879,9 @@ static void do_draw(const draw_args *a) {
     k.depth_gl = !atomic_load(&g_depth_zero) && VK.depth_clip_control;
     k.rast_discard = D.rast_discard; k.depth_clamp = D.depth_clamp && VK.f_depth_clamp; k.prim_restart = D.prim_restart;
     memcpy(k.blend, D.blend, sizeof k.blend); k.blend_en = D.color.blend_en; k.chmask = D.chmask.mask; k.ds = D.ds; k.poly = D.poly; k.a2c = D.ms.a2c;
+    // NVN's alpha test (as OpenGL, none when colour 0 goes to an integer target): the pipeline turns the shader's test on, the support buffer holds function and reference
+    g_at_func = D.color.alpha_func && D.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS && !(P.cf[0] && fmt_int(P.cf[0])) ? D.color.alpha_func : 0;
+    k.atest = g_at_func != 0; g_at_ref = D.alpha_ref;
     for (int i = 0; i < 8; i++) k.blend[i].target = 0;
     // vertex inputs: each location the vertex shader reads gets NVN attribute <location>, or the zero buffer
     const vks_shader *vs = pr->st[VKS_VS];
@@ -1197,7 +1210,7 @@ static void linear_done(void) {   // after the readbacks landed (stages_done): t
 static void draw_submitted(void) {
     for (int i = 0; i < g_nwb; i++) { memcpy((void *)(uintptr_t)g_wb[i].addr, RG.p + g_wb[i].off, g_wb[i].size); g_wb_bytes += g_wb[i].size; }
     g_nwb = 0;
-    RG.used = 0; DZ.support_off = 0;
+    RG.used = 0; DZ.support_off = 0; g_support_n++;
     if (g_nrh_used) { memset(g_rh, 0, sizeof g_rh); g_nrh_used = 0; }
     for (int i = 0; i < g_ndp; i++) vkResetDescriptorPool_(VK.dev, g_dp[i], 0);
     for (int i = 0; i < g_ntbv; i++) vkDestroyBufferView_(VK.dev, g_tbv[i], NULL);

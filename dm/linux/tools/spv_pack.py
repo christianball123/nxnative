@@ -14,6 +14,7 @@
 import json, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import spv_passthrough
+import spv_alpha
 from pathlib import Path
 
 KIND_SUPPORT, KIND_CBUF, KIND_SBUF, KIND_TEX, KIND_IMG, KIND_UNKNOWN = range(6)
@@ -137,7 +138,9 @@ def entry(spv_path, res_path, job_path=None):
     if spv_passthrough.is_passthrough(words):   # NVIDIA passthrough geometry shader → an ordinary one (spv_passthrough.py); one it cannot rewrite stays as it is
         try: words = spv_passthrough.rewrite(words)
         except Exception as e: print(f'[YELLOW] {Path(spv_path).stem}: passthrough geometry shader not rewritten ({e}): kept as it is', flush=True)
-    words = add_image_caps(strip_unused(words)); data = struct.pack(f'<{len(words)}I', *words)
+    words = add_image_caps(strip_unused(words))
+    words, _ = spv_alpha.add_alpha_test(words)   # fragment shaders: NVN's alpha test as code (spv_alpha.py)
+    data = struct.pack(f'<{len(words)}I', *words)
     model, binds, vin, fout, local = reflect(words)
     res = json.load(open(res_path)) if os.path.exists(res_path) else {}
     try: c1 = bytes.fromhex(json.load(open(job_path)).get('c1') or '') if job_path and os.path.exists(job_path) else b''
