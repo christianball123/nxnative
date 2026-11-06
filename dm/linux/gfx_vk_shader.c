@@ -104,16 +104,11 @@ static VkDescriptorSetLayout set_layout(const vks_shader *s) {   // s null: an e
 #define PR_CAP (1u << 14)
 static vks_prog *g_pr[PR_CAP];
 static int g_logged_missing;
-const vks_prog *vks_prog_get(const void *prog) {
-    const prog_t *p = prog;
-    if (!p || !p->serial || !VK.ok || !vks_init()) return NULL;
-    pthread_mutex_lock(&g_mu);
-    uint32_t i = (uint32_t)(p->serial * 0x9E3779B97F4A7C15ull >> 50) & (PR_CAP - 1);
-    for (uint32_t k = 0; k < PR_CAP; k++, i = (i + 1) & (PR_CAP - 1)) {
-        if (g_pr[i] && g_pr[i]->serial == p->serial) { vks_prog *r = g_pr[i]; pthread_mutex_unlock(&g_mu); return r->ok ? r : NULL; }
-        if (!g_pr[i]) break;
-    }
-    vks_prog *r = calloc(1, sizeof *r); r->serial = p->serial; r->ok = 1;
+// A program's shaders, modules, set layouts and pipeline layout. gs_class >= 0: its geometry shader is the translator's ordinary one for that input topology
+// (spv_pack.py packs <key>_g<t> under key ^ GVAR * (t + 1)), not the base translation, which uses NVIDIA's passthrough geometry shaders
+#define GVAR 0x9E3779B97F4A7C15ull
+static vks_prog *prog_build(const prog_t *p, uint64_t serial, int gs_class) {
+    vks_prog *r = calloc(1, sizeof *r); r->serial = serial; r->ok = 1; r->gs_class = gs_class; r->prog = p;
     for (unsigned st = 0; st < p->nstage && st < 6; st++) {
         uint8_t kb[8]; if (!prog_key(p, st, kb)) continue;
         uint64_t key = 0; for (int j = 0; j < 8; j++) key = key << 8 | kb[j];
@@ -124,9 +119,18 @@ const vks_prog *vks_prog_get(const void *prog) {
             continue;
         }
         if (s->model > 5) { r->ok = 0; continue; }
+        if (s->model == VKS_GS) {
+            r->has_gs = 1;
+            if (gs_class >= 0) {
+                const vks_shader *v = find_locked(key ^ (GVAR * (uint64_t)(gs_class + 1)));
+                if (!v) { r->ok = 0; static int n; if (n++ < 10) LOG("[RED] [vk] geometry shader %016llx has no translation for input topology %d (build again with --shaders)", (unsigned long long)key, gs_class); continue; }
+                s = v;
+            }
+        }
         if (s->model == VKS_CS) r->compute = 1;
         r->st[s->model] = s;
     }
+    if (r->ok && r->has_gs && gs_class < 0) return r;   // the topology picks the real program at the draw (vks_prog_topology)
     if (r->ok) {
         int nset = 1;
         for (int m = 0; m < 6; m++) if (r->st[m] && vks_set_of(m) + 1 > nset) nset = vks_set_of(m) + 1;
@@ -145,9 +149,35 @@ const vks_prog *vks_prog_get(const void *prog) {
         }
         if (!r->ok) g_failed++;
     }
-    g_progs++;
-    // the table holds every program seen; a full table stops caching (a program then resolves again at each bind)
-    for (uint32_t k = 0; k < PR_CAP; k++, i = (i + 1) & (PR_CAP - 1)) if (!g_pr[i]) { g_pr[i] = r; break; }
+    return r;
+}
+static vks_prog *cache_find(uint64_t serial, uint32_t *slot) {
+    uint32_t i = (uint32_t)(serial * 0x9E3779B97F4A7C15ull >> 50) & (PR_CAP - 1);
+    for (uint32_t k = 0; k < PR_CAP; k++, i = (i + 1) & (PR_CAP - 1)) {
+        if (g_pr[i] && g_pr[i]->serial == serial) { *slot = i; return g_pr[i]; }
+        if (!g_pr[i]) { *slot = i; return NULL; }
+    }
+    *slot = PR_CAP; return NULL;
+}
+static void cache_put(uint32_t slot, vks_prog *r) { if (slot < PR_CAP && !g_pr[slot]) g_pr[slot] = r; }   // a full table stops caching (a program resolves again at each bind)
+const vks_prog *vks_prog_get(const void *prog) {
+    const prog_t *p = prog;
+    if (!p || !p->serial || !VK.ok || !vks_init()) return NULL;
+    pthread_mutex_lock(&g_mu);
+    uint32_t slot; vks_prog *r = cache_find(p->serial, &slot);
+    if (!r) { r = prog_build(p, p->serial, -1); g_progs++; cache_put(slot, r); }
+    r->prog = p;
+    pthread_mutex_unlock(&g_mu);
+    return r->ok ? r : NULL;
+}
+// A program with a geometry shader, for a draw's topology (0 points, 1 lines, 2 lines with adjacency, 3 triangles, 4 triangles with adjacency)
+const vks_prog *vks_prog_topology(const vks_prog *base, int cls) {
+    if (!base || !base->has_gs || base->gs_class >= 0) return base;
+    if (cls < 0 || cls > 4) return NULL;
+    pthread_mutex_lock(&g_mu);
+    uint64_t serial = base->serial ^ (GVAR * (uint64_t)(cls + 1)) ^ 0x5bd1e995ull;
+    uint32_t slot; vks_prog *r = cache_find(serial, &slot);
+    if (!r) { r = prog_build(base->prog, serial, cls); cache_put(slot, r); }
     pthread_mutex_unlock(&g_mu);
     return r->ok ? r : NULL;
 }

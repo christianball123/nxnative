@@ -55,10 +55,11 @@ typedef struct { uint64_t key; uint8_t model, nb, nvin, fout; uint16_t local[3],
 enum { VKS_VS, VKS_TCS, VKS_TES, VKS_GS, VKS_FS, VKS_NGFX, VKS_CS = 5 };   // the SPIR-V execution models
 // Each stage's descriptor set: vertex 0, fragment 1, geometry 2, tessellation control 3, evaluation 4; compute 0. A vertex + fragment program uses two sets (a GPU must allow four)
 static inline int vks_set_of(int model) { static const int8_t s[6] = {0, 3, 4, 2, 1, 0}; return model >= 0 && model < 6 ? s[model] : 0; }
-typedef struct { uint64_t serial; int compute, ok, nset; const vks_shader *st[6]; VkShaderModule mod[6]; VkDescriptorSetLayout set[5]; VkPipelineLayout layout; } vks_prog;   // set[k]: descriptor set k (vks_set_of)
+typedef struct { uint64_t serial; int compute, ok, nset, has_gs, gs_class; const void *prog; const vks_shader *st[6]; VkShaderModule mod[6]; VkDescriptorSetLayout set[5]; VkPipelineLayout layout; } vks_prog;   // set[k]: descriptor set k (vks_set_of)
 int vks_init(void);                                  // the pack is open (1), or there is none (0: draws are skipped, as before stage C)
 const vks_shader *vks_find(uint64_t key);
 struct prog_t_;
 const vks_prog *vks_prog_get(const void *prog);     // the program's shaders, modules and layout (cached by its serial); NULL until its shaders are known
 void vks_stats(uint64_t *progs, uint64_t *missing, uint64_t *failed);
+const vks_prog *vks_prog_topology(const vks_prog *base, int cls);   // a program with a geometry shader, made for an input topology class (others: base itself)
 _Static_assert(sizeof(vks_bind) == 12, "vks_bind is spv_pack.py record");

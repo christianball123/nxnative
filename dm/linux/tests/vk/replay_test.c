@@ -73,6 +73,7 @@ int main(int argc, char **argv) {
     mtl_reg_samp(3, &sp);
     static uint8_t keys[2][8]; be_key(vsk, keys[0]); be_key(fsk, keys[1]);
     static prog_t prog; prog.nstage = 2; prog.sd[0].control = keys[0]; prog.sd[1].control = keys[1]; prog.serial = 77;
+    static uint8_t gk[8]; if (argc > 4) { be_key(argv[4], gk); prog.nstage = 3; prog.sd[2].control = gk; }   // a geometry stage between them
     static float ubo[4096]; for (int i = 0; i < 4096; i++) ubo[i] = (i % 4 == 3) ? 1.0f : 0.25f;
     static float verts[3][12] = {{-1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1}, {3, 0, 0, 1, 2, 0, 0, 0, 1, 1, 1, 1}, {-1, 2, 0, 1, 0, 2, 0, 0, 1, 1, 1, 1}};   /* covers NDC y in [0, 1]: the upper half when +1 is the first row */
     p_set_rt *r = rec(OP_SET_RT, sizeof(p_set_rt)); r->n = 1; r->color[0] = &rt;

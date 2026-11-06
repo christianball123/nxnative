@@ -128,11 +128,14 @@ def main():
     if len(sys.argv) != 3: sys.exit('usage: spv_pack.py <spv dir> <out file>')
     src, dst = Path(sys.argv[1]), Path(sys.argv[2])
     keys = sorted(p.name[:-4] for p in os.scandir(src) if p.name.endswith('.spv') and len(p.name) >= 20)
+    # A geometry shader's base translation uses NVIDIA's passthrough geometry shaders, which other GPUs lack; the translator also makes one ordinary geometry shader per
+    # input topology (<key>_g0 .. _g4: points, lines, lines with adjacency, triangles, triangles with adjacency), packed under key ^ GVAR * (t + 1) (gfx_vk_shader.c)
     blobs, bad = [], 0
     for k in keys:
         try: key = int(k[:16], 16)
         except ValueError: continue
-        if k != k[:16]: continue                                        # geometry variants (<key>_g<n>…) are for the Mac's geometry lowering
+        if len(k) == 19 and k[16:18] == '_g' and k[18] in '01234': key ^= (0x9E3779B97F4A7C15 * (int(k[18]) + 1)) & 0xffffffffffffffff
+        elif k != k[:16]: continue                                      # the Mac's geometry lowering's other outputs
         try: blobs.append((key, entry(src / f'{k}.spv', src / f'{k}.res.json', src / f'{k}.json')))
         except Exception as e:
             bad += 1
@@ -140,6 +143,7 @@ def main():
         if len(blobs) % 5000 == 0 and blobs: print(f'packed {len(blobs)}/{len(keys)}', flush=True)
     off = 16 + 16 * len(blobs)
     idx, body = bytearray(), bytearray()
+    blobs.sort(key=lambda kb: kb[0])
     for key, b in blobs:
         idx += struct.pack('<QII', key, off + len(body), len(b)); body += b; body += b'\0' * (-len(body) % 8)
     tmp = dst.with_suffix('.partial')

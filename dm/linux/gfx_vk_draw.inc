@@ -745,6 +745,12 @@ static void do_draw(const draw_args *a) {
     if (!pr) { g_skip[SK_NOPROG]++; return; }
     if (pr->st[VKS_TCS] || pr->st[VKS_TES]) { g_skip[SK_TESS]++; return; }
     VkPrimitiveTopology topo = topo_of(a->prim);
+    if (pr->has_gs) {   // the geometry shader made for this topology's input primitive
+        int cls = topo == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ? 0 : topo <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ? 1 : topo <= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ? 3 :
+                  topo <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ? 2 : topo <= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY ? 4 : -1;
+        pr = vks_prog_topology(pr, cls);
+        if (!pr) { g_skip[SK_PIPE]++; return; }
+    }
     if (topo == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM || topo == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) { g_skip[SK_PRIM]++; return; }
     if (!a->count) return;
     if (!ring_init() || !dummies_init()) return;
