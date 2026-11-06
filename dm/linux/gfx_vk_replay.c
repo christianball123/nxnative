@@ -106,11 +106,15 @@ static const void *tex_key(const tex_t *t) {
 }
 static VkFormat tex_vkfmt(const tex_t *t) { uint32_t mf = 0; uint8_t swz[4]; nvn_fmt_to_mtl(t->d.format, &mf, swz); return vk_of_mtl(mf); }
 // The format a texture's views take of its image: its own, when the image is another texture's (an alias) in the twin format
-static VkFormat tex_view_fmt(const vtex *v, const tex_t *t) {
-    if (!t || !v->twin) return v->fmt;
-    VkFormat f = tex_vkfmt(t);
+static VkFormat nvn_vkfmt(uint32_t nf) { uint32_t mf = 0; uint8_t swz[4]; nvn_fmt_to_mtl(nf, &mf, swz); return vk_of_mtl(mf); }
+// ... or the format a texture view asks for (nvnTextureViewSetFormat: a game draws into an sRGB texture through a UNORM view so its shader's sRGB values are
+// stored as they are, as Mario Tennis Fever's upscale into the window's texture does)
+static VkFormat tex_view_fmt2(const vtex *v, const tex_t *t, const view_t *vw, int has_vw) {
+    if (!v->twin) return v->fmt;
+    VkFormat f = has_vw && vw && vw->set_format ? nvn_vkfmt(vw->format) : t ? tex_vkfmt(t) : VK_FORMAT_UNDEFINED;
     return f && f == fmt_twin(v->fmt) ? f : v->fmt;
 }
+static VkFormat tex_view_fmt(const vtex *v, const tex_t *t) { return tex_view_fmt2(v, t, NULL, 0); }
 // Guest storage → the texture whose image holds it (aliases find their image here); entries are checked against the texture when read
 #define GM_CAP (1u << 15)
 static struct { const void *m; uint64_t serial; } g_gm[GM_CAP];

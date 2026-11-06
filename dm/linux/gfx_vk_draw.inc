@@ -248,7 +248,7 @@ static VkImageView tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_v
     VkImageAspectFlags asp = fmt_aspects(v->fmt);
     if (asp == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) asp = (t->stencil || (has_vw && vw->set_dsmode && vw->dsmode)) ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
     // the view's format: the shader's numeric kind of texel (the translator types a texel it has no answer for as float), and a storage-capable twin for sRGB shader images
-    VkFormat fmt = tex_view_fmt(v, t);   // an alias's own format (sRGB or UNORM)
+    VkFormat fmt = tex_view_fmt2(v, t, vw, has_vw);   // an alias's own format or the view's (sRGB or UNORM)
     if (v->mutable_fmt && !fmt_depth(fmt)) {
         int want_int = (img >> 7) & 1;
         if (want_int != fmt_int(fmt)) { VkFormat o = other_kind(fmt, want_int); if (o) fmt = o; }
@@ -461,7 +461,7 @@ static int pass_begin(void) {
         const tex_t *t = R.rt.color[i]; if (!t) continue;
         vtex *v = prep_tex(t); if (!v || fmt_depth(v->fmt)) continue;
         uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.cview[i], R.rt.has_cview[i], &lv, &nl, &l0, &nlay);
-        VkFormat vf = tex_view_fmt(v, t);
+        VkFormat vf = tex_view_fmt2(v, t, &R.rt.cview[i], R.rt.has_cview[i]);
         VkImageView iv = view_get_fmt(v, vf, v->is3d ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, v->is3d ? 0 : l0, 1, (VkComponentMapping){0, 0, 0, 0}, VK_IMAGE_ASPECT_COLOR_BIT, 2);
         if (!iv) continue;
         gpu_wrote(v); ca[i].imageView = iv; P.cf[i] = vf; P.cser[i] = t->serial; P.cvf[i] = vf; any = 1; P.cv[i] = v; P.clv[i] = lv; P.cl0[i] = v->is3d ? 0 : l0;
