@@ -447,7 +447,8 @@ static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
 static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0, cser[8]; VkFormat cvf[8]; } P;
 static void dump_pass(void);
-static int g_dump_subs, g_dump_pass, g_dump_lines, g_dump_light;   // frame dumps (below)
+static int g_dump_subs, g_dump_pass, g_dump_lines, g_dump_light;
+static vtex *g_dump_tex[64]; static int g_ndump_tex; static uint64_t g_dump_saved[512]; static int g_ndump_saved;   // sampled textures to save after the pass (once per dump)   // frame dumps (below)
 static void pass_end(void) { if (P.open) { vkCmdEndRendering_(g_cb); full_barrier(); P.open = 0; dump_pass(); } }
 // A texture a draw reads, ready for it: its first use (layout, zero fill) and its guest content are command-buffer work outside a render pass, so a pass open then is ended first
 static vtex *prep_tex(const tex_t *t) {
@@ -800,6 +801,11 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                 g_dump_lines++;
                 const treg *r = ok ? (storage ? ireg_get((int)(h & 0xfffff)) : treg_get((int)(h & 0xfffff))) : NULL;
                 if (iv && r) { vtex *v2 = tex_get(&r->t);
+                    if (v2 && !v2->gpu && v2->w <= 1024 && v2->h <= 1024 && g_ndump_tex < 64) {   // a texture from the game's files: saved once per dump, after the pass
+                        int seen = 0; for (int q = 0; q < g_ndump_saved && !seen; q++) seen = g_dump_saved[q] == v2->serial;
+                        for (int q = 0; q < g_ndump_tex && !seen; q++) seen = g_dump_tex[q] == v2;
+                        if (!seen) g_dump_tex[g_ndump_tex++] = v2;
+                    }
                     LOG("[vk] dump:   pass %d shader %016llx binding %u%s: texture serial %llu (%ux%u, NVN format %#x, read as format %d from the image of serial %llu format %d)", g_dump_pass, (unsigned long long)s->key, b->binding, storage ? " (image)" : "",
                         (unsigned long long)r->t.serial, r->t.d.width, r->t.d.height, r->t.d.format, v2 ? tex_view_fmt(v2, &r->t) : 0, v2 ? (unsigned long long)v2->serial : 0ull, v2 ? v2->fmt : 0); }
                 else LOG("[vk] dump:   pass %d shader %016llx binding %u%s: EMPTY (%s; handle %#x bank %u)", g_dump_pass, (unsigned long long)s->key, b->binding, storage ? " (image)" : "",
@@ -1154,6 +1160,11 @@ static void dump_pass(void) {
     char tag[16];
     for (uint32_t i = 0; pics && i < P.ncol && i < 8; i++) if (P.cv[i]) { snprintf(tag, sizeof tag, "c%u", i); dump_tex(P.cv[i], P.clv[i], P.cl0[i], tag); }
     if (pics && P.dv) dump_tex(P.dv, P.dlv, P.dl0, "depth");
+    for (int q = 0; q < g_ndump_tex; q++) {   // the textures its draws sampled (those dump_bpp knows: not block-compressed ones)
+        if (g_ndump_saved < 512) g_dump_saved[g_ndump_saved++] = g_dump_tex[q]->serial;
+        if (dump_bpp(g_dump_tex[q]->fmt)) dump_tex(g_dump_tex[q], 0, 0, "tex");
+    }
+    g_ndump_tex = 0;
     for (uint32_t i = 0; i < P.ncol && i < 8; i++) if (P.cv[i]) LOG("[vk] dump:   pass %d target c%u: texture serial %llu, drawn as format %d into the image of serial %llu %ux%u format %d", g_dump_pass, i, (unsigned long long)P.cser[i], P.cvf[i], (unsigned long long)P.cv[i]->serial, P.cv[i]->w, P.cv[i]->h, P.cv[i]->fmt);
     full_barrier();
     g_dump_pass++;
@@ -1198,7 +1209,7 @@ static void dump_submitted(void) {
     char cmd[480]; snprintf(cmd, sizeof cmd, "rm -rf '%s' && mkdir -p '%s'", g_dump_dir, g_dump_dir);
     if (system(cmd)) LOG("[vk] dump: could not make %s", g_dump_dir);
     g_dump_light = auto_on && every < 10000000000ull;   // every few seconds: 3 submissions, the full-size pictures only, so the game keeps running
-    g_dump_subs = g_dump_light ? 3 : 8; g_dump_pass = 0; g_dump_files = 0; g_dump_lines = 0;
+    g_dump_subs = g_dump_light ? 3 : 8; g_dump_pass = 0; g_dump_files = 0; g_dump_lines = 0; g_ndump_tex = 0; g_ndump_saved = 0;
     LOG("[vk] dump: saving the render passes of the next %d submissions into %s%s", g_dump_subs, g_dump_dir, g_dump_light ? " (light)" : "");
 }
 
