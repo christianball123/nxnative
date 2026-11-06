@@ -95,9 +95,9 @@ void mtl_set_depth_zero(int on) { atomic_store(&g_depth_zero, on != 0); }
 // The CPU wrote a texture's storage: unless the GPU owns it, it is uploaded again at its next use
 void mtl_tex_cpu_written(const tex_t *t) {
     if (!t || !t->serial) return;
-    pthread_mutex_lock(&g_tex_mu); vtex *v = tex_slot(t->serial, 0); if (v && !v->gpu) v->uploaded = 0; pthread_mutex_unlock(&g_tex_mu);
+    pthread_mutex_lock(&g_tex_mu); vtex *v = tex_find(t->serial); if (v && !v->gpu) v->uploaded = 0; pthread_mutex_unlock(&g_tex_mu);
 }
-int mtl_tex_gpu_owned(uint64_t serial) { pthread_mutex_lock(&g_tex_mu); vtex *v = tex_slot(serial, 0); int r = v && v->gpu; pthread_mutex_unlock(&g_tex_mu); return r; }
+int mtl_tex_gpu_owned(uint64_t serial) { pthread_mutex_lock(&g_tex_mu); vtex *v = tex_find(serial); int r = v && v->gpu; pthread_mutex_unlock(&g_tex_mu); return r; }
 
 // ---------------------------------------------------------------- texture contents from guest memory
 static uint64_t g_up_tex, g_up_bytes, g_up_fail, g_reup;
@@ -248,7 +248,7 @@ static VkImageView tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_v
     VkImageAspectFlags asp = fmt_aspects(v->fmt);
     if (asp == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) asp = (t->stencil || (has_vw && vw->set_dsmode && vw->dsmode)) ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
     // the view's format: the shader's numeric kind of texel (the translator types a texel it has no answer for as float), and a storage-capable twin for sRGB shader images
-    VkFormat fmt = v->fmt;
+    VkFormat fmt = tex_view_fmt(v, t);   // an alias's own format (sRGB or UNORM)
     if (v->mutable_fmt && !fmt_depth(fmt)) {
         int want_int = (img >> 7) & 1;
         if (want_int != fmt_int(fmt)) { VkFormat o = other_kind(fmt, want_int); if (o) fmt = o; }
@@ -461,9 +461,10 @@ static int pass_begin(void) {
         const tex_t *t = R.rt.color[i]; if (!t) continue;
         vtex *v = prep_tex(t); if (!v || fmt_depth(v->fmt)) continue;
         uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.cview[i], R.rt.has_cview[i], &lv, &nl, &l0, &nlay);
-        VkImageView iv = view_get(v, v->is3d ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, v->is3d ? 0 : l0, 1, (VkComponentMapping){0, 0, 0, 0}, VK_IMAGE_ASPECT_COLOR_BIT, 2);
+        VkFormat vf = tex_view_fmt(v, t);
+        VkImageView iv = view_get_fmt(v, vf, v->is3d ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, v->is3d ? 0 : l0, 1, (VkComponentMapping){0, 0, 0, 0}, VK_IMAGE_ASPECT_COLOR_BIT, 2);
         if (!iv) continue;
-        gpu_wrote(v); ca[i].imageView = iv; P.cf[i] = v->fmt; any = 1; P.cv[i] = v; P.clv[i] = lv; P.cl0[i] = v->is3d ? 0 : l0;
+        gpu_wrote(v); ca[i].imageView = iv; P.cf[i] = vf; any = 1; P.cv[i] = v; P.clv[i] = lv; P.cl0[i] = v->is3d ? 0 : l0;
         uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1;
         if (lw < w) w = lw;
         if (lh < h) h = lh;

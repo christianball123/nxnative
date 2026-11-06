@@ -109,6 +109,11 @@ int main(int argc, char **argv) {
     LOG("pixels: row 0 %08x, row 20 %08x, row 40 %08x, row 63 %08x; quad: row 50 col 5 %08x, row 50 col 50 %08x", px[0], px[20 * 64 + 5], px[40 * 64 + 5], px[63 * 64 + 5], px[50 * 64 + 5], px[50 * 64 + 50]);
     { const uint32_t *g = (const uint32_t *)rt.mem; LOG("linear target's guest memory: row 0 %08x, row 50 col 5 %08x, row 50 col 50 %08x", g[0], g[50 * 64 + 5], g[50 * 64 + 50]); }
     LOG("storage buffer after the submission: %u %u %u %u ... %u", sbuf_p[0], sbuf_p[1], sbuf_p[2], sbuf_p[3], sbuf_p[7]);
+    // an alias: an sRGB texture over the linear target's storage reads what was drawn into the UNORM one (one image)
+    { static tex_t al; al = rt; al.serial = 9; al.d.format = NVN_FORMAT_RGBA8_SRGB; static uint32_t ap[64 * 64]; cn = 0;
+      p_copy_t2t *c2 = rec(OP_COPY_T2B, sizeof *c2); c2->src = (const tex_t *)(void *)ap; c2->dst = &al; c2->dr.width = 64; c2->dr.height = 64; c2->dr.depth = 1;
+      rec(OP_END, 0); mtl_sub_begin(); mtl_exec(cmd); mtl_sub_commit();
+      LOG("alias: row 50 col 50 %08x (as the target: %08x)", ap[50 * 64 + 50], px[50 * 64 + 50]); }
     LOG("validation errors: %d", g_val_errors);
     return g_val_errors ? 1 : 0;
 }

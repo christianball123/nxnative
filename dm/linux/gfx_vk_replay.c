@@ -68,7 +68,7 @@ struct vview;
 // linear: a LINEAR texture, which the CPU and GPU may both write: its guest memory stays the reference (GPU writes are read back into it after each submission: wrote)
 // tracked: its guest pages are write-protected since stamp (nvn_dirty.c), so a CPU write since its upload is seen (prep_tex) and it is uploaded again
 typedef struct { uint64_t serial; VkImage img; VkDeviceMemory mem; VkFormat fmt; uint32_t w, h, d, layers, levels, samples; int is3d, is1d, bad, gpu, uploaded, storage; struct vview *views;
-                 int linear, wrote, tracked, mutable_fmt, cube; uint8_t *gmem; uint64_t gsize, stamp; const void *span; uint32_t stride, rowbytes, rows; uint64_t bytes; } vtex;
+                 int linear, wrote, tracked, mutable_fmt, cube, twin; uint64_t alias; uint8_t *gmem; uint64_t gsize, stamp; const void *span; uint32_t stride, rowbytes, rows; uint64_t bytes; } vtex;
 static vtex **g_lw; static int g_nlw, g_clw;   // linear textures the GPU wrote in this submission
 static inline void gpu_wrote(vtex *v) {
     v->gpu = 1; v->uploaded = 1;   // the GPU's content is the newest now: nothing from guest memory goes over it (a linear texture's is read back at the submission's end)
@@ -86,10 +86,53 @@ static vtex *tex_slot(uint64_t serial, int make) {
     }
     return NULL;
 }
+// The sRGB / UNORM twin of a format (0: none): two textures over the same memory in these two formats are one image (a game draws into an sRGB texture and
+// reads it back through a UNORM texture of the same storage, as Mario Tennis Fever's upscaling does)
+static VkFormat fmt_twin(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB; case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB; case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return VK_FORMAT_A8B8G8R8_SRGB_PACK32; case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+static VkFormat tex_vkfmt(const tex_t *t) { uint32_t mf = 0; uint8_t swz[4]; nvn_fmt_to_mtl(t->d.format, &mf, swz); return vk_of_mtl(mf); }
+// The format a texture's views take of its image: its own, when the image is another texture's (an alias) in the twin format
+static VkFormat tex_view_fmt(const vtex *v, const tex_t *t) {
+    if (!t || !v->twin) return v->fmt;
+    VkFormat f = tex_vkfmt(t);
+    return f && f == fmt_twin(v->fmt) ? f : v->fmt;
+}
+// Guest storage → the texture whose image holds it (aliases find their image here); entries are checked against the texture when read
+#define GM_CAP (1u << 15)
+static struct { const void *m; uint64_t serial; } g_gm[GM_CAP];
+static uint32_t gm_hash(const void *m) { return (uint32_t)((uint64_t)(uintptr_t)m * 0x9E3779B97F4A7C15ull >> 49) & (GM_CAP - 1); }
+static void gm_put(const void *m, uint64_t serial) {
+    uint32_t i = gm_hash(m);
+    for (uint32_t k = 0; k < 64; k++, i = (i + 1) & (GM_CAP - 1))
+        if (!g_gm[i].m || g_gm[i].m == m || !tex_slot(g_gm[i].serial, 0) || !tex_slot(g_gm[i].serial, 0)->img) { g_gm[i].m = m; g_gm[i].serial = serial; return; }
+}
+static vtex *gm_find(const void *m) {
+    uint32_t i = gm_hash(m);
+    for (uint32_t k = 0; k < 64 && g_gm[i].m; k++, i = (i + 1) & (GM_CAP - 1))
+        if (g_gm[i].m == m) { vtex *b = tex_slot(g_gm[i].serial, 0); if (b && b->img && b->gmem == m) return b; }
+    return NULL;
+}
+// The texture's vtex, following an alias to the image it shares
+static vtex *tex_find(uint64_t serial) {
+    vtex *v = tex_slot(serial, 0);
+    if (v && v->alias) { vtex *b = tex_slot(v->alias, 0); if (b && b->img) return b; }
+    return v;
+}
 static vtex *tex_get(const tex_t *t) {
     if (!t || !t->serial || !VK.ok) return NULL;
     pthread_mutex_lock(&g_tex_mu);
     vtex *v = tex_slot(t->serial, 1);
+    if (v && v->alias) {   // another texture's image: while that texture lives with the same storage
+        vtex *b = tex_slot(v->alias, 0);
+        if (b && b->img && b->gmem == t->mem) { pthread_mutex_unlock(&g_tex_mu); return b; }
+        v->alias = 0;
+    }
     if (!v || v->img || v->bad) { pthread_mutex_unlock(&g_tex_mu); return v && v->img ? v : NULL; }
     uint32_t mf = 0; uint8_t swz[4]; nvn_fmt_to_mtl(t->d.format, &mf, swz);
     VkFormat f = vk_of_mtl(mf);
@@ -122,6 +165,28 @@ static vtex *tex_get(const tex_t *t) {
     }
     if (ci.imageType == VK_IMAGE_TYPE_2D && ci.arrayLayers >= 6 && ci.extent.width == ci.extent.height && samples == 1) { ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT; v->cube = 1; }
     if (samples > 1) ci.mipLevels = 1;
+    // Another texture over the same storage, of the same shape, in this format or its twin: this texture is that one's image (an alias)
+    if (t->mem && !depth) {
+        vtex *b = gm_find(t->mem);
+        if (b && b != v && b->w == ci.extent.width && b->h == ci.extent.height && b->layers == ci.arrayLayers && b->levels == ci.mipLevels && b->samples == samples && b->is3d == (ci.imageType == VK_IMAGE_TYPE_3D)) {
+            if (f == b->fmt || (b->twin && f == fmt_twin(b->fmt))) {
+                v->alias = b->serial;
+                static int n; if (n++ < 20) LOG("[vk] texture serial %llu (format %d) shares the image of serial %llu (format %d): the same storage", (unsigned long long)t->serial, f, (unsigned long long)b->serial, b->fmt);
+                pthread_mutex_unlock(&g_tex_mu); return b;
+            }
+            static int n2; if (n2++ < 20) LOG("[YELLOW] [vk] texture serial %llu (format %d) is over the storage of serial %llu (format %d) but cannot share its image: it gets its own (the other's drawing is not seen through it)", (unsigned long long)t->serial, f, (unsigned long long)b->serial, b->fmt);
+        }
+    }
+    // Formats with an sRGB / UNORM twin: the image can take views of both (the format list keeps the GPU's compression)
+    VkFormat twin = fmt_twin(f); VkFormat fl[2] = {f, twin};
+    VkImageFormatListCreateInfo fli = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, 2, fl};
+    if (twin && samples >= 1) {
+        if (!v->mutable_fmt) {
+            ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; fli.pNext = ci.pNext; ci.pNext = &fli;
+            if (ci.usage & VK_IMAGE_USAGE_STORAGE_BIT) ci.flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;   // the sRGB twin cannot be a shader image: only views of this format are
+        }
+        v->twin = 1;
+    }
     if (!ff) { v->bad = 1; pthread_mutex_unlock(&g_tex_mu); static int once2; if (!once2++) LOG("[RED] [vk] the GPU has no support for Vulkan format %d (NVN %#x): such textures are skipped (BC formats on Adreno need a CPU decode)", f, t->d.format); return NULL; }
     VkResult r = vkCreateImage_(VK.dev, &ci, NULL, &v->img);
     if (r) { v->bad = 1; v->img = VK_NULL_HANDLE; pthread_mutex_unlock(&g_tex_mu); LOG("[RED] [vk] vkCreateImage %ux%ux%u x%u levels %u format %d failed (%d)", ci.extent.width, ci.extent.height, ci.extent.depth, ci.arrayLayers, ci.mipLevels, f, r); return NULL; }
@@ -138,6 +203,7 @@ static vtex *tex_get(const tex_t *t) {
         v->linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && ci.mipLevels == 1 && ci.arrayLayers == 1 && ci.imageType != VK_IMAGE_TYPE_3D && bpb && samples == 1;
         if (v->linear) { v->rowbytes = (ci.extent.width + bw - 1) / bw * (uint32_t)bpb; v->rows = (ci.extent.height + bh - 1) / bh; v->stride = t->d.stride ? t->d.stride : v->rowbytes; if (!v->gsize) v->gsize = (uint64_t)v->stride * v->rows; }
     }
+    if (t->mem && !depth) gm_put(t->mem, t->serial);
     v->fmt = f; v->w = ci.extent.width; v->h = ci.extent.height; v->d = ci.extent.depth; v->layers = ci.arrayLayers; v->levels = ci.mipLevels; v->is3d = ci.imageType == VK_IMAGE_TYPE_3D; v->is1d = ci.imageType == VK_IMAGE_TYPE_1D; v->samples = samples;
     g_tex_made++; g_tex_bytes += mr.size; g_tex_live++; g_tex_live_bytes += mr.size; v->bytes = mr.size;
     if (g_tex_made == 1 || g_tex_made % 500 == 0) LOG("[vk] textures made: %llu, %.0f MB", (unsigned long long)g_tex_made, g_tex_bytes / 1048576.0);
@@ -151,6 +217,7 @@ void mtl_tex_release(tex_t *t) {
     pthread_mutex_lock(&g_tex_mu);
     vtex *v = tex_slot(t->serial, 0);
     if (v) {
+        if (v->alias) { memset(v, 0, sizeof *v); v->serial = ~0ull; pthread_mutex_unlock(&g_tex_mu); return; }   // owns no image
         if (v->img) { pthread_mutex_lock(&VK.qmu); vkQueueWaitIdle_(VK.q); pthread_mutex_unlock(&VK.qmu); vk_views_drop(v); vkDestroyImage_(VK.dev, v->img, NULL); vkFreeMemory_(VK.dev, v->mem, NULL); g_tex_live--; g_tex_live_bytes -= v->bytes; }
         memset(v, 0, sizeof *v); v->serial = ~0ull;   // a tombstone keeps later probes going
     }
@@ -448,8 +515,8 @@ void mtl_finish(void) {}
 // The image to show for a present (gfx_null.c mtl_present): the swapchain texture's VkImage, or none (stage A's colour) while nothing has written it
 int vk_present_image(const tex_t *t, VkImage *img, uint32_t *w, uint32_t *h, int *srgb) {
     if (!t || !VK.ok) return 0;
-    pthread_mutex_lock(&g_tex_mu); vtex *v = tex_slot(t->serial, 0); int ok = v && v->img && (v->bad & 2);
-    if (ok) { *img = v->img; *w = v->w; *h = v->h; *srgb = v->fmt == VK_FORMAT_R8G8B8A8_SRGB || v->fmt == VK_FORMAT_B8G8R8A8_SRGB || v->fmt == VK_FORMAT_A8B8G8R8_SRGB_PACK32; }
+    pthread_mutex_lock(&g_tex_mu); vtex *v = tex_find(t->serial); int ok = v && v->img && (v->bad & 2);
+    if (ok) { VkFormat f = tex_view_fmt(v, t); *img = v->img; *w = v->w; *h = v->h; *srgb = f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_A8B8G8R8_SRGB_PACK32; }
     pthread_mutex_unlock(&g_tex_mu);
     return ok;
 }
