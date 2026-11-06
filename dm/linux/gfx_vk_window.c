@@ -15,6 +15,7 @@ enum { SDL_INIT_VIDEO = 0x20, SDL_INIT_GAMEPAD = 0x2000, SDL_INIT_EVENTS = 0x400
 enum { SDL_WINDOW_FULLSCREEN = 0x1, SDL_WINDOW_RESIZABLE = 0x20, SDL_WINDOW_VULKAN = 0x10000000 };
 enum { SDL_EVENT_QUIT = 0x100, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED = 0x207, SDL_EVENT_KEY_DOWN = 0x300, SDL_EVENT_GAMEPAD_ADDED = 0x653, SDL_EVENT_GAMEPAD_REMOVED = 0x654 };
 typedef struct SDL_Gamepad SDL_Gamepad;
+typedef struct SDL_Joystick SDL_Joystick;
 typedef uint32_t SDL_JoystickID;
 static struct {
     void *lib;
@@ -37,6 +38,17 @@ static struct {
     const char *(*GetGamepadName)(SDL_Gamepad *);
     const bool *(*GetKeyboardState)(int *);
     void (*free)(void *);
+    bool (*SetHint)(const char *, const char *);
+    int (*GetGamepadType)(SDL_Gamepad *);
+    SDL_JoystickID *(*GetJoysticks)(int *);
+    bool (*IsGamepad)(SDL_JoystickID);
+    SDL_Joystick *(*OpenJoystick)(SDL_JoystickID);
+    void (*CloseJoystick)(SDL_Joystick *);
+    bool (*GetJoystickButton)(SDL_Joystick *, int);
+    int16_t (*GetJoystickAxis)(SDL_Joystick *, int);
+    uint8_t (*GetJoystickHat)(SDL_Joystick *, int);
+    const char *(*GetJoystickName)(SDL_Joystick *);
+    int (*GetNumJoystickAxes)(SDL_Joystick *);
 } S;
 
 static int sdl_load(void) {
@@ -49,6 +61,9 @@ static int sdl_load(void) {
     // the gamepad and keyboard functions: optional (no input without them, the game still runs)
 #define LO(f) *(void **)&S.f = dlsym(S.lib, "SDL_" #f);
     LO(GetGamepads) LO(OpenGamepad) LO(CloseGamepad) LO(GamepadConnected) LO(GetGamepadButton) LO(GetGamepadAxis) LO(GetGamepadName) LO(GetKeyboardState) LO(free)
+    LO(SetHint) LO(GetGamepadType) LO(GetJoysticks) LO(IsGamepad) LO(OpenJoystick) LO(CloseJoystick) LO(GetJoystickButton) LO(GetJoystickAxis) LO(GetJoystickHat) LO(GetJoystickName) LO(GetNumJoystickAxes)
+    // controllers keep working while another window (the terminal) has the focus: in desktop mode the game window is rarely the focused one
+    if (S.SetHint) S.SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
 #undef LO
     return 1;
 }
@@ -217,16 +232,28 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImage
 #include "../host/dm_input.h"
 enum { GP_SOUTH, GP_EAST, GP_WEST, GP_NORTH, GP_BACK, GP_GUIDE, GP_START, GP_LSTICK, GP_RSTICK, GP_LSHOULDER, GP_RSHOULDER, GP_UP, GP_DOWN, GP_LEFT, GP_RIGHT };
 enum { GA_LX, GA_LY, GA_RX, GA_RY, GA_LT, GA_RT };
-static SDL_Gamepad *g_pad[DM_PLAYERS]; static int g_npad, g_pad_scan = 1, g_xbox = -1;
+// A joystick SDL has no gamepad mapping for is read as an Xbox 360 pad (the Linux xpad driver's order: buttons A B X Y LB RB Back Start Guide LS RS,
+// axes LX LY LT RX RY RT, the d-pad as hat 0), which is how most handhelds' built-in controls and 360-compatible pads report
+static SDL_Gamepad *g_pad[DM_PLAYERS]; static SDL_Joystick *g_joy[DM_PLAYERS]; static int g_npad, g_pad_scan = 1, g_xbox = -1;
+static const char *k_gptype[] = {"unknown", "standard", "Xbox 360", "Xbox One", "PS3", "PS4", "PS5", "Switch Pro", "Joy-Con (L)", "Joy-Con (R)", "Joy-Con pair"};
 static void pads_scan(void) {
     g_pad_scan = 0;
-    for (int i = 0; i < g_npad; i++) if (g_pad[i]) S.CloseGamepad(g_pad[i]);
+    for (int i = 0; i < g_npad; i++) { if (g_pad[i]) S.CloseGamepad(g_pad[i]); if (g_joy[i] && S.CloseJoystick) S.CloseJoystick(g_joy[i]); g_pad[i] = NULL; g_joy[i] = NULL; }
     g_npad = 0;
     int n = 0; SDL_JoystickID *ids = S.GetGamepads ? S.GetGamepads(&n) : NULL;
     for (int i = 0; i < n && g_npad < DM_PLAYERS; i++) {
         SDL_Gamepad *g = S.OpenGamepad(ids[i]); if (!g) continue;
+        int t = S.GetGamepadType ? S.GetGamepadType(g) : 0;
         g_pad[g_npad++] = g;
-        LOG("[input] player %d: %s", g_npad, S.GetGamepadName ? S.GetGamepadName(g) : "gamepad");
+        LOG("[input] player %d: %s (%s pad)", g_npad, S.GetGamepadName ? S.GetGamepadName(g) : "gamepad", t >= 0 && t < 11 ? k_gptype[t] : "other");
+    }
+    if (ids && S.free) S.free(ids);
+    ids = S.GetJoysticks && S.IsGamepad && S.OpenJoystick ? S.GetJoysticks(&n) : NULL;
+    for (int i = 0; ids && i < n && g_npad < DM_PLAYERS; i++) {
+        if (S.IsGamepad(ids[i])) continue;
+        SDL_Joystick *j = S.OpenJoystick(ids[i]); if (!j) continue;
+        g_joy[g_npad++] = j;
+        LOG("[input] player %d: %s (no gamepad mapping: read as an Xbox 360 pad)", g_npad, S.GetJoystickName ? S.GetJoystickName(j) : "joystick");
     }
     if (ids && S.free) S.free(ids);
     if (!g_npad) LOG("[input] no gamepad found: the keyboard plays player 1 (arrows, X = A, Z = B, S = X, A = Y, Q / W = L / R, 1 / 2 = ZL / ZR, Enter = +, Backspace = -)");
@@ -238,6 +265,31 @@ static void input_poll(void) {
     if (g_xbox < 0) { const char *e = getenv("DM_PAD_LAYOUT"); g_xbox = e && !strcmp(e, "xbox"); }
     if (g_pad_scan) pads_scan();
     for (int p = 0; p < g_npad; p++) {
+        SDL_Joystick *j = g_joy[p];
+        if (j) {   // a raw joystick in the xpad layout
+            #define JB(x) S.GetJoystickButton(j, x)
+            uint64_t b = 0; uint8_t hat = S.GetJoystickHat ? S.GetJoystickHat(j, 0) : 0; int na = S.GetNumJoystickAxes ? S.GetNumJoystickAxes(j) : 6;
+            if (JB(g_xbox ? 0 : 1)) b |= DM_BTN_A;
+            if (JB(g_xbox ? 1 : 0)) b |= DM_BTN_B;
+            if (JB(g_xbox ? 3 : 2)) b |= DM_BTN_Y;
+            if (JB(g_xbox ? 2 : 3)) b |= DM_BTN_X;
+            if (JB(4)) b |= DM_BTN_L;
+            if (JB(5)) b |= DM_BTN_R;
+            if (JB(6)) b |= DM_BTN_MINUS;
+            if (JB(7)) b |= DM_BTN_PLUS;
+            if (JB(9)) b |= DM_BTN_LS;
+            if (JB(10)) b |= DM_BTN_RS;
+            #undef JB
+            if (hat & 1) b |= DM_BTN_UP;
+            if (hat & 2) b |= DM_BTN_RIGHT;
+            if (hat & 4) b |= DM_BTN_DOWN;
+            if (hat & 8) b |= DM_BTN_LEFT;
+            if (na >= 6) { if (S.GetJoystickAxis(j, 2) > 0) b |= DM_BTN_ZL; if (S.GetJoystickAxis(j, 5) > 0) b |= DM_BTN_ZR; }   // triggers rest at -32768
+            int32_t lx = stick(S.GetJoystickAxis(j, 0)), ly = -stick(S.GetJoystickAxis(j, 1));
+            int32_t rx = na >= 5 ? stick(S.GetJoystickAxis(j, 3)) : 0, ry = na >= 5 ? -stick(S.GetJoystickAxis(j, 4)) : 0;
+            dm_pad_set_player(p, b, lx, ly, rx, ry);
+            continue;
+        }
         SDL_Gamepad *g = g_pad[p];
         if (!g || (S.GamepadConnected && !S.GamepadConnected(g))) continue;
         #define B(x) S.GetGamepadButton(g, x)
