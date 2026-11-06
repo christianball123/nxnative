@@ -447,7 +447,7 @@ static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
 static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0, cser[8]; VkFormat cvf[8]; } P;
 static void dump_pass(void);
-static int g_dump_subs, g_dump_pass, g_dump_lines;   // frame dumps (below)
+static int g_dump_subs, g_dump_pass, g_dump_lines, g_dump_light;   // frame dumps (below)
 static void pass_end(void) { if (P.open) { vkCmdEndRendering_(g_cb); full_barrier(); P.open = 0; dump_pass(); } }
 // A texture a draw reads, ready for it: its first use (layout, zero fill) and its guest content are command-buffer work outside a render pass, so a pass open then is ended first
 static vtex *prep_tex(const tex_t *t) {
@@ -1149,7 +1149,7 @@ static void dump_tex(vtex *v, uint32_t lv, uint32_t l0, const char *tag) {
 static void dump_pass(void) {
     if (!g_dump_subs) return;
     if (g_dump_pass >= 600) return;
-    int pics = g_dump_pass < 40 || P.w >= 256;
+    int pics = g_dump_light ? P.w >= 1280 && P.ncol : g_dump_pass < 40 || P.w >= 256;   // light dumps (frequent ones): the full-size colour passes only
     LOG("[vk] dump: pass %d: %llu draws, %ux%u, %u colour targets%s", g_dump_pass, (unsigned long long)(g_drawn - P.draws0), P.w, P.h, P.ncol, P.dv ? " + depth" : "");
     char tag[16];
     for (uint32_t i = 0; pics && i < P.ncol && i < 8; i++) if (P.cv[i]) { snprintf(tag, sizeof tag, "c%u", i); dump_tex(P.cv[i], P.clv[i], P.cl0[i], tag); }
@@ -1189,8 +1189,9 @@ static void dump_submitted(void) {
     if (d && *d) snprintf(g_dump_dir, sizeof g_dump_dir, "%s", d); else snprintf(g_dump_dir, sizeof g_dump_dir, "%s/nxnative-dump", home ? home : "/tmp");
     char cmd[480]; snprintf(cmd, sizeof cmd, "rm -rf '%s' && mkdir -p '%s'", g_dump_dir, g_dump_dir);
     if (system(cmd)) LOG("[vk] dump: could not make %s", g_dump_dir);
-    g_dump_subs = 8; g_dump_pass = 0; g_dump_files = 0; g_dump_lines = 0;
-    LOG("[vk] dump: saving the render passes of the next 8 submissions into %s", g_dump_dir);
+    g_dump_light = auto_on && every < 10000000000ull;   // every few seconds: 3 submissions, the full-size pictures only, so the game keeps running
+    g_dump_subs = g_dump_light ? 3 : 8; g_dump_pass = 0; g_dump_files = 0; g_dump_lines = 0;
+    LOG("[vk] dump: saving the render passes of the next %d submissions into %s%s", g_dump_subs, g_dump_dir, g_dump_light ? " (light)" : "");
 }
 
 // ---------------------------------------------------------------- the submission's end: the ring and descriptor pools start over
