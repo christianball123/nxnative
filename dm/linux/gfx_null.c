@@ -93,17 +93,9 @@ void mtl_prog_release(prog_t *p) { (void)p; }
 void mtl_queue_activate(uint64_t serial) { (void)serial; }
 void mtl_queue_forget(uint64_t serial) { (void)serial; }
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) { (void)t; (void)level; (void)layer0; (void)r; (void)dst; (void)row; (void)img; }
-void mtl_reg_image(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
-void mtl_reg_samp(int id, const samp_par *p) { (void)id; (void)p; }
-void mtl_reg_tex(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
-void mtl_set_depth_zero(int on) { (void)on; }
 void mtl_set_frame(uint64_t f) { (void)f; }
-void mtl_set_origin_lower_left(int on) { (void)on; }
-void mtl_set_queue_origin_lower_left(int on) { (void)on; }
-void mtl_set_tex_pool_n(int n) { (void)n; }
 void mtl_sp_phys_gone(const void *mem, uint64_t size) { (void)mem; (void)size; }
 void mtl_stats(uint64_t *passes, uint64_t *draws) { if (passes) *passes = 0; (void)passes; if (draws) *draws = 0; (void)draws; }
-void mtl_tex_cpu_written(const tex_t *t) { (void)t; }
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
 uint64_t mtl_udc_saved_bytes(void) { return 0; }
 uint64_t mtl_upload_gpu_ns_take(void) { return 0; }

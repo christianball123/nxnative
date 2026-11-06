@@ -103,7 +103,8 @@ def shaders(tid, ver, ext, exefs, nro_dir, lw, env, jobs, retranslate=False):
         (sh / 'spv.done').write_text('')
     if not (sh / 'spv.done').is_file(): (sh / 'spv.done').write_text('')
     pack = lw / 'shaders.dmsp'
-    if not pack.is_file() or pack.stat().st_mtime < (sh / 'spv.done').stat().st_mtime:
+    packer = REPO / 'dm/linux/tools/spv_pack.py'
+    if not pack.is_file() or pack.stat().st_mtime < max((sh / 'spv.done').stat().st_mtime, packer.stat().st_mtime):
         say('packing the shaders into one file (a few minutes)')
         run([sys.executable, REPO / 'dm/linux/tools/spv_pack.py', spv, pack])
     else: say(f'shaders: already packed ({pack})')

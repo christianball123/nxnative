@@ -25,7 +25,7 @@ int vks_init(void) {
     void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0); close(fd);
     if (m == MAP_FAILED) { LOG("[RED] [vk] shader pack %s: mmap: %s", path, strerror(errno)); return 0; }
     uint32_t ver, n; memcpy(&ver, (uint8_t *)m + 4, 4); memcpy(&n, (uint8_t *)m + 8, 4);
-    if (memcmp(m, "DMSP", 4) || ver != 1 || 16 + (uint64_t)n * 16 > (uint64_t)st.st_size) { LOG("[RED] [vk] %s is not a shader pack this host reads (version %u)", path, ver); munmap(m, (size_t)st.st_size); return 0; }
+    if (memcmp(m, "DMSP", 4) || ver != 2 || 16 + (uint64_t)n * 16 > (uint64_t)st.st_size) { LOG("[RED] [vk] %s is not a shader pack this host reads (version %u; build again with --shaders to repack)", path, ver); munmap(m, (size_t)st.st_size); return 0; }
     g_pack = m; g_pack_len = (size_t)st.st_size; g_n = n; g_init = 1;
     LOG("[vk] shader pack: %u shaders (%.1f MB) from %s", n, st.st_size / 1048576.0, path);
     return 1;
@@ -40,9 +40,9 @@ static int entry_of(uint64_t key, vks_shader *s) {
         if (e.key == key) {
             if ((uint64_t)e.off + e.len > g_pack_len || e.len < 12) return 0;
             const uint8_t *p = g_pack + e.off;
-            s->key = key; s->model = p[0]; s->nb = p[1]; s->nvin = p[2]; s->fout = p[3]; memcpy(s->local, p + 4, 6);
-            s->b = (const vks_bind *)(p + 12); s->vin = p + 12 + 8 * s->nb;
-            uint32_t h = 12 + 8 * s->nb + 2 * s->nvin; h += -h & 3;
+            s->key = key; s->model = p[0]; s->nb = p[1]; s->nvin = p[2]; s->fout = p[3]; memcpy(s->local, p + 4, 6); memcpy(&s->c1_len, p + 10, 2);
+            s->b = (const vks_bind *)(p + 12); s->vin = p + 12 + sizeof(vks_bind) * s->nb; s->c1 = s->vin + 2 * s->nvin;
+            uint32_t h = 12 + sizeof(vks_bind) * s->nb + 2 * s->nvin + s->c1_len; h += -h & 3;
             if (h >= e.len) return 0;
             s->spv = (const uint32_t *)(p + h); s->nspv = (e.len - h) / 4;
             return s->spv[0] == 0x07230203;
@@ -90,11 +90,11 @@ static VkShaderModule module_for(const vks_shader *s, uint32_t set) {
 }
 static const VkShaderStageFlags k_stage[6] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
                                                VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_COMPUTE_BIT};
-static VkDescriptorSetLayout set_layout(const vks_shader *s) {
+static VkDescriptorSetLayout set_layout(const vks_shader *s) {   // s null: an empty set (a stage the program does not have, below one it has)
     VkDescriptorSetLayoutBinding b[256]; uint32_t n = 0;
     for (int i = 0; s && i < s->nb && n < 256; i++)
         b[n++] = (VkDescriptorSetLayoutBinding){s->b[i].binding, (VkDescriptorType)s->b[i].vktype, s->b[i].count ? s->b[i].count : 1, k_stage[s->model], NULL};
-    VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, VK.push_desc ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0, n, b};
+    VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, n, b};   // sets come from per-submission pools (a shader can have more bindings than the push limit)
     VkDescriptorSetLayout l = VK_NULL_HANDLE;
     if (vkCreateDescriptorSetLayout_(VK.dev, &ci, NULL, &l)) LOG("[RED] [vk] shader %016llx: its descriptor set layout was refused", s ? (unsigned long long)s->key : 0ull);
     return l;
@@ -128,9 +128,17 @@ const vks_prog *vks_prog_get(const void *prog) {
         r->st[s->model] = s;
     }
     if (r->ok) {
-        int nset = r->compute ? 1 : VKS_NGFX;
-        for (int m = 0; m < 6; m++) if (r->st[m]) { r->mod[m] = module_for(r->st[m], m == VKS_CS ? 0 : (uint32_t)m); if (!r->mod[m]) r->ok = 0; }
-        for (int k = 0; k < nset && r->ok; k++) { r->set[k] = set_layout(r->compute ? r->st[VKS_CS] : r->st[k]); if (!r->set[k]) r->ok = 0; }
+        int nset = 1;
+        for (int m = 0; m < 6; m++) if (r->st[m] && vks_set_of(m) + 1 > nset) nset = vks_set_of(m) + 1;
+        if (r->compute) nset = 1;
+        r->nset = nset;
+        for (int m = 0; m < 6; m++) if (r->st[m] && (m == VKS_CS) == (r->compute != 0)) { r->mod[m] = module_for(r->st[m], (uint32_t)vks_set_of(m)); if (!r->mod[m]) r->ok = 0; }
+        for (int k = 0; k < nset && r->ok; k++) {
+            const vks_shader *s = NULL;
+            for (int m = 0; m < 6; m++) if (r->st[m] && vks_set_of(m) == k && (m == VKS_CS) == (r->compute != 0)) s = r->st[m];
+            r->set[k] = set_layout(s); if (!r->set[k]) r->ok = 0;
+        }
+        if (r->ok && nset > (int)VK.limits.maxBoundDescriptorSets) { r->ok = 0; LOG("[RED] [vk] a program needs %d descriptor sets, the GPU allows %u", nset, VK.limits.maxBoundDescriptorSets); }
         if (r->ok) {
             VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, (uint32_t)nset, r->set, 0, NULL};
             if (vkCreatePipelineLayout_(VK.dev, &ci, NULL, &r->layout)) { r->ok = 0; LOG("[RED] [vk] a pipeline layout was refused"); }

@@ -52,7 +52,7 @@ static struct {
     VkSurfaceKHR surf;
     VkSwapchainKHR sc; VkFormat fmt; VkExtent2D ext; uint32_t nimg; VkImage img[SWAP_MAX];
     VkSemaphore acquired[SWAP_MAX], done[SWAP_MAX]; VkCommandPool pool; VkCommandBuffer cb[SWAP_MAX]; VkFence fence[SWAP_MAX]; uint32_t slot;
-    int ok, failed, resized; uint64_t frames; double t0; char devname[256]; int ext_host_mem, ext_push;
+    int ok, failed, resized; uint64_t frames; double t0; char devname[256]; int ext_host_mem, ext_push, ext_dcc;
 } W;
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
@@ -80,6 +80,18 @@ static int swapchain_make(void) {
     return 1;
 }
 
+// Validation messages (DM_VK_VALIDATE): each kind (message ID) logged 3 times at most, so a per-draw mistake does not flood the log
+static VKAPI_ATTR VkBool32 VKAPI_CALL val_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type, const VkDebugUtilsMessengerCallbackDataEXT *d, void *u) {
+    (void)type; (void)u;
+    static int32_t ids[512]; static int cnt[512], n; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    int k = 0; for (; k < n; k++) if (ids[k] == d->messageIdNumber) break;
+    if (k == n && n < 512) { ids[n] = d->messageIdNumber; cnt[n++] = 0; }
+    int show = k < 512 && cnt[k]++ < 3;
+    pthread_mutex_unlock(&mu);
+    if (show) LOG("%s[vkval] %s", sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "[RED] " : "", d->pMessage ? d->pMessage : "?");
+    return VK_FALSE;
+}
 static int window_init(void) {
     if (!sdl_load()) return 0;
     if (!S.Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) { LOG("[RED] [vk] SDL_Init: %s", S.GetError()); return 0; }
@@ -89,14 +101,26 @@ static int window_init(void) {
     if (!W.win) { LOG("[RED] [vk] SDL_CreateWindow: %s", S.GetError()); return 0; }
     vkGetInstanceProcAddr_ = (PFN_vkGetInstanceProcAddr)S.Vulkan_GetVkGetInstanceProcAddr();
     vkCreateInstance_ = (PFN_vkCreateInstance)vkGetInstanceProcAddr_(NULL, "vkCreateInstance");
-    uint32_t next = 0; const char *const *exts = S.Vulkan_GetInstanceExtensions(&next);
+    uint32_t next = 0; const char *const *sexts = S.Vulkan_GetInstanceExtensions(&next);
+    // DM_VK_VALIDATE=1: the Khronos validation layer (Fedora: sudo dnf install -y vulkan-validation-layers), its messages in the log
+    const char *val = getenv("DM_VK_VALIDATE"); int validate = val && *val == '1';
+    const char *exts[32]; uint32_t ne0 = 0; for (uint32_t i = 0; i < next && ne0 < 31; i++) exts[ne0++] = sexts[i];
+    const char *layers[1] = {"VK_LAYER_KHRONOS_validation"};
+    if (validate) exts[ne0++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "nxnative", 1, "nxnative", 1, VK_API_VERSION_1_3};
-    VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, next, exts};
+    VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, validate ? 1 : 0, validate ? layers : NULL, ne0, exts};
     VkResult r = vkCreateInstance_(&ici, NULL, &VK.inst);
+    if (r && validate) { LOG("[RED] [vk] DM_VK_VALIDATE: the validation layer did not load (%d; sudo dnf install -y vulkan-validation-layers): going on without it", r); validate = 0; ici.enabledLayerCount = 0; ici.enabledExtensionCount = ne0 - 1; r = vkCreateInstance_(&ici, NULL, &VK.inst); }
     if (r) { LOG("[RED] [vk] vkCreateInstance failed (%d)", r); return 0; }
 #define LI(f) f##_ = (PFN_##f)vkGetInstanceProcAddr_(VK.inst, #f); if (!f##_) { LOG("[RED] [vk] no " #f); return 0; }
     VKI_FUNCS(LI)
 #undef LI
+    if (validate) {
+        PFN_vkCreateDebugUtilsMessengerEXT cm = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr_(VK.inst, "vkCreateDebugUtilsMessengerEXT");
+        VkDebugUtilsMessengerCreateInfoEXT mi = {VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT, NULL, 0, VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+                                                 VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT, val_cb, NULL};
+        VkDebugUtilsMessengerEXT m; if (cm && !cm(VK.inst, &mi, NULL, &m)) LOG("[vk] validation layer on (DM_VK_VALIDATE): its messages follow as [vkval]");
+    }
     if (!S.Vulkan_CreateSurface(W.win, VK.inst, NULL, &W.surf)) { LOG("[RED] [vk] SDL_Vulkan_CreateSurface: %s", S.GetError()); return 0; }
     // A real GPU before a software one (llvmpipe, lavapipe: VK_PHYSICAL_DEVICE_TYPE_CPU), which Mesa also installs; DM_VK_GPU=<n> picks by its index in vulkaninfo's list
     uint32_t np = 8; VkPhysicalDevice pd[8]; vkEnumeratePhysicalDevices_(VK.inst, &np, pd);
@@ -119,6 +143,7 @@ static int window_init(void) {
     for (uint32_t i = 0; i < ne; i++) {
         if (!strcmp(ep[i].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) W.ext_host_mem = 1;
         if (!strcmp(ep[i].extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) W.ext_push = 1;
+        if (!strcmp(ep[i].extensionName, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME)) W.ext_dcc = 1;
     }
     free(ep);
     LOG("[vk] GPU %s, Vulkan %u.%u.%u, driver %#x; guest memory import (VK_EXT_external_memory_host): %s", pp.deviceName, VK_API_VERSION_MAJOR(pp.apiVersion), VK_API_VERSION_MINOR(pp.apiVersion),
@@ -130,14 +155,19 @@ static int window_init(void) {
     const char *dext[4] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME}; uint32_t ndext = 1;
     if (VK_API_VERSION_MINOR(pp.apiVersion) < 3 && VK_API_VERSION_MAJOR(pp.apiVersion) == 1) LOG("[RED] [vk] this driver has Vulkan %u.%u: stage C needs 1.3", VK_API_VERSION_MAJOR(pp.apiVersion), VK_API_VERSION_MINOR(pp.apiVersion));
     if (W.ext_push) { dext[ndext++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME; VK.push_desc = 1; }
+    static VkPhysicalDeviceDepthClipControlFeaturesEXT fdcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
     static VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    if (W.ext_dcc) { dext[ndext++] = VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME; f13.pNext = &fdcc; }
     static VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
     static VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12};
     static VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
     PFN_vkGetPhysicalDeviceFeatures2 gpf2 = (PFN_vkGetPhysicalDeviceFeatures2)vkGetInstanceProcAddr_(VK.inst, "vkGetPhysicalDeviceFeatures2");
     if (gpf2) gpf2(VK.phys, &f2);
     f2.features.robustBufferAccess = 0;   // costs speed and the game does not ask for it
-    VK.f_dynrender = f13.dynamicRendering;
+    VK.f_dynrender = f13.dynamicRendering; VK.depth_clip_control = W.ext_dcc && fdcc.depthClipControl;
+    VK.f_logic_op = f2.features.logicOp; VK.f_dual_src = f2.features.dualSrcBlend; VK.f_depth_clamp = f2.features.depthClamp; VK.f_wide_lines = f2.features.wideLines; VK.limits = pp.limits;
+    LOG("[vk] features: dynamic rendering %d, GL depth clipping %d, logic ops %d, dual-source blending %d, depth clamp %d, push descriptors %d; BC textures %d",
+        VK.f_dynrender, VK.depth_clip_control, VK.f_logic_op, VK.f_dual_src, VK.f_depth_clamp, W.ext_push, f2.features.textureCompressionBC);
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, gpf2 ? &f2 : NULL, 0, 1, &qci, 0, NULL, ndext, dext, NULL};
     if ((r = vkCreateDevice_(VK.phys, &dci, NULL, &VK.dev))) { LOG("[RED] [vk] vkCreateDevice failed (%d)", r); return 0; }
 #define LD(f) f##_ = (PFN_##f)vkGetDeviceProcAddr_(VK.dev, #f); if (!f##_) { LOG("[RED] [vk] no " #f); return 0; }

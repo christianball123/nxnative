@@ -1,0 +1,102 @@
+// Test harness: the Linux host's Vulkan replay (gfx_vk_replay.c + gfx_vk_draw.inc + gfx_vk_shader.c) on any Vulkan device (lavapipe works) with the validation layer, fed a synthetic NVN
+// command stream: a clear, a textured draw into the upper half of a 64x64 target (upper-left origin, as Mario Tennis Fever), a compute dispatch writing a storage buffer. Run: tests/vk/run.sh
+#include "dm.h"
+#include "../../../gfx/nvn/nvn_obj.h"
+#include "../../../gfx/nvn/nvn_mtl.h"
+#include "../../gfx_vk.h"
+#include <dlfcn.h>
+#define VK_DEF(f) PFN_##f f##_;
+VKI_FUNCS(VK_DEF) VKD_FUNCS(VK_DEF)
+vk_core VK;
+static int g_val_errors;
+uint64_t guest_ns(void) { return 0; }
+int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) { if (st >= p->nstage) return 0; memcpy(key, p->sd[st].control, 8); return 1; }
+int vkw_wanted(void) { return 1; }
+uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want) { for (uint32_t i = 0; i < VK.mem.memoryTypeCount; i++) if ((bits >> i & 1) && (VK.mem.memoryTypes[i].propertyFlags & want) == want) return i; return ~0u; }
+static VKAPI_ATTR VkBool32 VKAPI_CALL cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT t, const VkDebugUtilsMessengerCallbackDataEXT *d, void *u) {
+    if (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) { if (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) g_val_errors++; fprintf(stderr, "[VAL%s] %s\n\n", sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? " ERROR" : "", d->pMessage); }
+    return 0;
+}
+int vkw_init(void) {
+    void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
+    PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
+    PFN_vkCreateInstance ci_ = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
+    const char *layers[] = {"VK_LAYER_KHRONOS_validation"}; const char *ext[] = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
+    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "t", 1, "t", 1, VK_API_VERSION_1_3};
+    VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 1, layers, 1, ext};
+    if (ci_(&ici, NULL, &VK.inst)) { LOG("no instance"); return 0; }
+#define LI(f) f##_ = (PFN_##f)gipa(VK.inst, #f);
+    VKI_FUNCS(LI)
+    PFN_vkCreateDebugUtilsMessengerEXT cm = (PFN_vkCreateDebugUtilsMessengerEXT)gipa(VK.inst, "vkCreateDebugUtilsMessengerEXT");
+    VkDebugUtilsMessengerCreateInfoEXT mi = {VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT, NULL, 0, 0x1100, 0x7, cb, NULL}; VkDebugUtilsMessengerEXT m; cm(VK.inst, &mi, NULL, &m);
+    uint32_t n = 4; VkPhysicalDevice pd[4]; vkEnumeratePhysicalDevices_(VK.inst, &n, pd); VK.phys = pd[0];
+    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties_(VK.phys, &pp); VK.limits = pp.limits; LOG("device %s", pp.deviceName);
+    static VkPhysicalDeviceDepthClipControlFeaturesEXT fd = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+    static VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &fd};
+    static VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
+    static VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12};
+    static VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
+    ((PFN_vkGetPhysicalDeviceFeatures2)gipa(VK.inst, "vkGetPhysicalDeviceFeatures2"))(VK.phys, &f2);
+    f2.features.robustBufferAccess = 0; f2.features.shaderFloat64 = 0;   // as the Thor has none
+    float pr = 1; VkDeviceQueueCreateInfo q = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &pr};
+    const char *dext[] = {VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME};
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &q, 0, NULL, 1, dext, NULL};
+    if (vkCreateDevice_(VK.phys, &dci, NULL, &VK.dev)) { LOG("no device"); return 0; }
+#define LD(f) f##_ = (PFN_##f)vkGetDeviceProcAddr_(VK.dev, #f); if (!f##_) LOG("missing " #f);
+    VKD_FUNCS(LD)
+    vkGetDeviceQueue_(VK.dev, 0, 0, &VK.q); vkGetPhysicalDeviceMemoryProperties_(VK.phys, &VK.mem); pthread_mutex_init(&VK.qmu, NULL);
+    VK.depth_clip_control = fd.depthClipControl; VK.f_depth_clamp = 1; VK.ok = 1; return 1;
+}
+void vkw_present(uint64_t n, VkImage img, uint32_t w, uint32_t h, const int crop[4]) {}
+int vkw_active(void) { return VK.ok; }
+
+static uint32_t *sbuf_p;
+static uint8_t cmd[1 << 16]; static size_t cn;
+static void *rec(uint32_t op, uint32_t payload) { uint32_t sz = (8 + payload + 7) & ~7u; op_hdr *h = (op_hdr *)(cmd + cn); h->op = op; h->size = sz; memset(cmd + cn + 8, 0, sz - 8); cn += sz; return cmd + cn - sz + 8; }
+static uint64_t be_key(const char *hex, uint8_t out[8]) { uint64_t k = strtoull(hex, NULL, 16); for (int i = 0; i < 8; i++) out[i] = (uint8_t)(k >> (56 - 8 * i)); return k; }
+
+int main(int argc, char **argv) {
+    setenv("DM_SHADERS", argc > 3 ? argv[3] : "/tmp/spvs.dmsp", 1); mtl_set_origin_lower_left(0);   /* upper left, as Mario Tennis */
+    const char *vsk = argc > 1 ? argv[1] : "83477ae89102633b", *fsk = argc > 2 ? argv[2] : "831a03da67ed2702";
+    mtl_sub_begin();
+    // render target 64x64 RGBA8, and a sampled 64x64 RGBA8 texture with block-linear storage (all 0x80)
+    static tex_t rt, tx; memset(&rt, 0, sizeof rt);
+    rt.d.target = NVN_TEXTURE_TARGET_2D; rt.d.format = NVN_FORMAT_RGBA8; rt.d.width = rt.d.height = 64; rt.d.depth = 1; rt.d.levels = 1; rt.serial = 1;
+    tx = rt; tx.serial = 2; nvn_tex_layout(&tx.d, &tx.L); tx.mem = malloc(tx.L.size); memset(tx.mem, 0x80, tx.L.size);
+    mtl_reg_tex(5, &tx, NULL);
+    samp_par sp = {NVN_MIN_FILTER_LINEAR, NVN_MAG_FILTER_LINEAR, NVN_WRAP_MODE_REPEAT, NVN_WRAP_MODE_REPEAT, NVN_WRAP_MODE_REPEAT, 0, 0, 0, 0, 1000, 0, 1, {0}};
+    mtl_reg_samp(3, &sp);
+    static uint8_t keys[2][8]; be_key(vsk, keys[0]); be_key(fsk, keys[1]);
+    static prog_t prog; prog.nstage = 2; prog.sd[0].control = keys[0]; prog.sd[1].control = keys[1]; prog.serial = 77;
+    static float ubo[4096]; for (int i = 0; i < 4096; i++) ubo[i] = (i % 4 == 3) ? 1.0f : 0.25f;
+    static float verts[3][12] = {{-1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1}, {3, 0, 0, 1, 2, 0, 0, 0, 1, 1, 1, 1}, {-1, 2, 0, 1, 0, 2, 0, 0, 1, 1, 1, 1}};   /* covers NDC y in [0, 1]: the upper half when +1 is the first row */
+    p_set_rt *r = rec(OP_SET_RT, sizeof(p_set_rt)); r->n = 1; r->color[0] = &rt;
+    p_clear_color *cc = rec(OP_CLEAR_COLOR, sizeof *cc); cc->index = 0; cc->mask = 0xf; cc->rgba[2] = 1; cc->rgba[3] = 1;
+    p_bind_program *bp = rec(OP_BIND_PROGRAM, sizeof *bp); bp->prog = &prog; bp->stages = 0x3;
+    p_bind_vattr *va = rec(OP_BIND_VATTR, sizeof *va); va->n = 3; for (int i = 0; i < 3; i++) { va_st a = {NVN_FORMAT_RGBA32F, 16u * i, 0}; memcpy(&va->st[i], &a, 4); }
+    p_bind_vstream *vs = rec(OP_BIND_VSTREAM, sizeof *vs); vs->n = 1; vs->st[0].stride = 48;
+    p_bind_vbuf1 *vb = rec(OP_BIND_VBUF1, sizeof *vb); vb->index = 0; vb->size = sizeof verts; vb->addr = (uint64_t)(uintptr_t)verts;
+    for (int st = 0; st < 2; st++) for (int i = 0; i < 14; i++) { p_bind_buf *u = rec(OP_BIND_UBO, sizeof *u); u->stage = st; u->index = i; u->addr = (uint64_t)(uintptr_t)ubo; u->size = sizeof ubo; }
+    p_bind_tex1 *bt = rec(OP_BIND_TEX1, 16); bt->stage = 1 | BIND_TEX1_NOBASE; bt->slot = 0; bt->h = 5 | (3u << 20);
+    p_viewports *vp = rec(OP_VIEWPORTS, sizeof *vp); vp->n = 1; vp->v[0][2] = 64; vp->v[0][3] = 64;
+    p_draw *d = rec(OP_DRAW, sizeof *d); d->prim = NVN_DRAW_PRIMITIVE_TRIANGLES; d->count = 3; d->instances = 1;
+    d = rec(OP_DRAW, sizeof *d); d->prim = NVN_DRAW_PRIMITIVE_TRIANGLES; d->count = 3; d->instances = 1;   // the second draw reuses the pipeline and ring ranges
+    // a compute dispatch writing a storage buffer
+    static uint32_t sbuf[16]; sbuf_p = sbuf; static uint8_t ck[8]; be_key("3333333333333333", ck);
+    static prog_t cprog; cprog.nstage = 1; cprog.sd[0].control = ck; cprog.serial = 78;
+    p_bind_program *cbp = rec(OP_BIND_PROGRAM, sizeof *cbp); cbp->prog = &cprog; cbp->stages = NVN_SHADER_STAGE_COMPUTE_BIT;
+    p_bind_buf *sb = rec(OP_BIND_SSBO, sizeof *sb); sb->stage = 5; sb->index = 0; sb->addr = (uint64_t)(uintptr_t)sbuf; sb->size = sizeof sbuf;
+    p_dispatch *dp = rec(OP_DISPATCH, sizeof *dp); dp->x = 2; dp->y = 1; dp->z = 1;
+    rec(OP_END, 0);
+    mtl_exec(cmd);
+    mtl_sub_commit();
+    // read the target back
+    static uint32_t px[64 * 64]; cn = 0;
+    p_copy_t2t *c = rec(OP_COPY_T2B, sizeof *c); c->src = (const tex_t *)(void *)px; c->dst = &rt; c->dr.width = 64; c->dr.height = 64; c->dr.depth = 1;
+    rec(OP_END, 0);
+    mtl_sub_begin(); mtl_exec(cmd); mtl_sub_commit();
+    LOG("pixels: row 0 %08x, row 20 %08x, row 40 %08x, row 63 %08x", px[0], px[20 * 64 + 5], px[40 * 64 + 5], px[63 * 64 + 5]);
+    LOG("storage buffer after the submission: %u %u %u %u ... %u", sbuf_p[0], sbuf_p[1], sbuf_p[2], sbuf_p[3], sbuf_p[7]);
+    LOG("validation errors: %d", g_val_errors);
+    return g_val_errors ? 1 : 0;
+}

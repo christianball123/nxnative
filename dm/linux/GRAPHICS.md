@@ -19,7 +19,7 @@ The Apple host replays NVN on Metal (`dm/gfx/nvn/nvn_mtl.m`, 13,700 lines) behin
 |---|---|---|
 | A | SDL3 window, Vulkan instance / device / swapchain, presents paced with the game's (`DM_WINDOW=1`) | done (tested on the Thor: Turnip, Adreno 740, 60 fps) |
 | B | the replay's CPU effects (events, counters, fence syncs, buffer copies / fills / uniform updates), textures as `VkImage`s, clears, texture and buffer copies, the game's swapchain image in the window (`gfx_vk_replay.c`) | first version: no memory pools on the GPU yet (no draws need them), no packaged texture uploads, no partial clears |
-| C | shaders: SPIR-V per key, pipelines, draws (vertex streams, index buffers, uniform buffers, textures and samplers) | |
+| C | shaders: SPIR-V per key (`--shaders`: `spv_build.py`, `spv_pack.py`), pipelines, draws and dispatches (vertex streams, index buffers, uniform / storage buffers, textures and samplers, shader images) (`gfx_vk_shader.c`, `gfx_vk_draw.inc`) | first version: every Mario Tennis Fever shader found and accepted by Turnip; draws through an upload ring (copies per submission), textures uploaded from guest memory at first use; tested with `tests/vk/run.sh` (lavapipe + validation layer). Not yet: tessellation, transform feedback, texture buffers, quads, alpha test, logic ops |
 | D | the rest of Mario Tennis Fever's frame: depth / stencil, blending, compute, queries, the formats it uses | |
 | E | controller (SDL3 gamepad → `hle_hid.c`), audio out (SDL3) | |
 | F | performance: pipeline cache, prewarm lists, Adreno specifics | |
@@ -28,4 +28,5 @@ Mario Tennis Fever is the test game: it plays on the Mac, so a difference is the
 
 ## Notes
 
-- Turnip (Adreno 740) has no `VK_EXT_external_memory_host`: stage C maps device memory over the pools instead.
+- Turnip (Adreno 740) has no `VK_EXT_external_memory_host`. Stage C's first version copies what each draw reads into an upload ring (once per submission per range) and copies written storage buffers back after the submission; mapping device memory over the pools is the faster way for stage F.
+- Debugging: `DM_VK_VALIDATE=1` (the validation layer, messages in the log as `[vkval]`), `DM_VK_DRAW=0` (count draws without drawing), `DM_VK_FLIP_Y=0/1` and `DM_VK_FRONT_FLIP=1` (try the other viewport direction / winding).

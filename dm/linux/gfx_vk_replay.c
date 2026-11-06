@@ -13,6 +13,7 @@
 #include "../gfx/nvn/nvn_mtl.h"
 #include "../gfx/nvn/nvn_timestamp.h"
 #include "../gfx/tex/nvn_fmt_mtl.h"
+#include "../gfx/tex/nvn_deswizzle.h"
 #include "gfx_vk.h"
 #include <stdatomic.h>
 
@@ -58,7 +59,10 @@ static int fmt_int(VkFormat f) {   // integer formats clear with integer values
 }
 
 // ---------------------------------------------------------------- textures: one VkImage per texture serial
-typedef struct { uint64_t serial; VkImage img; VkDeviceMemory mem; VkFormat fmt; uint32_t w, h, d, layers, levels; int is3d, bad; } vtex;
+struct vview;
+// gpu: the GPU has written it (render target, clear, copy destination, shader image): its content lives here and is never replaced from guest memory;
+// uploaded: its guest-memory content was copied in (stage C uploads a texture the GPU has not written at its first sampling, and again after the CPU writes it: mtl_tex_cpu_written)
+typedef struct { uint64_t serial; VkImage img; VkDeviceMemory mem; VkFormat fmt; uint32_t w, h, d, layers, levels, samples; int is3d, is1d, bad, gpu, uploaded, storage; struct vview *views; } vtex;
 #define TEX_CAP (1u << 16)
 static vtex g_tex[TEX_CAP];   // open addressing by serial
 static pthread_mutex_t g_tex_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -81,13 +85,14 @@ static vtex *tex_get(const tex_t *t) {
     int target = t->d.target;
     if (!f || target == NVN_TEXTURE_TARGET_BUFFER) { v->bad = 1; pthread_mutex_unlock(&g_tex_mu); static int once; if (!once++) LOG("[vk] texture format %#x / target %d has no Vulkan image yet (first one: serial %llu)", t->d.format, target, (unsigned long long)t->serial); return NULL; }
     int depth = fmt_depth(f);
+    uint32_t samples = t->d.samples > 1 ? (uint32_t)t->d.samples : 1;
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, f, {t->d.width ? t->d.width : 1, t->d.height ? t->d.height : 1, 1}, t->d.levels ? t->d.levels : 1, 1,
-                            VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                            (VkSampleCountFlagBits)samples, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                             (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT), VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     switch (target) {
-    case NVN_TEXTURE_TARGET_1D: ci.extent.height = 1; break;   // 1D as one-row 2D, as the Metal layer does
+    case NVN_TEXTURE_TARGET_1D: ci.imageType = VK_IMAGE_TYPE_1D; ci.extent.height = 1; break;   // a real 1D image: the translated shaders sample it as one
     case NVN_TEXTURE_TARGET_3D: ci.imageType = VK_IMAGE_TYPE_3D; ci.extent.depth = t->d.depth ? t->d.depth : 1; break;
-    case NVN_TEXTURE_TARGET_1D_ARRAY: ci.arrayLayers = t->d.height ? t->d.height : 1; ci.extent.height = 1; break;
+    case NVN_TEXTURE_TARGET_1D_ARRAY: ci.imageType = VK_IMAGE_TYPE_1D; ci.arrayLayers = t->d.height ? t->d.height : 1; ci.extent.height = 1; break;
     case NVN_TEXTURE_TARGET_2D_ARRAY: case NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY: ci.arrayLayers = t->d.depth ? t->d.depth : 1; break;
     case NVN_TEXTURE_TARGET_CUBEMAP: ci.arrayLayers = 6; ci.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT; break;
     case NVN_TEXTURE_TARGET_CUBEMAP_ARRAY: ci.arrayLayers = t->d.depth ? t->d.depth : 6; ci.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT; break;
@@ -97,6 +102,8 @@ static vtex *tex_get(const tex_t *t) {
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties_(VK.phys, f, &fp); VkFormatFeatureFlags ff = fp.optimalTilingFeatures;
     if (!(ff & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))) ci.usage &= ~(VkImageUsageFlags)(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
     if (!(ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) ci.usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_SAMPLED_BIT;
+    if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && samples == 1) { ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT; v->storage = 1; }   // shader images (nvnCommandBufferBindImage)
+    if (samples > 1) ci.mipLevels = 1;
     if (!ff) { v->bad = 1; pthread_mutex_unlock(&g_tex_mu); static int once2; if (!once2++) LOG("[RED] [vk] the GPU has no support for Vulkan format %d (NVN %#x): such textures are skipped (BC formats on Adreno need a CPU decode)", f, t->d.format); return NULL; }
     VkResult r = vkCreateImage_(VK.dev, &ci, NULL, &v->img);
     if (r) { v->bad = 1; v->img = VK_NULL_HANDLE; pthread_mutex_unlock(&g_tex_mu); LOG("[RED] [vk] vkCreateImage %ux%ux%u x%u levels %u format %d failed (%d)", ci.extent.width, ci.extent.height, ci.extent.depth, ci.arrayLayers, ci.mipLevels, f, r); return NULL; }
@@ -105,19 +112,20 @@ static vtex *tex_get(const tex_t *t) {
     if (ai.memoryTypeIndex == ~0u) ai.memoryTypeIndex = vk_mem_type(mr.memoryTypeBits, 0);
     if ((r = vkAllocateMemory_(VK.dev, &ai, NULL, &v->mem)) || (r = vkBindImageMemory_(VK.dev, v->img, v->mem, 0))) {
         LOG("[RED] [vk] texture memory (%.1f MB) failed (%d)", mr.size / 1048576.0, r); vkDestroyImage_(VK.dev, v->img, NULL); v->img = VK_NULL_HANDLE; v->bad = 1; pthread_mutex_unlock(&g_tex_mu); return NULL; }
-    v->fmt = f; v->w = ci.extent.width; v->h = ci.extent.height; v->d = ci.extent.depth; v->layers = ci.arrayLayers; v->levels = ci.mipLevels; v->is3d = ci.imageType == VK_IMAGE_TYPE_3D;
+    v->fmt = f; v->w = ci.extent.width; v->h = ci.extent.height; v->d = ci.extent.depth; v->layers = ci.arrayLayers; v->levels = ci.mipLevels; v->is3d = ci.imageType == VK_IMAGE_TYPE_3D; v->is1d = ci.imageType == VK_IMAGE_TYPE_1D; v->samples = samples;
     g_tex_made++; g_tex_bytes += mr.size;
     if (g_tex_made == 1 || g_tex_made % 500 == 0) LOG("[vk] textures made: %llu, %.0f MB", (unsigned long long)g_tex_made, g_tex_bytes / 1048576.0);
     pthread_mutex_unlock(&g_tex_mu);
     return v;
 }
+static void vk_views_drop(vtex *v);
 void mtl_tex_init(const tex_t *t) { (void)t; }   // made at first use (tex_get): most textures a game initializes are packaged textures stage B does not upload yet
 void mtl_tex_release(tex_t *t) {
     if (!t || !t->serial) return;
     pthread_mutex_lock(&g_tex_mu);
     vtex *v = tex_slot(t->serial, 0);
     if (v) {
-        if (v->img) { pthread_mutex_lock(&VK.qmu); vkQueueWaitIdle_(VK.q); pthread_mutex_unlock(&VK.qmu); vkDestroyImage_(VK.dev, v->img, NULL); vkFreeMemory_(VK.dev, v->mem, NULL); }
+        if (v->img) { pthread_mutex_lock(&VK.qmu); vkQueueWaitIdle_(VK.q); pthread_mutex_unlock(&VK.qmu); vk_views_drop(v); vkDestroyImage_(VK.dev, v->img, NULL); vkFreeMemory_(VK.dev, v->mem, NULL); }
         memset(v, 0, sizeof *v); v->serial = ~0ull;   // a tombstone keeps later probes going
     }
     pthread_mutex_unlock(&g_tex_mu);
@@ -198,10 +206,13 @@ static void stages_done(void) {
     g_nstage = 0;
 }
 
+static void tex_fill(vtex *v, const tex_t *t);   // gfx_vk_draw.inc: a texture the GPU has not written gets its guest-memory content
+
 // ---------------------------------------------------------------- operations
 static void clear_color(const p_clear_color *c) {
     if (!R.has_rt || c->index < 0 || c->index >= R.rt.n || !R.rt.color[c->index]) return;
     vtex *v = use(R.rt.color[c->index]); if (!v) return;
+    v->gpu = 1;
     static int warned; if (c->mask != 0xf && !warned++) LOG("[vk] a colour clear with channel mask %#x was done on all channels (stage B has no masked clears)", c->mask);
     uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.cview[c->index], R.rt.has_cview[c->index], &lv, &nl, &l0, &nlay);
     VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 1, l0, nlay};
@@ -212,6 +223,7 @@ static void clear_color(const p_clear_color *c) {
 static void clear_ds(const p_clear_ds *c) {
     if (!R.has_rt || !R.rt.depth) return;
     vtex *v = use(R.rt.depth); if (!v) return;
+    v->gpu = 1;
     VkImageAspectFlags a = fmt_aspects(v->fmt) & ((c->depth_mask ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (c->stencil_mask ? VK_IMAGE_ASPECT_STENCIL_BIT : 0));
     if (!a) return;
     uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.dview, R.rt.has_dview, &lv, &nl, &l0, &nlay);
@@ -221,6 +233,7 @@ static void clear_ds(const p_clear_ds *c) {
 }
 static void clear_tex(const p_clear_tex *c) {
     vtex *v = use(c->tex); if (!v) return;
+    v->gpu = 1;
     uint32_t lv, nl, l0, nlay; view_range(v, &c->view, c->has_view, &lv, &nl, &l0, &nlay);
     uint32_t w = v->w >> lv ? v->w >> lv : 1, h = v->h >> lv ? v->h >> lv : 1;
     static int warned; if ((c->r.xoffset || c->r.yoffset || (uint32_t)c->r.width < w || (uint32_t)c->r.height < h) && !warned++) LOG("[vk] a texture clear of part of a level was done on the whole level (stage B)");
@@ -232,6 +245,7 @@ static void clear_tex(const p_clear_tex *c) {
 }
 static void copy_b2t(const p_copy_b2t *c) {
     vtex *v = use(c->tex); if (!v) return;
+    tex_fill(v, c->tex); v->gpu = 1;   // a copy into part of a texture keeps the rest: its guest content goes in first
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh); if (!bpb) return;
     uint32_t lv, nl, l0, nlay; view_range(v, &c->view, c->has_view, &lv, &nl, &l0, &nlay);
     size_t wb = (size_t)((c->r.width + bw - 1) / bw) * bpb, rows = (size_t)(c->r.height + bh - 1) / bh;
@@ -250,6 +264,7 @@ static void copy_b2t(const p_copy_b2t *c) {
 static void copy_t2b(const p_copy_t2t *c) {   // T2B reuses p_copy_t2t: src holds the destination buffer address, dst the texture
     const tex_t *t = c->dst; uint64_t dst = (uint64_t)(uintptr_t)c->src;
     vtex *v = use(t); if (!v) return;
+    tex_fill(v, t);
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); if (!bpb) return;
     uint32_t lv, nl, l0, nlay; view_range(v, &c->dv, c->has_dv, &lv, &nl, &l0, &nlay);
     const NVNcopyRegion *r = &c->dr;
@@ -265,6 +280,7 @@ static void copy_t2b(const p_copy_t2t *c) {   // T2B reuses p_copy_t2t: src hold
 }
 static void copy_t2t(const p_copy_t2t *c) {
     vtex *s = use(c->src), *d = use(c->dst); if (!s || !d) return;
+    tex_fill(s, c->src); tex_fill(d, c->dst); d->gpu = 1;
     uint32_t slv, snl, sl0, snlay, dlv, dnl, dl0, dnlay;
     view_range(s, &c->sv, c->has_sv, &slv, &snl, &sl0, &snlay); view_range(d, &c->dv, c->has_dv, &dlv, &dnl, &dl0, &dnlay);
     const NVNcopyRegion *a = &c->sr, *b = &c->dr;
@@ -289,9 +305,13 @@ static void copy_t2t(const p_copy_t2t *c) {
     full_barrier();
 }
 
-// ---------------------------------------------------------------- the record walk
+// ---------------------------------------------------------------- stage C: draws and compute
 static uint64_t g_draws, g_dispatches, g_draws_ready, g_disp_ready;
 static const vks_prog *g_gfx_prog, *g_cs_prog;   // the bound programs' shaders (stage C), NULL while a program's shaders are not known
+static int g_draw_on = 1;   // DM_VK_DRAW=0: count draws without drawing (stage B's behaviour)
+#include "gfx_vk_draw.inc"
+
+// ---------------------------------------------------------------- the record walk
 void mtl_exec(const uint8_t *p) {
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
@@ -307,21 +327,22 @@ void mtl_exec(const uint8_t *p) {
         case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); memmove((void *)(uintptr_t)d, (const void *)(uintptr_t)s_, n); break; }
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); memcpy((void *)(uintptr_t)d, a + 16, n); break; }
         case OP_COPY_STRIDE: { const p_copy_stride *cs = (const p_copy_stride *)a; if (cs->image) R.copy_img_stride = cs->stride; else R.copy_stride = cs->stride; break; }
-        case OP_SET_RT: R.rt = *(const p_set_rt *)a; R.has_rt = 1; break;
-        case OP_CLEAR_COLOR: if (VK.ok) clear_color((const p_clear_color *)a); break;
-        case OP_CLEAR_DS: if (VK.ok) clear_ds((const p_clear_ds *)a); break;
-        case OP_CLEAR_TEX: if (VK.ok) clear_tex((const p_clear_tex *)a); break;
-        case OP_COPY_B2T: if (VK.ok) copy_b2t((const p_copy_b2t *)a); break;
-        case OP_COPY_T2B: if (VK.ok) copy_t2b((const p_copy_t2t *)a); break;
-        case OP_COPY_T2T: if (VK.ok) copy_t2t((const p_copy_t2t *)a); break;
+        case OP_SET_RT: if (VK.ok) pass_end(); R.rt = *(const p_set_rt *)a; R.has_rt = 1; break;
+        case OP_CLEAR_COLOR: if (VK.ok) { pass_end(); clear_color((const p_clear_color *)a); } break;
+        case OP_CLEAR_DS: if (VK.ok) { pass_end(); clear_ds((const p_clear_ds *)a); } break;
+        case OP_CLEAR_TEX: if (VK.ok) { pass_end(); clear_tex((const p_clear_tex *)a); } break;
+        case OP_COPY_B2T: if (VK.ok) { pass_end(); copy_b2t((const p_copy_b2t *)a); } break;
+        case OP_COPY_T2B: if (VK.ok) { pass_end(); copy_t2b((const p_copy_t2t *)a); } break;
+        case OP_COPY_T2T: if (VK.ok) { pass_end(); copy_t2t((const p_copy_t2t *)a); } break;
         case OP_BIND_PROGRAM: if (VK.ok) {
             const p_bind_program *b = (const p_bind_program *)a; const vks_prog *pr = vks_prog_get(b->prog);
             if (pr && pr->compute) g_cs_prog = pr; else if (pr || !(b->stages & NVN_SHADER_STAGE_COMPUTE_BIT)) g_gfx_prog = pr; else g_cs_prog = NULL;
         } break;
-        case OP_DRAW: case OP_DRAW_IDX: case OP_MULTI_DRAW: g_draws++; if (g_gfx_prog) g_draws_ready++; break;
+        case OP_DRAW: case OP_DRAW_IDX: case OP_MULTI_DRAW: g_draws++; if (g_gfx_prog) g_draws_ready++; if (VK.ok && g_draw_on) draw_op(h.op, a, h.size); break;
         case OP_DRAW_TEX: g_draws++; break;
-        case OP_DISPATCH: g_dispatches++; if (g_cs_prog) g_disp_ready++; break;
-        default: break;   // state for draws and compute (stage C)
+        case OP_DISPATCH: g_dispatches++; if (g_cs_prog) g_disp_ready++; if (VK.ok && g_draw_on) dispatch_op((const p_dispatch *)a); break;
+        case OP_BARRIER: break;   // every pass end and GPU operation is followed by a full barrier already
+        default: state_op(h.op, a); break;   // state for draws and compute
         }
         p += h.size;
     }
@@ -331,18 +352,24 @@ void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 
 void mtl_sub_begin(void) {
     // the window comes up with the first submission, so the game's textures have a device from the start
-    if (vkw_wanted() && !VK.ok) vkw_init();
+    if (vkw_wanted() && !VK.ok) { vkw_init(); const char *e = getenv("DM_VK_DRAW"); g_draw_on = !(e && *e == '0'); if (VK.ok) LOG("[vk] draws: %s", g_draw_on ? "on (stage C)" : "off (DM_VK_DRAW=0)"); }
 }
 uint64_t mtl_sub_commit(void) {
     if (g_cb_open) {
+        pass_end();
         vkEndCommandBuffer_(g_cb); g_cb_open = 0;
         VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &g_cb, 0, NULL};
         pthread_mutex_lock(&VK.qmu);
         VkResult r = vkQueueSubmit_(VK.q, 1, &si, g_fence_vk);
         pthread_mutex_unlock(&VK.qmu);
         if (r) LOG("[RED] [vk] submission failed (%d)", r);
-        else { vkWaitForFences_(VK.dev, 1, &g_fence_vk, VK_TRUE, UINT64_MAX); vkResetFences_(VK.dev, 1, &g_fence_vk); }
+        else {
+            VkResult w = vkWaitForFences_(VK.dev, 1, &g_fence_vk, VK_TRUE, 5000000000ull);
+            if (w) { LOG("[RED] [vk] the GPU did not finish a submission in 5 s (%d): device lost or hung", w); vkDeviceWaitIdle_(VK.dev); }
+            vkResetFences_(VK.dev, 1, &g_fence_vk);
+        }
         stages_done();
+        draw_submitted();
     }
     // The submission has completed: its events and counters land, in record order
     uint64_t now = gpu_ticks();
@@ -360,9 +387,10 @@ uint64_t mtl_sub_commit(void) {
     uint64_t f = atomic_fetch_add(&g_fence, 1) + 1;
     if (f == 1 || f - reported >= 600) {
         reported = f; uint64_t np = 0, nm = 0, nf = 0; vks_stats(&np, &nm, &nf);
-        LOG("[vk] replay: %llu submissions; draws %llu (%llu with their shaders ready), dispatches %llu (%llu ready); programs %llu, shaders missing %llu, refused %llu — not drawn yet (stage C)",
+        char ds[640]; draw_summary(ds, sizeof ds);
+        LOG("[vk] replay: %llu submissions; draws %llu (%llu with their shaders ready), dispatches %llu (%llu ready); programs %llu, shaders missing %llu, refused %llu; %s",
             (unsigned long long)f, (unsigned long long)g_draws, (unsigned long long)g_draws_ready, (unsigned long long)g_dispatches, (unsigned long long)g_disp_ready,
-            (unsigned long long)np, (unsigned long long)nm, (unsigned long long)nf);
+            (unsigned long long)np, (unsigned long long)nm, (unsigned long long)nf, ds);
     }
     return f;
 }

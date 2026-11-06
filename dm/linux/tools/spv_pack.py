@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # spv_build.py's output (<key>.spv + <key>.res.json per shader, over 100 000 small files) → one file the Linux host maps (dm/linux/gfx_vk_shader.c), shaders.dmsp:
-#   header  "DMSP" u32 version, u32 count, u32 0
+#   header  "DMSP" u32 version (2), u32 count, u32 0
 #   index   count × {u64 key (the 16 hex digits read as a big-endian number), u32 offset, u32 length}, sorted by key
 #   entries u8 stage (SPIR-V execution model: 0 vertex 1 tess control 2 tess eval 3 geometry 4 fragment 5 compute), u8 bindings, u8 vertex inputs, u8 fragment output mask,
-#           u16 local size x, y, z (compute), u16 0
-#           bindings × {u8 binding, u8 Vulkan descriptor type, u8 kind (KIND_*), u8 image (dim | arrayed << 4 | multisample << 5 | depth << 6), u16 reg, u16 count}
-#           vertex inputs × {u8 location, u8 component type (0 float 1 uint 2 int)}, padded to 4 bytes, then the SPIR-V words
+#           u16 local size x, y, z (compute), u16 c1 bytes
+#           bindings × {u8 binding, u8 Vulkan descriptor type, u8 kind (KIND_*), u8 image (dim | arrayed << 4 | multisample << 5 | depth << 6), u32 reg, u16 count, u16 aux}
+#             KIND_CBUF: reg = the constant bank (0, 2 driver; 1 the shader's own c1; 3 + n uniform slot n)
+#             KIND_SBUF: reg = the byte its address is at in bank aux (aux 0: the stage's c0 table; aux >= 3: uniform slot aux - 3); image = 1 when the shader writes it
+#             KIND_TEX / KIND_IMG: reg = the translator's handle (bits 0-13 the handle word, 14-27 a separate sampler's word, 28-31 the handle type), aux = the bank the words are in
+#           vertex inputs × {u8 location, u8 component type (0 float 1 uint 2 int)}, the c1 bytes, padded to 4 bytes, then the SPIR-V words
 # The descriptor types and image shapes come from the SPIR-V itself; what each binding means (which uniform slot, which texture handle) from the translator's reflection.
 # All bindings are in set 0 (dmsh_xlate Program.cs); binding 0 is the translator's support buffer.
 import json, os, struct, sys
@@ -73,16 +76,15 @@ def reflect(words):
     return model, binds, vin, fout, local
 
 def kind_of(res, binding):
-    if binding == 0: return KIND_SUPPORT, 0
+    if binding == 0: return KIND_SUPPORT, 0, 0, 0
     for b in res.get('cbufs', []):
-        if b['binding'] == binding: return KIND_CBUF, b['slot']
+        if b['binding'] == binding: return KIND_CBUF, b['slot'], 0, 0
     for b in res.get('sbufs', []):
-        if b['binding'] == binding: return KIND_SBUF, b['slot']
-    for b in res.get('textures', []):
-        if b['binding'] == binding: return KIND_TEX, b['handle'] if b['handle'] >= 0 else 0xffff
-    for b in res.get('images', []):
-        if b['binding'] == binding: return KIND_IMG, b['handle'] if b['handle'] >= 0 else 0xffff
-    return KIND_UNKNOWN, 0
+        if b['binding'] == binding: return KIND_SBUF, b['cb_offset'] * 4, b['cb_slot'] & 0xffff, b.get('flags', 0) & 1
+    for name, kind in (('textures', KIND_TEX), ('images', KIND_IMG)):
+        for b in res.get(name, []):
+            if b['binding'] == binding: return kind, b['handle'] & 0xffffffff, b['cbuf_slot'] & 0xffff, 0
+    return KIND_UNKNOWN, 0, 0, 0
 
 def strip_unused(words):
     # The translator declares Float64 and fragment shader interlock in every shader; Adreno's driver (Turnip) supports neither. Declarations a shader does not use are dropped
@@ -103,18 +105,22 @@ def strip_unused(words):
         i += n
     return out
 
-def entry(spv_path, res_path):
+def entry(spv_path, res_path, job_path=None):
     data = Path(spv_path).read_bytes()
     words = struct.unpack(f'<{len(data) // 4}I', data)
     if words[0] != 0x07230203: raise ValueError('not SPIR-V')
     words = strip_unused(words); data = struct.pack(f'<{len(words)}I', *words)
     model, binds, vin, fout, local = reflect(words)
     res = json.load(open(res_path)) if os.path.exists(res_path) else {}
-    out = bytearray(struct.pack('<BBBB3HH', model, len(binds), len(vin), fout & 0xff, *[min(x, 0xffff) for x in local], 0))
+    try: c1 = bytes.fromhex(json.load(open(job_path)).get('c1') or '') if job_path and os.path.exists(job_path) else b''
+    except ValueError: c1 = b''
+    out = bytearray(struct.pack('<BBBB3HH', model, len(binds), len(vin), fout & 0xff, *[min(x, 0xffff) for x in local], len(c1)))
     for b, vk, img, n in sorted(binds):
-        k, reg = kind_of(res, b)
-        out += struct.pack('<BBBBHH', b, vk, k, img, reg & 0xffff, n)
+        k, reg, aux, written = kind_of(res, b)
+        if k == KIND_SBUF: img = written                                # buffers have no image shape: the byte says whether the shader writes it
+        out += struct.pack('<BBBBIHH', b, vk, k, img, reg, n, aux)
     for loc, ct in sorted(vin): out += struct.pack('<BB', loc, ct)
+    out += c1
     out += b'\0' * (-len(out) % 4)
     return bytes(out + data)
 
@@ -127,7 +133,7 @@ def main():
         try: key = int(k[:16], 16)
         except ValueError: continue
         if k != k[:16]: continue                                        # geometry variants (<key>_g<n>…) are for the Mac's geometry lowering
-        try: blobs.append((key, entry(src / f'{k}.spv', src / f'{k}.res.json')))
+        try: blobs.append((key, entry(src / f'{k}.spv', src / f'{k}.res.json', src / f'{k}.json')))
         except Exception as e:
             bad += 1
             if bad <= 10: print(f'[RED] {k}: {e}')
@@ -137,7 +143,7 @@ def main():
     for key, b in blobs:
         idx += struct.pack('<QII', key, off + len(body), len(b)); body += b; body += b'\0' * (-len(body) % 8)
     tmp = dst.with_suffix('.partial')
-    with open(tmp, 'wb') as f: f.write(b'DMSP' + struct.pack('<III', 1, len(blobs), 0)); f.write(idx); f.write(body)
+    with open(tmp, 'wb') as f: f.write(b'DMSP' + struct.pack('<III', 2, len(blobs), 0)); f.write(idx); f.write(body)
     tmp.replace(dst)
     print(f'shader pack: {len(blobs)} shaders, {bad} unreadable, {(16 + len(idx) + len(body)) / 2**20:.1f} MB → {dst}')
 
