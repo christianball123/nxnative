@@ -177,7 +177,13 @@ const vks_prog *vks_prog_topology(const vks_prog *base, int cls) {
     pthread_mutex_lock(&g_mu);
     uint64_t serial = base->serial ^ (GVAR * (uint64_t)(cls + 1)) ^ 0x5bd1e995ull;
     uint32_t slot; vks_prog *r = cache_find(serial, &slot);
-    if (!r) { r = prog_build(base->prog, serial, cls); cache_put(slot, r); }
+    if (!r) {
+        static int n; int say = n++ < 30;
+        if (say) { LOG("[vk] building a geometry program for input topology %d (vertex %016llx, geometry %016llx, fragment %016llx)", cls, base->st[VKS_VS] ? (unsigned long long)base->st[VKS_VS]->key : 0ull,
+                       base->st[VKS_GS] ? (unsigned long long)base->st[VKS_GS]->key : 0ull, base->st[VKS_FS] ? (unsigned long long)base->st[VKS_FS]->key : 0ull); fflush(stderr); }
+        r = prog_build(base->prog, serial, cls); cache_put(slot, r);
+        if (say) { LOG("[vk] geometry program built: %s", r->ok ? "ok" : "failed"); fflush(stderr); }
+    }
     pthread_mutex_unlock(&g_mu);
     return r->ok ? r : NULL;
 }
