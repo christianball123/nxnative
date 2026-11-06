@@ -66,7 +66,7 @@ static uint64_t ring_bytes(const void *p, uint64_t n) { uint64_t off = ring_allo
 
 // ---------------------------------------------------------------- texture, sampler and image registrations (the game's descriptor pools: hle_nvn.c)
 typedef struct { tex_t t; view_t v; int has_v; } treg;
-static treg **g_treg, **g_ireg; static samp_par **g_sreg; static int g_ntreg, g_nireg, g_nsreg;
+static treg **g_treg; static samp_par **g_sreg; static int g_ntreg, g_nsreg;
 static pthread_mutex_t g_reg_mu = PTHREAD_MUTEX_INITIALIZER;
 static void reg_put(void ***tab, int *n, int id, void *e) {
     if (id < 0 || id >= (1 << 22)) { free(e); return; }
@@ -77,11 +77,12 @@ static void reg_put(void ***tab, int *n, int id, void *e) {
     free(old);   // a registration replaced while a submission reads the old one is the game's race (NVN has it too)
 }
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v) { treg *e = calloc(1, sizeof *e); if (t) e->t = *t; if (v) { e->v = *v; e->has_v = 1; } reg_put((void ***)&g_treg, &g_ntreg, id, e); }
-void mtl_reg_image(int id, const tex_t *t, const view_t *v) { treg *e = calloc(1, sizeof *e); if (t) e->t = *t; if (v) { e->v = *v; e->has_v = 1; } reg_put((void ***)&g_ireg, &g_nireg, id, e); }
+// Images share the texture pool's index space (an image handle is a pool index: hle_nvn.c nvnDeviceGetImageHandle), so RegisterImage writes the same table as RegisterTexture
+void mtl_reg_image(int id, const tex_t *t, const view_t *v) { treg *e = calloc(1, sizeof *e); if (t) { e->t = *t; e->t.d.flags |= NVN_TEXTURE_FLAGS_IMAGE; } if (v) { e->v = *v; e->has_v = 1; } reg_put((void ***)&g_treg, &g_ntreg, id, e); }
 void mtl_reg_samp(int id, const samp_par *p) { samp_par *e = malloc(sizeof *e); *e = *p; reg_put((void ***)&g_sreg, &g_nsreg, id, e); }
 void mtl_set_tex_pool_n(int n) { (void)n; }
 static const treg *treg_get(int id) { pthread_mutex_lock(&g_reg_mu); const treg *r = id > 0 && id < g_ntreg ? g_treg[id] : NULL; pthread_mutex_unlock(&g_reg_mu); return r && r->t.serial ? r : NULL; }
-static const treg *ireg_get(int id) { pthread_mutex_lock(&g_reg_mu); const treg *r = id > 0 && id < g_nireg ? g_ireg[id] : NULL; pthread_mutex_unlock(&g_reg_mu); return r && r->t.serial ? r : NULL; }
+static const treg *ireg_get(int id) { return treg_get(id); }
 static const samp_par *sreg_get(int id) { pthread_mutex_lock(&g_reg_mu); const samp_par *r = id >= 0 && id < g_nsreg ? g_sreg[id] : NULL; pthread_mutex_unlock(&g_reg_mu); return r; }
 
 // Window origin and depth mode (hle_nvn.c)
