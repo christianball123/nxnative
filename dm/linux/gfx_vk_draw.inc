@@ -579,8 +579,8 @@ static VkPipeline pipe_make(const vks_prog *pr, const pkey *k) {
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rci, 0, ns, st, &vi, &ia, NULL, &vp, &rs, &ms, &dss, &cbs, &ds, pr->layout, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, -1};
     if (!g_pcache) { VkPipelineCacheCreateInfo pc = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, 0, NULL}; vkCreatePipelineCache_(VK.dev, &pc, NULL, &g_pcache); }
     VkPipeline p = VK_NULL_HANDLE;
-    if (pr->st[VKS_GS]) { static int n; if (n++ < 30) { LOG("[vk] making a pipeline with geometry shader %016llx (vertex %016llx, fragment %016llx, input topology %d)",
-        (unsigned long long)pr->st[VKS_GS]->key, pr->st[VKS_VS] ? (unsigned long long)pr->st[VKS_VS]->key : 0ull, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull, pr->gs_class); fflush(stderr); } }
+    if (pr->st[VKS_GS]) { static int n; if (n++ < 30) { LOG("[vk] making a pipeline with geometry shader %016llx_g%d (vertex %016llx, fragment %016llx)",
+        (unsigned long long)(pr->st[VKS_GS]->key ^ (pr->gs_class >= 0 ? 0x9E3779B97F4A7C15ull * (uint64_t)(pr->gs_class + 1) : 0)), pr->gs_class, pr->st[VKS_VS] ? (unsigned long long)pr->st[VKS_VS]->key : 0ull, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull); fflush(stderr); } }
     VkResult r = vkCreateGraphicsPipelines_(VK.dev, g_pcache, 1, &ci, NULL, &p);
     if (r) {
         static int n; if (n++ < 10) {
