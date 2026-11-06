@@ -83,6 +83,7 @@ static struct {
     VkSwapchainKHR sc; VkFormat fmt; VkExtent2D ext; uint32_t nimg; VkImage img[SWAP_MAX];
     VkSemaphore acquired[SWAP_MAX], done[SWAP_MAX]; VkCommandPool pool; VkCommandBuffer cb[SWAP_MAX]; VkFence fence[SWAP_MAX]; uint32_t slot;
     int ok, failed, resized; uint64_t frames; double t0; char devname[256]; int ext_host_mem, ext_push, ext_dcc; int want_srgb, srgb;
+    VkImage mid; VkDeviceMemory mid_mem; VkExtent2D mid_ext; VkFormat mid_fmt;   // an sRGB image of the window's size (sRGB game images when the window has no sRGB format)
 } W;
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
@@ -357,6 +358,34 @@ int vkw_init(void) {
     return W.ok;
 }
 
+// The sRGB image the window's size (made again when the window changes size or format): its format is the window's with sRGB encoding, so a raw copy keeps the channel order
+static VkImage mid_image(void) {
+    VkFormat f = W.fmt == VK_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_SRGB : W.fmt == VK_FORMAT_R8G8B8A8_UNORM ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_UNDEFINED;
+    if (!f) return VK_NULL_HANDLE;
+    if (W.mid && W.mid_ext.width == W.ext.width && W.mid_ext.height == W.ext.height && W.mid_fmt == f) return W.mid;
+    if (W.mid) { vkDeviceWaitIdle_(VK.dev); vkDestroyImage_(VK.dev, W.mid, NULL); vkFreeMemory_(VK.dev, W.mid_mem, NULL); W.mid = VK_NULL_HANDLE; }
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, f, {W.ext.width, W.ext.height, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    if (vkCreateImage_(VK.dev, &ci, NULL, &W.mid)) { W.mid = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements_(VK.dev, W.mid, &mr);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+    if (ai.memoryTypeIndex == ~0u || vkAllocateMemory_(VK.dev, &ai, NULL, &W.mid_mem)) { vkDestroyImage_(VK.dev, W.mid, NULL); W.mid = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+    vkBindImageMemory_(VK.dev, W.mid, W.mid_mem, 0);
+    // into GENERAL once, with a one-off submission
+    VkCommandBuffer cb = W.cb[(W.slot + 1) % W.nimg];
+    vkWaitForFences_(VK.dev, 1, &W.fence[(W.slot + 1) % W.nimg], VK_TRUE, UINT64_MAX);
+    vkResetCommandBuffer_(cb, 0);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+    vkBeginCommandBuffer_(cb, &bi);
+    barrier(cb, W.mid, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    vkEndCommandBuffer_(cb);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL};
+    vkQueueSubmit_(VK.q, 1, &si, VK_NULL_HANDLE); vkQueueWaitIdle_(VK.q);
+    W.mid_ext = W.ext; W.mid_fmt = f;
+    LOG("[vk] the window has no sRGB format: sRGB game images go through an sRGB image of the window's size (%ux%u)", W.ext.width, W.ext.height);
+    return W.mid;
+}
+
 // One present: the next swapchain image, with the game's image scaled into it (or stage A's colour when there is none yet), shown with FIFO: the display's vsync paces the game
 // as a Switch's display would. The game's image stays in VK_IMAGE_LAYOUT_GENERAL, the layout gfx_vk_replay.c keeps every image in
 void vkw_present(uint64_t n, VkImage gimg, uint32_t gw, uint32_t gh, const int crop[4]) {
@@ -384,9 +413,20 @@ void vkw_present(uint64_t n, VkImage gimg, uint32_t gw, uint32_t gh, const int c
         double sx = (double)W.ext.width / cw, sy = (double)W.ext.height / ch, k = sx < sy ? sx : sy;
         int dw = (int)(cw * k), dh = (int)(ch * k), dx = ((int)W.ext.width - dw) / 2, dy = ((int)W.ext.height - dh) / 2;
         VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{cx, cy, 0}, {cx + cw, cy + ch, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
-        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
         vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-        vkCmdBlitImage_(cb, gimg, VK_IMAGE_LAYOUT_GENERAL, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        VkImage mid = W.want_srgb && !W.srgb ? mid_image() : VK_NULL_HANDLE;
+        if (mid) {
+            // An sRGB game image and a window without an sRGB format: the blit (which filters in linear light) goes into an sRGB image of the window's size, encoding
+            // the colours again, and those bytes are copied as they are into the window's image, which shows them as sRGB
+            VkImageSubresourceRange mr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage_(cb, mid, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &mr);
+            vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            vkCmdBlitImage_(cb, gimg, VK_IMAGE_LAYOUT_GENERAL, mid, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_LINEAR);
+            vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            VkImageCopy ic = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {W.ext.width, W.ext.height, 1}};
+            vkCmdCopyImage_(cb, mid, VK_IMAGE_LAYOUT_GENERAL, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+        } else vkCmdBlitImage_(cb, gimg, VK_IMAGE_LAYOUT_GENERAL, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
     } else {
         // Stage A's picture: a dark blue that brightens and dims once a second at 60 presents a second (so a steady pulse means a steady 60 fps)
         double ph = (double)(n % 60) / 60.0, k = 0.5 - 0.5 * cos(ph * 2 * M_PI);

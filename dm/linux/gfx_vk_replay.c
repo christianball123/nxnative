@@ -66,7 +66,7 @@ struct vview;
 // linear: a LINEAR texture, which the CPU and GPU may both write: its guest memory stays the reference (GPU writes are read back into it after each submission: wrote)
 // tracked: its guest pages are write-protected since stamp (nvn_dirty.c), so a CPU write since its upload is seen (prep_tex) and it is uploaded again
 typedef struct { uint64_t serial; VkImage img; VkDeviceMemory mem; VkFormat fmt; uint32_t w, h, d, layers, levels, samples; int is3d, is1d, bad, gpu, uploaded, storage; struct vview *views;
-                 int linear, wrote, tracked; uint8_t *gmem; uint64_t gsize, stamp; const void *span; uint32_t stride, rowbytes, rows; } vtex;
+                 int linear, wrote, tracked; uint8_t *gmem; uint64_t gsize, stamp; const void *span; uint32_t stride, rowbytes, rows; uint64_t bytes; } vtex;
 static vtex **g_lw; static int g_nlw, g_clw;   // linear textures the GPU wrote in this submission
 static inline void gpu_wrote(vtex *v) {
     v->gpu = 1; v->uploaded = 1;   // the GPU's content is the newest now: nothing from guest memory goes over it (a linear texture's is read back at the submission's end)
@@ -75,7 +75,7 @@ static inline void gpu_wrote(vtex *v) {
 #define TEX_CAP (1u << 16)
 static vtex g_tex[TEX_CAP];   // open addressing by serial
 static pthread_mutex_t g_tex_mu = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t g_tex_made, g_tex_bytes;
+static uint64_t g_tex_made, g_tex_bytes, g_tex_live, g_tex_live_bytes;
 static vtex *tex_slot(uint64_t serial, int make) {
     uint32_t i = (uint32_t)(serial * 0x9E3779B97F4A7C15ull >> 48) & (TEX_CAP - 1);
     for (uint32_t k = 0; k < TEX_CAP; k++, i = (i + 1) & (TEX_CAP - 1)) {
@@ -130,7 +130,7 @@ static vtex *tex_get(const tex_t *t) {
         if (v->linear) { v->rowbytes = (ci.extent.width + bw - 1) / bw * (uint32_t)bpb; v->rows = (ci.extent.height + bh - 1) / bh; v->stride = t->d.stride ? t->d.stride : v->rowbytes; if (!v->gsize) v->gsize = (uint64_t)v->stride * v->rows; }
     }
     v->fmt = f; v->w = ci.extent.width; v->h = ci.extent.height; v->d = ci.extent.depth; v->layers = ci.arrayLayers; v->levels = ci.mipLevels; v->is3d = ci.imageType == VK_IMAGE_TYPE_3D; v->is1d = ci.imageType == VK_IMAGE_TYPE_1D; v->samples = samples;
-    g_tex_made++; g_tex_bytes += mr.size;
+    g_tex_made++; g_tex_bytes += mr.size; g_tex_live++; g_tex_live_bytes += mr.size; v->bytes = mr.size;
     if (g_tex_made == 1 || g_tex_made % 500 == 0) LOG("[vk] textures made: %llu, %.0f MB", (unsigned long long)g_tex_made, g_tex_bytes / 1048576.0);
     pthread_mutex_unlock(&g_tex_mu);
     return v;
@@ -142,7 +142,7 @@ void mtl_tex_release(tex_t *t) {
     pthread_mutex_lock(&g_tex_mu);
     vtex *v = tex_slot(t->serial, 0);
     if (v) {
-        if (v->img) { pthread_mutex_lock(&VK.qmu); vkQueueWaitIdle_(VK.q); pthread_mutex_unlock(&VK.qmu); vk_views_drop(v); vkDestroyImage_(VK.dev, v->img, NULL); vkFreeMemory_(VK.dev, v->mem, NULL); }
+        if (v->img) { pthread_mutex_lock(&VK.qmu); vkQueueWaitIdle_(VK.q); pthread_mutex_unlock(&VK.qmu); vk_views_drop(v); vkDestroyImage_(VK.dev, v->img, NULL); vkFreeMemory_(VK.dev, v->mem, NULL); g_tex_live--; g_tex_live_bytes -= v->bytes; }
         memset(v, 0, sizeof *v); v->serial = ~0ull;   // a tombstone keeps later probes going
     }
     pthread_mutex_unlock(&g_tex_mu);
@@ -408,6 +408,12 @@ uint64_t mtl_sub_commit(void) {
     if (f == 1 || f - reported >= 600) {
         reported = f; uint64_t np = 0, nm = 0, nf = 0; vks_stats(&np, &nm, &nf);
         char ds[640]; draw_summary(ds, sizeof ds);
+        // memory: the textures alive on the GPU side, this process's resident memory, and what the system has left (a game's memory file fails with SIGBUS when it runs out)
+        long rss_kb = 0, avail_kb = 0, swapf_kb = 0; char ln[256];
+        FILE *fs = fopen("/proc/self/status", "r"); if (fs) { while (fgets(ln, sizeof ln, fs)) sscanf(ln, "VmRSS: %ld", &rss_kb); fclose(fs); }
+        FILE *fm = fopen("/proc/meminfo", "r"); if (fm) { while (fgets(ln, sizeof ln, fm)) { sscanf(ln, "MemAvailable: %ld", &avail_kb); sscanf(ln, "SwapFree: %ld", &swapf_kb); } fclose(fm); }
+        LOG("[vk] memory: textures alive %llu (%.0f MB), process resident %.2f GB, system available %.2f GB, swap free %.2f GB", (unsigned long long)g_tex_live, g_tex_live_bytes / 1048576.0,
+            rss_kb / 1048576.0, avail_kb / 1048576.0, swapf_kb / 1048576.0);
         LOG("[vk] replay: %llu submissions; draws %llu (%llu with their shaders ready), dispatches %llu (%llu ready); programs %llu, shaders missing %llu, refused %llu; %s",
             (unsigned long long)f, (unsigned long long)g_draws, (unsigned long long)g_draws_ready, (unsigned long long)g_dispatches, (unsigned long long)g_disp_ready,
             (unsigned long long)np, (unsigned long long)nm, (unsigned long long)nf, ds);
