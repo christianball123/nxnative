@@ -81,6 +81,10 @@ int main(int argc, char **argv) {
     p_viewports *vp = rec(OP_VIEWPORTS, sizeof *vp); vp->n = 1; vp->v[0][2] = 64; vp->v[0][3] = 64;
     p_draw *d = rec(OP_DRAW, sizeof *d); d->prim = NVN_DRAW_PRIMITIVE_TRIANGLES; d->count = 3; d->instances = 1;
     d = rec(OP_DRAW, sizeof *d); d->prim = NVN_DRAW_PRIMITIVE_TRIANGLES; d->count = 3; d->instances = 1;   // the second draw reuses the pipeline and ring ranges
+    // a quad over the lower-left quarter (NDC x, y in [-1, 0]): Vulkan has no quads, the replay makes two triangles of it
+    static float quad[4][12] = {{-1, -1, 0, 1, 0, 0, 0, 0}, {0, -1, 0, 1, 1, 0, 0, 0}, {0, 0, 0, 1, 1, 1, 0, 0}, {-1, 0, 0, 1, 0, 1, 0, 0}};
+    vb = rec(OP_BIND_VBUF1, sizeof *vb); vb->index = 0; vb->size = sizeof quad; vb->addr = (uint64_t)(uintptr_t)quad;
+    d = rec(OP_DRAW, sizeof *d); d->prim = NVN_DRAW_PRIMITIVE_QUADS; d->count = 4; d->instances = 1;
     // a compute dispatch writing a storage buffer
     static uint32_t sbuf[16]; sbuf_p = sbuf; static uint8_t ck[8]; be_key("3333333333333333", ck);
     static prog_t cprog; cprog.nstage = 1; cprog.sd[0].control = ck; cprog.serial = 78;
@@ -95,7 +99,7 @@ int main(int argc, char **argv) {
     p_copy_t2t *c = rec(OP_COPY_T2B, sizeof *c); c->src = (const tex_t *)(void *)px; c->dst = &rt; c->dr.width = 64; c->dr.height = 64; c->dr.depth = 1;
     rec(OP_END, 0);
     mtl_sub_begin(); mtl_exec(cmd); mtl_sub_commit();
-    LOG("pixels: row 0 %08x, row 20 %08x, row 40 %08x, row 63 %08x", px[0], px[20 * 64 + 5], px[40 * 64 + 5], px[63 * 64 + 5]);
+    LOG("pixels: row 0 %08x, row 20 %08x, row 40 %08x, row 63 %08x; quad: row 50 col 5 %08x, row 50 col 50 %08x", px[0], px[20 * 64 + 5], px[40 * 64 + 5], px[63 * 64 + 5], px[50 * 64 + 5], px[50 * 64 + 50]);
     LOG("storage buffer after the submission: %u %u %u %u ... %u", sbuf_p[0], sbuf_p[1], sbuf_p[2], sbuf_p[3], sbuf_p[7]);
     LOG("validation errors: %d", g_val_errors);
     return g_val_errors ? 1 : 0;

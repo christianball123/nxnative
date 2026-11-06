@@ -385,7 +385,7 @@ static void state_op(uint32_t op, const uint8_t *a) {
 
 // ---------------------------------------------------------------- statistics (in the replay's summary line)
 enum { SK_NOPROG, SK_NORT, SK_TESS, SK_PIPE, SK_RING, SK_PRIM, SK_DESC, SK_N };
-static const char *k_sk[SK_N] = {"shaders not ready", "no render target", "tessellation", "pipeline refused", "upload ring full", "quads / polygons", "descriptors"};
+static const char *k_sk[SK_N] = {"shaders not ready", "no render target", "tessellation", "pipeline refused", "upload ring full", "primitive type", "descriptors"};
 static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g_tex_missing;
 
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
@@ -489,7 +489,9 @@ static VkPrimitiveTopology topo_of(int prim) {
     case NVN_DRAW_PRIMITIVE_LINES_ADJACENCY: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY; case NVN_DRAW_PRIMITIVE_LINE_STRIP_ADJACENCY: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
     case NVN_DRAW_PRIMITIVE_TRIANGLES_ADJACENCY: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY; case NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP_ADJACENCY: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
     case NVN_DRAW_PRIMITIVE_PATCHES: return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
-    default: return VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;   // quads, quad strips, polygons: no Vulkan topology (index conversion: not yet)
+    case NVN_DRAW_PRIMITIVE_POLYGON: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;   // a convex polygon is a fan
+    case NVN_DRAW_PRIMITIVE_QUADS: case NVN_DRAW_PRIMITIVE_QUAD_STRIP: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;   // no Vulkan topology: indices made per draw (quad_indices)
+    default: return VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     }
 }
 static const VkBlendFactor k_bf[0x65] = {
@@ -679,8 +681,31 @@ static int bind_sets(const vks_prog *pr, VkPipelineBindPoint bp) {
     return 1;
 }
 
-// ---------------------------------------------------------------- a draw
 typedef struct { int prim; int indexed; uint32_t count, instances, first, base_instance; int32_t base_vertex; uint64_t ibuf; int itype; } draw_args;
+// Quads and quad strips as triangle lists: two triangles per quad, in the quad's winding (v0 v1 v2, v0 v2 v3; a strip's quad k is 2k, 2k+1, 2k+3, 2k+2).
+// The indices go into the ring as 32-bit; an indexed draw's own indices are read through them (restart indices end the strip there)
+static uint64_t g_quads;
+static int quad_indices(int prim, const draw_args *a, uint64_t *off, uint32_t *count) {
+    uint32_t nq = prim == NVN_DRAW_PRIMITIVE_QUADS ? a->count / 4 : (a->count >= 4 ? (a->count - 2) / 2 : 0);
+    if (!nq) return 0;
+    uint64_t o = ring_alloc((uint64_t)nq * 6 * 4); if (o == ~0ull) return -1;
+    uint32_t *dst = (uint32_t *)(RG.p + o);
+    uint32_t isz = !a->indexed ? 0 : a->itype == NVN_INDEX_TYPE_UNSIGNED_INT ? 4 : a->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 1;
+    const uint8_t *ib = a->indexed ? (const uint8_t *)(uintptr_t)a->ibuf : NULL;
+    #define QI(n) (ib ? (isz == 4 ? ((const uint32_t *)ib)[n] : isz == 2 ? ((const uint16_t *)ib)[n] : ib[n]) : a->first + (n))
+    for (uint32_t q = 0; q < nq; q++) {
+        uint32_t v0, v1, v2, v3;
+        if (prim == NVN_DRAW_PRIMITIVE_QUADS) { v0 = 4 * q; v1 = v0 + 1; v2 = v0 + 2; v3 = v0 + 3; }
+        else { v0 = 2 * q; v1 = v0 + 1; v2 = v0 + 3; v3 = v0 + 2; }
+        uint32_t *t = dst + 6 * q;
+        t[0] = QI(v0); t[1] = QI(v1); t[2] = QI(v2); t[3] = QI(v0); t[4] = QI(v2); t[5] = QI(v3);
+    }
+    #undef QI
+    *off = o; *count = nq * 6; g_quads++;
+    return 1;
+}
+
+// ---------------------------------------------------------------- a draw
 static void do_draw(const draw_args *a) {
     state_init();
     const vks_prog *pr = g_gfx_prog;
@@ -734,9 +759,17 @@ static void do_draw(const draw_args *a) {
         if (off == ~0ull) { g_skip[SK_RING]++; return; }
         vb_off[b] = off;
     }
-    // indices (8-bit ones widened to 16: Vulkan needs an extension for those)
+    // indices (8-bit ones widened to 16: Vulkan needs an extension for those; quads made into triangles)
     uint64_t ib_off = 0; VkIndexType it = VK_INDEX_TYPE_UINT16;
-    if (a->indexed) {
+    int quads = a->prim == NVN_DRAW_PRIMITIVE_QUADS || a->prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP;
+    uint32_t icount = a->count; int indexed = a->indexed;
+    if (quads) {
+        if (a->indexed && !a->ibuf) return;
+        int q = quad_indices(a->prim, a, &ib_off, &icount);
+        if (q < 0) { g_skip[SK_RING]++; return; }
+        if (!q) return;
+        it = VK_INDEX_TYPE_UINT32; indexed = 1;
+    } else if (a->indexed) {
         uint32_t isz = a->itype == NVN_INDEX_TYPE_UNSIGNED_INT ? 4 : a->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 1;
         if (!a->ibuf) return;
         if (isz == 1) {
@@ -765,7 +798,7 @@ static void do_draw(const draw_args *a) {
         vkCmdBindVertexBuffers_(g_cb, b, 1, &vb, &vo); nb++;
     }
     (void)vbufs; (void)voffs; (void)nb;
-    if (a->indexed) vkCmdBindIndexBuffer_(g_cb, RG.b, ib_off, it);
+    if (indexed) vkCmdBindIndexBuffer_(g_cb, RG.b, ib_off, it);
     // viewport 0 (NVN x, y, w, h; depth range from SetDepthRange); upper-left origin: negative height (see the top of this file)
     float vx = D.vp[0][0], vy = D.vp[0][1], vw = D.vp[0][2], vh = D.vp[0][3];
     if (vw <= 0 || vh <= 0) { vx = 0; vy = 0; vw = (float)P.w; vh = (float)P.h; }
@@ -789,7 +822,7 @@ static void do_draw(const draw_args *a) {
     vkCmdSetBlendConstants_(g_cb, D.blend_color);
     vkCmdSetDepthBias_(g_cb, D.po.units, D.po.clamp, D.po.factor);
     uint32_t inst = a->instances ? a->instances : 1;
-    if (a->indexed) vkCmdDrawIndexed_(g_cb, a->count, inst, 0, a->base_vertex, a->base_instance);
+    if (indexed) vkCmdDrawIndexed_(g_cb, icount, inst, 0, quads && !a->indexed ? 0 : a->base_vertex, a->base_instance);
     else vkCmdDraw_(g_cb, a->count, inst, a->first, a->base_instance);
     g_drawn++; g_cb_ops++;
 }
@@ -861,7 +894,7 @@ static void draw_submitted(void) {
     g_dp_cur = 0;
 }
 static void draw_summary(char *out, size_t n) {
-    int o = snprintf(out, n, "drawn %llu, dispatched %llu, pipelines %llu, textures uploaded %llu (%.0f MB, %llu failed)", (unsigned long long)g_drawn, (unsigned long long)g_disp_done,
+    int o = snprintf(out, n, "drawn %llu (%llu of them quads), dispatched %llu, pipelines %llu, textures uploaded %llu (%.0f MB, %llu failed)", (unsigned long long)g_drawn, (unsigned long long)g_quads, (unsigned long long)g_disp_done,
                      (unsigned long long)g_pipes, (unsigned long long)g_up_tex, g_up_bytes / 1048576.0, (unsigned long long)g_up_fail);
     for (int i = 0; i < SK_N && o < (int)n; i++) if (g_skip[i]) o += snprintf(out + o, n - o, "; skipped (%s) %llu", k_sk[i], (unsigned long long)g_skip[i]);
     if (g_tex_missing && o < (int)n) o += snprintf(out + o, n - o, "; texture bindings without a usable view %llu", (unsigned long long)g_tex_missing);
