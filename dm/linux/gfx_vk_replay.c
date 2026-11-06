@@ -421,10 +421,10 @@ void mtl_drain(void) {}
 void mtl_finish(void) {}
 
 // The image to show for a present (gfx_null.c mtl_present): the swapchain texture's VkImage, or none (stage A's colour) while nothing has written it
-int vk_present_image(const tex_t *t, VkImage *img, uint32_t *w, uint32_t *h) {
+int vk_present_image(const tex_t *t, VkImage *img, uint32_t *w, uint32_t *h, int *srgb) {
     if (!t || !VK.ok) return 0;
     pthread_mutex_lock(&g_tex_mu); vtex *v = tex_slot(t->serial, 0); int ok = v && v->img && (v->bad & 2);
-    if (ok) { *img = v->img; *w = v->w; *h = v->h; }
+    if (ok) { *img = v->img; *w = v->w; *h = v->h; *srgb = v->fmt == VK_FORMAT_R8G8B8A8_SRGB || v->fmt == VK_FORMAT_B8G8R8A8_SRGB || v->fmt == VK_FORMAT_A8B8G8R8_SRGB_PACK32; }
     pthread_mutex_unlock(&g_tex_mu);
     return ok;
 }

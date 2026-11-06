@@ -18,9 +18,10 @@ static uint64_t g_shown_until, g_first_ns, g_last_present_ns;
 static double g_times[64];
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (vkw_wanted()) {
-        int vk_present_image(const tex_t *t, VkImage *img, uint32_t *w, uint32_t *h);
-        VkImage img = VK_NULL_HANDLE; uint32_t w = 0, h = 0;
-        if (!vk_present_image(t, &img, &w, &h)) img = VK_NULL_HANDLE;
+        int vk_present_image(const tex_t *t, VkImage *img, uint32_t *w, uint32_t *h, int *srgb);
+        VkImage img = VK_NULL_HANDLE; uint32_t w = 0, h = 0; int srgb = 0;
+        if (!vk_present_image(t, &img, &w, &h, &srgb)) img = VK_NULL_HANDLE;
+        else vkw_image_srgb(srgb);
         vkw_present(atomic_load(&g_presents) + 1, img, w, h, crop);
     }   // the window's FIFO swapchain paces the game (the display's vsync), as the Switch's display does
     int win = vkw_active();

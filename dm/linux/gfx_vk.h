@@ -43,6 +43,9 @@ int vkw_active(void);           // the window and device are up
 int vkw_init(void);             // make the window and device now (any thread; once); 1 when up
 // Show present number n: the game's image (VK_IMAGE_LAYOUT_GENERAL, its extent w x h, crop x, y, w, h or NULL) scaled into the window, or stage A's colour when img is null
 void vkw_present(uint64_t n, VkImage img, uint32_t w, uint32_t h, const int crop[4]);
+// The game's image is sRGB-encoded (RGBA8_SRGB, Mario Tennis Fever's swapchain): the window's swapchain takes the same encoding, so the blit that copies it decodes and encodes
+// again and the colours arrive unchanged (an sRGB image blitted into a UNORM swapchain is decoded once and shown too dark and saturated)
+void vkw_image_srgb(int srgb);
 uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want);   // a memory type index of those bits with the properties, or ~0u
 
 // Stage C, shaders (gfx_vk_shader.c): the game's shaders translated to SPIR-V, from the pack dm/linux/tools/spv_pack.py writes (DM_SHADERS = its path)

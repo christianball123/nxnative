@@ -82,7 +82,7 @@ static struct {
     VkSurfaceKHR surf;
     VkSwapchainKHR sc; VkFormat fmt; VkExtent2D ext; uint32_t nimg; VkImage img[SWAP_MAX];
     VkSemaphore acquired[SWAP_MAX], done[SWAP_MAX]; VkCommandPool pool; VkCommandBuffer cb[SWAP_MAX]; VkFence fence[SWAP_MAX]; uint32_t slot;
-    int ok, failed, resized; uint64_t frames; double t0; char devname[256]; int ext_host_mem, ext_push, ext_dcc;
+    int ok, failed, resized; uint64_t frames; double t0; char devname[256]; int ext_host_mem, ext_push, ext_dcc; int want_srgb, srgb;
 } W;
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
@@ -96,6 +96,8 @@ static int swapchain_make(void) {
     VkSurfaceFormatKHR f[64]; if (n > 64) n = 64; vkGetPhysicalDeviceSurfaceFormatsKHR_(VK.phys, W.surf, &n, f);
     VkSurfaceFormatKHR pick = f[0];
     for (uint32_t i = 0; i < n; i++) if (f[i].format == VK_FORMAT_B8G8R8A8_UNORM || f[i].format == VK_FORMAT_R8G8B8A8_UNORM) { pick = f[i]; break; }
+    if (W.want_srgb) for (uint32_t i = 0; i < n; i++) if (f[i].format == VK_FORMAT_B8G8R8A8_SRGB || f[i].format == VK_FORMAT_R8G8B8A8_SRGB) { pick = f[i]; break; }
+    W.srgb = pick.format == VK_FORMAT_B8G8R8A8_SRGB || pick.format == VK_FORMAT_R8G8B8A8_SRGB;
     uint32_t count = cap.minImageCount + 1; if (cap.maxImageCount && count > cap.maxImageCount) count = cap.maxImageCount; if (count > SWAP_MAX) count = SWAP_MAX;
     VkSwapchainKHR old = W.sc;
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, NULL, 0, W.surf, count, pick.format, pick.colorSpace, e, 1,
@@ -106,7 +108,7 @@ static int swapchain_make(void) {
     if (old) { vkDeviceWaitIdle_(VK.dev); vkDestroySwapchainKHR_(VK.dev, old, NULL); }
     if (r) { LOG("[RED] [vk] vkCreateSwapchainKHR %dx%d failed (%d)", e.width, e.height, r); W.sc = VK_NULL_HANDLE; return 0; }
     W.fmt = pick.format; W.ext = e; W.nimg = SWAP_MAX; vkGetSwapchainImagesKHR_(VK.dev, W.sc, &W.nimg, W.img);
-    LOG("[vk] swapchain %ux%u, %u images, format %d, FIFO (vsync)", e.width, e.height, W.nimg, pick.format);
+    LOG("[vk] swapchain %ux%u, %u images, format %d%s, FIFO (vsync)", e.width, e.height, W.nimg, pick.format, W.srgb ? " (sRGB, as the game's image)" : "");
     return 1;
 }
 
@@ -342,6 +344,7 @@ uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want) {
     return ~0u;
 }
 int vkw_active(void) { return W.ok; }
+void vkw_image_srgb(int srgb) { if (W.want_srgb != srgb) { W.want_srgb = srgb; if (W.ok) W.resized = 1; } }   // the swapchain is made again with the encoding at the next present
 int vkw_wanted(void) { const char *w = getenv("DM_WINDOW"); return w && *w && *w != '0'; }
 int vkw_init(void) {
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
