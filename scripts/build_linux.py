@@ -247,12 +247,23 @@ echo "=== $(date) play.sh in: $( [ -f /run/.containerenv ] && echo container || 
 if [ -f /.flatpak-info ]; then   # Steam from Flathub: out of its sandbox first (needs: flatpak override --user --talk-name=org.freedesktop.Flatpak com.valvesoftware.Steam)
     exec flatpak-spawn --host "$here/play.sh" "$@"
 fi
+# Steam gives a game its controller layout only while the window in front belongs to a process it started: the game runs straight on the host when the host has
+# what it loads (SDL3, the Vulkan loader; the GPU driver is the system's), and goes through the toolbox only when not (DM_TOOLBOX=1 forces it)
 if [ ! -f /run/.containerenv ] && [ -n "{box}" ]; then
-    # Steam's own environment (its runtime's libraries, the overlay) does not belong in the toolbox
-    unset LD_PRELOAD LD_LIBRARY_PATH
-    tb="$(command -v toolbox || echo /usr/bin/toolbox)"
-    echo "entering toolbox {box} with $tb"
-    exec "$tb" run -c "{box}" "$here/play.sh" "$@"
+    need_box="${{DM_TOOLBOX:-0}}"
+    if [ "$need_box" != 1 ]; then
+        for lib in libSDL3.so.0 libvulkan.so.1; do
+            if ! ldconfig -p 2>/dev/null | grep -q "$lib"; then echo "the host has no $lib: through the toolbox"; need_box=1; fi
+        done
+        if [ "$need_box" != 1 ] && ldd "$here/dmhost" 2>&1 | grep -q "not found\|version .* not found"; then echo "dmhost does not load on the host: through the toolbox"; ldd "$here/dmhost"; need_box=1; fi
+    fi
+    if [ "$need_box" = 1 ]; then
+        unset LD_PRELOAD LD_LIBRARY_PATH   # Steam's own environment does not belong in the toolbox
+        tb="$(command -v toolbox || echo /usr/bin/toolbox)"
+        echo "entering toolbox {box} with $tb"
+        exec "$tb" run -c "{box}" "$here/play.sh" "$@"
+    fi
+    echo "running on the host"
 fi
 cd "$here"
 export DM_WINDOW=1 DM_FULLSCREEN="${{DM_FULLSCREEN:-1}}"
