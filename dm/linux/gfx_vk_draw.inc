@@ -462,6 +462,11 @@ static int pass_begin(void) {
         vtex *v = prep_tex(t); if (!v || fmt_depth(v->fmt)) continue;
         uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.cview[i], R.rt.has_cview[i], &lv, &nl, &l0, &nlay);
         VkFormat vf = tex_view_fmt2(v, t, &R.rt.cview[i], R.rt.has_cview[i]);
+        if (R.rt.has_cview[i] && R.rt.cview[i].set_format) {   // which targets a game draws through a view of another format (logged once per texture and format, up to 40)
+            static uint64_t seen[40]; static int ns; uint64_t k = t->serial << 16 | R.rt.cview[i].format; int j = 0; while (j < ns && seen[j] != k) j++;
+            if (j == ns && ns < 40) { seen[ns++] = k; LOG("[vk] render target serial %llu (NVN format %#x, %ux%u) drawn through a view of NVN format %#x: Vulkan format %d (image format %d)",
+                (unsigned long long)t->serial, t->d.format, t->d.width, t->d.height, R.rt.cview[i].format, vf, v->fmt); }
+        }
         VkImageView iv = view_get_fmt(v, vf, v->is3d ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, v->is3d ? 0 : l0, 1, (VkComponentMapping){0, 0, 0, 0}, VK_IMAGE_ASPECT_COLOR_BIT, 2);
         if (!iv) continue;
         gpu_wrote(v); ca[i].imageView = iv; P.cf[i] = vf; P.cser[i] = t->serial; P.cvf[i] = vf; any = 1; P.cv[i] = v; P.clv[i] = lv; P.cl0[i] = v->is3d ? 0 : l0;
