@@ -689,6 +689,35 @@ static uint32_t handle_of(int st, const vks_bind *b, int *ok) {
 }
 typedef struct { VkWriteDescriptorSet w[256]; VkDescriptorBufferInfo bi[512]; VkDescriptorImageInfo ii[512]; VkBufferView tv[512]; uint32_t nw, nbi, nii, ntv; } wset;
 static wset g_ws;
+
+// Texture buffers (NVN_TEXTURE_TARGET_BUFFER): the texture's storage (width texels of its format) copied into the ring like a uniform buffer, and a buffer view of
+// the format over it, made for this submission (draw_submitted destroys them). Written ones (shader images of buffer textures) are copied back with the submission
+static VkBufferView *g_tbv; static int g_ntbv, g_ctbv; static uint64_t g_tbuf_n, g_tbuf_miss;
+static VkBufferView tbuf_view(int st, const vks_bind *b, int storage) {
+    int ok = 0; uint32_t h = handle_of(st, b, &ok);
+    if (!ok) { g_tex_unres++; return VK_NULL_HANDLE; }
+    const treg *r = storage ? ireg_get((int)(h & 0xfffff)) : treg_get((int)(h & 0xfffff));
+    if (!r || r->t.d.target != NVN_TEXTURE_TARGET_BUFFER || !r->t.mem) { g_tbuf_miss++; return VK_NULL_HANDLE; }
+    VkFormat f = tex_vkfmt(&r->t); int bw, bh, bpb = nvn_fmt_bpb(r->t.d.format, &bw, &bh);
+    if (!f || bpb <= 0) { g_tbuf_miss++; return VK_NULL_HANDLE; }
+    static uint8_t okc[256], okv[256];   // the format's texel buffer support, asked once
+    if (f < 256 && !okc[f]) { okc[f] = 1; VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties_(VK.phys, f, &fp);
+        okv[f] = (fp.bufferFeatures & VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT ? 1 : 0) | (fp.bufferFeatures & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT ? 2 : 0);
+        if (!(okv[f] & 1)) LOG("[RED] [vk] format %d (NVN %#x) cannot be a texture buffer on this GPU: those read zero", f, r->t.d.format); }
+    if (f >= 256 || !(okv[f] & (storage ? 2 : 1))) { g_tbuf_miss++; return VK_NULL_HANDLE; }
+    uint64_t elems = r->t.d.width ? r->t.d.width : 1;
+    if (elems > VK.limits.maxTexelBufferElements) elems = VK.limits.maxTexelBufferElements;
+    uint64_t size = elems * (uint64_t)bpb;
+    uint64_t off = ring_put((uint64_t)(uintptr_t)r->t.mem, size); if (off == ~0ull) return (VkBufferView)(uintptr_t)~0ull;
+    if (storage) wb_add((uint64_t)(uintptr_t)r->t.mem, size, off);
+    VkBufferViewCreateInfo bv = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, NULL, 0, RG.b, f, off, size};
+    VkBufferView view = VK_NULL_HANDLE;
+    if (vkCreateBufferView_(VK.dev, &bv, NULL, &view)) { g_tbuf_miss++; return VK_NULL_HANDLE; }
+    if (g_ntbv == g_ctbv) { g_ctbv = g_ctbv ? 2 * g_ctbv : 256; g_tbv = realloc(g_tbv, g_ctbv * sizeof *g_tbv); }
+    g_tbv[g_ntbv++] = view; g_tbuf_n++;
+    static int once; if (!once++) LOG("[vk] texture buffers: on (first: NVN format %#x, %llu texels)", r->t.d.format, (unsigned long long)elems);
+    return view;
+}
 static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
     wset *W = &g_ws; W->nw = W->nbi = W->nii = W->ntv = 0;
     for (int i = 0; i < s->nb && W->nw < 256; i++) {
@@ -721,10 +750,12 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
             for (uint32_t k = 0; k < n; k++) bi[k] = off != ~0ull ? (VkDescriptorBufferInfo){RG.b, off, size} : (VkDescriptorBufferInfo){DZ.zbuf, 0, 65536};
             break;
         }
-        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {   // texture buffers: not yet (zero texels)
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {   // texture buffers: the guest's bytes in the ring, seen through a buffer view
             if (W->ntv + n > 512) return 0;
             VkBufferView *tv = &W->tv[W->ntv]; W->ntv += n; w->pTexelBufferView = tv;
-            for (uint32_t k = 0; k < n; k++) tv[k] = DZ.ztb;
+            VkBufferView view = tbuf_view(st, b, b->vktype == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER);
+            if (view == (VkBufferView)(uintptr_t)~0ull) return -1;   // the ring is full
+            for (uint32_t k = 0; k < n; k++) tv[k] = view ? view : DZ.ztb;
             break;
         }
         default: {   // samplers, sampled images, combined image samplers, storage images
@@ -1169,6 +1200,8 @@ static void draw_submitted(void) {
     RG.used = 0; DZ.support_off = 0;
     if (g_nrh_used) { memset(g_rh, 0, sizeof g_rh); g_nrh_used = 0; }
     for (int i = 0; i < g_ndp; i++) vkResetDescriptorPool_(VK.dev, g_dp[i], 0);
+    for (int i = 0; i < g_ntbv; i++) vkDestroyBufferView_(VK.dev, g_tbv[i], NULL);
+    g_ntbv = 0;
     g_dp_cur = 0;
 }
 static void draw_summary(char *out, size_t n) {
@@ -1178,6 +1211,7 @@ static void draw_summary(char *out, size_t n) {
     if (g_tex_missing && o < (int)n) o += snprintf(out + o, n - o, "; texture bindings without a usable view %llu", (unsigned long long)g_tex_missing);
     if (g_storage_unsup && o < (int)n) o += snprintf(out + o, n - o, "; shader images in a format that cannot be written %llu", (unsigned long long)g_storage_unsup);
     if (g_tex_unreg && o < (int)n) o += snprintf(out + o, n - o, "; bound texture IDs not registered %llu", (unsigned long long)g_tex_unreg);
+    if ((g_tbuf_n || g_tbuf_miss) && o < (int)n) o += snprintf(out + o, n - o, "; texture buffers bound %llu, unusable %llu", (unsigned long long)g_tbuf_n, (unsigned long long)g_tbuf_miss);
     if (g_tex_unres && o < (int)n) o += snprintf(out + o, n - o, "; texture handles not decoded %llu", (unsigned long long)g_tex_unres);
     if (g_unsup_sbuf_ubo && o < (int)n) snprintf(out + o, n - o, "; storage buffers addressed through uniforms (not bound) %llu", (unsigned long long)g_unsup_sbuf_ubo);
 }
