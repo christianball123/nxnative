@@ -160,14 +160,18 @@ def main():
         if host_built: return
         run(['make', '-C', REPO / 'dm/linux', f'GAME={tid}', f'-j{a.jobs}'] + ([] if platform.machine() in ('aarch64', 'arm64') else ['CROSS=1']), env=env)
         shutil.copy2(REPO / 'dm/linux/build' / tid / 'dmhost', lw / 'dmhost'); host_built = True
-    for d in ('save', 'temp'): (lw / 'run' / d).mkdir(parents=True, exist_ok=True)
+    # Saves and the game's temporary files live on the internal storage: their files carry their guest name in an extended attribute and a save commits by an atomic
+    # directory swap (renameat2 RENAME_EXCHANGE), which exFAT / FAT SD cards and USB drives do not support (the game aborts when its save cannot be created)
+    run_dir = Path(os.environ.get('DM_RUN_DIR') or Path.home() / '.local/share/nxnative' / tid)
+    for d in ('save', 'temp'): (run_dir / d).mkdir(parents=True, exist_ok=True)
+    say(f'saves: {run_dir / "save"}')
     missing = nro_dir / 'missing.tsv'
     want = dict(l.split('\t')[:2] for l in missing.read_text().splitlines() if l) if missing.is_file() else {}
     if want and platform.machine() in ('aarch64', 'arm64'):
         build_host()
         cap = nro_dir / 'capture'; shutil.rmtree(cap, ignore_errors=True); cap.mkdir(parents=True)
         say(f'{len(want)} NRO(s) the game registers are in no file: booting it once to catch what it decodes (up to 2 minutes)')
-        henv = dict(env, DM_ROMFS=str(romfs), DM_SAVE=str(lw / 'run/save'), DM_TEMP=str(lw / 'run/temp'), DM_ROOT=str(lw / 'run'), DM_NRO_CAPTURE=str(cap))
+        henv = dict(env, DM_ROMFS=str(romfs), DM_SAVE=str(run_dir / 'save'), DM_TEMP=str(run_dir / 'temp'), DM_ROOT=str(run_dir), DM_NRO_CAPTURE=str(cap))
         if (patched / 'nro.tsv').exists(): (patched / 'nro.tsv').unlink()
         with open(lw / 'nro_capture.log', 'w') as logf:
             p = subprocess.Popen([str(lw / 'dmhost'), str(patched)], env=henv, stdout=logf, stderr=subprocess.STDOUT)
@@ -221,7 +225,7 @@ def main():
 # Runs {tid} v{ver} with the null graphics device (headless). The log goes to the screen and to log.txt beside this script.
 # Ctrl+C stops it. DM_TIME_LIMIT=<seconds> stops it by itself.
 cd "$(dirname "$0")"
-export DM_ROOT="{lw}/run" DM_ROMFS="{ext / 'RomFS.img'}" DM_SAVE="{lw}/run/save" DM_TEMP="{lw}/run/temp" DM_FONT_DIR="{lw}/font"
+export DM_ROOT="{run_dir}" DM_ROMFS="{ext / 'RomFS.img'}" DM_SAVE="{run_dir}/save" DM_TEMP="{run_dir}/temp" DM_FONT_DIR="{lw}/font"
 export DM_AUDIO="${{DM_AUDIO:-1}}"   # sound through SDL3 (DM_AUDIO=0: silent)
 {f'export DM_SHADERS="{lw / "shaders.dmsp"}"   # the translated shaders (stage C)' if (lw / 'shaders.dmsp').is_file() else '# no shader pack yet (build with --shaders)'}
 {f'export DM_AOC_DIR="{aoc}"' if aoc.is_dir() and any(aoc.iterdir()) else '# no DLC'}
