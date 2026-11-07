@@ -88,7 +88,7 @@ static void wb_add(uint64_t addr, uint64_t size, uint64_t off) {
 #define FW_SIZE (16ull << 20)
 static struct { VkBuffer b; VkDeviceMemory m; uint64_t used; uint32_t epoch; int failed; } FW;
 typedef struct { uint64_t addr, size, off; } fwent;
-static fwent g_fw[1024]; static int g_nfw; static uint64_t g_fwd_n, g_fwd_miss;
+static fwent g_fw[1024]; static int g_nfw; static uint64_t g_fwd_n, g_fwd_miss, g_fwd_post;
 static int fw_init(void) {
     if (FW.b) return 1;
     if (FW.failed) return 0;
@@ -111,12 +111,19 @@ static int64_t fw_slot(uint64_t addr, uint64_t size) {   // the forwarding buffe
 }
 static void fw_copy_out(void) {   // at the submission's end (no pass open): its write-backs into the forwarding buffer
     static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_FORWARD"); on = !(e && *e == '0'); }
-    if (!on || !g_nwb || !fw_init()) return;
+    int any = g_nwb; for (int i = 0; i < g_nstage && !any; i++) any = g_stage[i].orig != NULL;
+    if (!on || !any || !fw_init()) return;
     full_barrier();
     for (int i = 0; i < g_nwb; i++) {
         wback *w = &g_wb[i]; int64_t o = fw_slot(w->addr, w->size); if (o < 0) continue;
         VkBufferCopy bc = {w->off, (uint64_t)o, w->size}; vkCmdCopyBuffer_(g_cb, RG.b, FW.b, 1, &bc);
         w->fwo = o; w->fw_epoch = FW.epoch;
+    }
+    for (int i = 0; i < g_nstage; i++) {   // packed texture-to-buffer copies (their staging buffer holds the bytes as the guest will)
+        stage_t *st = &g_stage[i]; if (!st->rb_dst || !st->orig) continue;
+        uint64_t n = (st->rb_rows - 1) * st->rb_row + st->rb_n; int64_t o = fw_slot((uint64_t)(uintptr_t)st->rb_dst, n); if (o < 0) continue;
+        VkBufferCopy bc = {0, (uint64_t)o, n}; vkCmdCopyBuffer_(g_cb, st->b, FW.b, 1, &bc);
+        st->fwo = o; st->fw_epoch = FW.epoch;
     }
 }
 static void wb_land(const wback *w) {   // on the completion thread

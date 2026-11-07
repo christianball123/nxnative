@@ -293,7 +293,7 @@ typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t ad
 static post_op *g_post; static int g_npost, g_postcap;
 static struct { p_set_rt rt; int has_rt; int64_t copy_stride, copy_img_stride; } R;
 // Staging buffers of this submission (texture uploads and readbacks), freed at commit; readbacks copy into guest memory after the GPU finishes
-typedef struct { VkBuffer b; VkDeviceMemory m; void *p; uint64_t n; uint8_t *rb_dst; size_t rb_row, rb_src_row, rb_rows, rb_n; int dump_fmt, lin_rb; uint32_t dw, dh; char dump_name[160]; } stage_t;
+typedef struct { VkBuffer b; VkDeviceMemory m; void *p; uint64_t n; uint8_t *rb_dst; size_t rb_row, rb_src_row, rb_rows, rb_n; int dump_fmt, lin_rb; uint32_t dw, dh; char dump_name[160]; uint8_t *orig; int64_t fwo; uint32_t fw_epoch; } stage_t;   // orig, fwo: forwarding (gfx_vk_draw.inc)
 static void dump_write(const stage_t *s);   // gfx_vk_draw.inc: a frame dump's image (DM debug: L3 + R3 or F12)
 static stage_t *g_stage; static int g_nstage, g_stagecap;
 
@@ -412,7 +412,8 @@ static void copy_t2b(const p_copy_t2t *c) {   // T2B reuses p_copy_t2t: src hold
         }
     }
     stage_t *s = stage_new(wb * rows); if (!s) return;
-    s->rb_dst = (uint8_t *)(uintptr_t)dst; s->rb_row = row; s->rb_src_row = wb; s->rb_rows = rows; s->rb_n = wb;
+    s->rb_dst = (uint8_t *)(uintptr_t)dst; s->rb_row = row; s->rb_src_row = wb; s->rb_rows = rows; s->rb_n = wb; s->fwo = -1;
+    if (row == wb && (s->orig = malloc(wb * rows))) memcpy(s->orig, s->rb_dst, wb * rows);   // packed: a later submission may get it forwarded on the GPU
     VkBufferImageCopy bic = {0, 0, 0, {fmt_aspects(v->fmt) & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT), lv, v->is3d ? 0 : l0 + (uint32_t)r->zoffset, 1},
                              {r->xoffset, r->yoffset, v->is3d ? r->zoffset : 0}, {(uint32_t)r->width, (uint32_t)r->height, 1}};
     if (!bic.imageSubresource.aspectMask) bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -611,7 +612,7 @@ static void *cm_thread(void *u) {
 static void slot_clean(subslot *s) {
     if (!s->dirty) return;
     s->dirty = 0;
-    for (int i = 0; i < s->nstage; i++) { stage_t *st = &s->stage[i]; vkUnmapMemory_(VK.dev, st->m); vkDestroyBuffer_(VK.dev, st->b, NULL); vkFreeMemory_(VK.dev, st->m, NULL); }
+    for (int i = 0; i < s->nstage; i++) { stage_t *st = &s->stage[i]; vkUnmapMemory_(VK.dev, st->m); vkDestroyBuffer_(VK.dev, st->b, NULL); vkFreeMemory_(VK.dev, st->m, NULL); free(st->orig); }
     s->nstage = 0;
     if (s->nlw) {
         pthread_mutex_lock(&g_tex_mu);
@@ -640,22 +641,42 @@ static subslot *slot_free(void) {
 // copied to the forwarding buffer at its end. When the guest's bytes are still those it recorded (the CPU has not written them since), a GPU copy before this submission
 // puts the result in the ring and nothing waits. 0: not forwarded (the caller waits as before)
 static int fwd_try(uint64_t addr, uint64_t size, uint64_t ring_off) {
-    const wback *best = NULL; uint64_t best_id = 0;
+    // what the submissions in flight write into these bytes: a storage write-back or a packed texture-to-buffer copy holding all of them (the newest), and counters or events
+    VkBuffer src = VK_NULL_HANDLE; uint64_t src_off = 0, src_id = 0; int posts = 0;
     for (int s = 0; s < NSUB - 1; s++) {
         if (!atomic_load_explicit(&g_pr[s].busy, memory_order_acquire) || addr >= g_pr[s].hi || addr + size <= g_pr[s].lo) continue;
-        subslot *sl = &g_sl[s]; int hit = 0;
-        for (int i = 0; i < sl->nwb; i++) {
-            const wback *w = &sl->wb[i];
-            if (addr < w->addr + w->size && w->addr < addr + size) {
-                hit = 1;
-                if (w->addr <= addr && addr + size <= w->addr + w->size && w->fwo >= 0 && w->orig && (!best || sl->id > best_id)) { best = w; best_id = sl->id; }
+        subslot *sl = &g_sl[s];
+        #define FW_HOLD(A, N, FWO, EP, ORIG) do { uint64_t a_ = (A), n_ = (N); if (addr >= a_ + n_ || a_ >= addr + size) break; \
+            if (!(a_ <= addr && addr + size <= a_ + n_) || (FWO) < 0 || (EP) != FW.epoch || !(ORIG)) { g_fwd_miss++; return 0; } \
+            if (memcmp((const void *)(uintptr_t)addr, (ORIG) + (addr - a_), size)) { g_fwd_miss++; return 0; }   /* the CPU wrote them since: its bytes are the newer ones */ \
+            if (!src || sl->id > src_id) { src = FW.b; src_off = (uint64_t)(FWO) + (addr - a_); src_id = sl->id; } } while (0)
+        for (int i = 0; i < sl->nwb; i++) FW_HOLD(sl->wb[i].addr, sl->wb[i].size, sl->wb[i].fwo, sl->wb[i].fw_epoch, sl->wb[i].orig);
+        for (int i = 0; i < sl->nstage; i++) { stage_t *st = &sl->stage[i]; if (st->rb_dst) FW_HOLD((uint64_t)(uintptr_t)st->rb_dst, (st->rb_rows - 1) * st->rb_row + st->rb_n, st->fwo, st->fw_epoch, st->orig); }
+        #undef FW_HOLD
+        for (int i = 0; i < sl->npost; i++) {
+            const post_op *o = &sl->post[i]; uint64_t a_ = o->kind == 1 ? (uint64_t)(uintptr_t)o->val : o->addr, n_ = o->kind == 1 ? 4 : 16;
+            if (addr < a_ + n_ && a_ < addr + size) { if (o->kind == 1 && o->mode == 1) return 0; posts = 1; }   // an event add waits (it would count twice)
+        }
+    }
+    if (src && posts) return 0;
+    if (posts) {   // counters and events: their values are known now (as when a sync is done early): written into guest memory, the ring copy takes them
+        pthread_mutex_lock(&g_cm_mu);
+        uint64_t now = gpu_ticks();
+        for (int s = 0; s < NSUB - 1; s++) {
+            subslot *sl = &g_sl[s]; if (!atomic_load(&g_pr[s].busy)) continue;
+            for (int i = 0; i < sl->npost; i++) {
+                post_op *o = &sl->post[i]; uint64_t a_ = o->kind == 1 ? (uint64_t)(uintptr_t)o->val : o->addr, n_ = o->kind == 1 ? 4 : 16;
+                if (!(addr < a_ + n_ && a_ < addr + size)) continue;
+                if (o->kind == 1) { dm_guest_write_prepare((void *)o->val, 4); *o->val = o->v; }
+                else { uint64_t rec[2] = {o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1 : (o->type == 0 || o->type == 0x10) && !DM_GAME_RENDER_COND ? now : 0, now};
+                       dm_guest_write_prepare((void *)(uintptr_t)o->addr, sizeof rec); memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec); }
             }
         }
-        if (!hit) return 0;   // a read-back or a counter in flight writes these bytes: waited for
-        for (int i = 0; i < sl->nstage; i++) if (sl->stage[i].rb_dst && addr < (uint64_t)(uintptr_t)sl->stage[i].rb_dst + (sl->stage[i].rb_rows - 1) * sl->stage[i].rb_row + sl->stage[i].rb_n && (uint64_t)(uintptr_t)sl->stage[i].rb_dst < addr + size) return 0;
+        pthread_mutex_unlock(&g_cm_mu);
+        g_fwd_post++;
+        return 1;
     }
-    if (!best || best->fw_epoch != FW.epoch) { if (best) g_fwd_miss++; return 0; }
-    if (memcmp((const void *)(uintptr_t)addr, best->orig + (addr - best->addr), size)) { g_fwd_miss++; return 0; }   // the CPU wrote them since: its bytes are the newer ones
+    if (!src) return 0;
     if (!g_pre_open) {
         if (!g_pre) { VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, g_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1}; if (vkAllocateCommandBuffers_(VK.dev, &cai, &g_pre)) { g_pre = VK_NULL_HANDLE; return 0; } }
         vkResetCommandBuffer_(g_pre, 0);
@@ -664,7 +685,7 @@ static int fwd_try(uint64_t addr, uint64_t size, uint64_t ring_off) {
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT};
         vkCmdPipelineBarrier_(g_pre, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
-    VkBufferCopy bc = {(uint64_t)best->fwo + (addr - best->addr), ring_off, size}; vkCmdCopyBuffer_(g_pre, FW.b, RG.b, 1, &bc);
+    VkBufferCopy bc = {src_off, ring_off, size}; vkCmdCopyBuffer_(g_pre, src, RG.b, 1, &bc);
     static int said; g_fwd_n++; if (!said++) LOG("[vk] first storage result forwarded on the GPU (%llu bytes at %#llx)", (unsigned long long)size, (unsigned long long)addr);
     return 1;
 }
@@ -794,7 +815,8 @@ static uint64_t sub_commit_locked(int force) {
         if (g_hz[0].line) { char hb[400]; int o = 0; for (int i = 0; i < 16 && g_hz[i].line && o < 380; i++) o += snprintf(hb + o, sizeof hb - o, "%s%s:%d: %llu waits, %.1f ms, %llu bytes read each", i ? "; " : "", strrchr(g_hz[i].file, '/') ? strrchr(g_hz[i].file, '/') + 1 : g_hz[i].file, g_hz[i].line,
                 (unsigned long long)g_hz[i].n, g_hz[i].ns / 1e6, (unsigned long long)(g_hz[i].bytes / g_hz[i].n));
             LOG("[vk] waits for a write-back in flight, by where the bytes are read: %s", hb); memset(g_hz, 0, sizeof g_hz); }
-        if (g_fwd_n || g_fwd_miss) { LOG("[vk] storage results forwarded on the GPU %llu times (%llu could not be: the CPU had written them, or the forwarding buffer had moved on)", (unsigned long long)g_fwd_n, (unsigned long long)g_fwd_miss); g_fwd_n = g_fwd_miss = 0; }
+        if (g_fwd_n || g_fwd_miss || g_fwd_post) { LOG("[vk] results in flight forwarded: on the GPU %llu times, counters and events written at once %llu times; %llu could not be (the CPU had written them, partly covered, or the forwarding buffer had moved on)",
+            (unsigned long long)g_fwd_n, (unsigned long long)g_fwd_post, (unsigned long long)g_fwd_miss); g_fwd_n = g_fwd_miss = g_fwd_post = 0; }
         g_t_rec = g_t_submit = g_t_wait = g_t_done = g_t_n = g_t_gpu = 0; g_hazard_waits = 0;
         prof_report();
     }
