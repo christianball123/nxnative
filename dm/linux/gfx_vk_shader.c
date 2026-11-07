@@ -41,7 +41,7 @@ static int entry_of(uint64_t key, vks_shader *s) {
             if ((uint64_t)e.off + e.len > g_pack_len || e.len < 12) return 0;
             const uint8_t *p = g_pack + e.off;
             s->gsm = NULL; s->ngsm = 0;   // (the caller's struct is not zeroed: a shader without a mask program has none)
-            s->key = key; s->model = p[0]; s->nb = p[1]; s->nvin = p[2]; s->fout = p[3]; memcpy(s->local, p + 4, 6); memcpy(&s->c1_len, p + 10, 2);
+            s->key = key; s->model = p[0]; s->nb = p[1]; s->nvin = p[2] & 0x7f; s->c1_pad = p[2] >> 7; s->fout = p[3]; memcpy(s->local, p + 4, 6); memcpy(&s->c1_len, p + 10, 2);
             s->b = (const vks_bind *)(p + 12); s->vin = p + 12 + sizeof(vks_bind) * s->nb; s->c1 = s->vin + 2 * s->nvin;
             uint32_t h = 12 + sizeof(vks_bind) * s->nb + 2 * s->nvin + s->c1_len; h += -h & 3;
             if (s->model == 3 && s->local[0] == 1 && s->local[1]) { s->gsm = (const uint32_t *)(p + h); s->ngsm = s->local[1]; h += 4 * s->ngsm; }   // the mask program after c1

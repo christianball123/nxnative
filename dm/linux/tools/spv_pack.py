@@ -154,11 +154,19 @@ def entry(spv_path, res_path, job_path=None):
     res = json.load(open(res_path)) if os.path.exists(res_path) else {}
     try: c1 = bytes.fromhex(json.load(open(job_path)).get('c1') or '') if job_path and os.path.exists(job_path) else b''
     except ValueError: c1 = b''
-    out = bytearray(struct.pack('<BBBB3HH', model, len(binds), len(vin), fout & 0xff, *[min(x, 0xffff) for x in local], len(c1)))
+    # A driver constant bank (c1) of 64 KB (NVN2 games, Ocarina of Time) does not fit the u16 length: its trailing zeros are dropped and bit 7 of the vertex input
+    # count says so (the host binds 64 KB, zero past the stored bytes: gfx_vk_draw.inc c1_put)
+    c1_pad = 0
+    if len(c1) > 0xffff:
+        c1 = c1.rstrip(b'\0')[:0xffff]; c1_pad = 0x80
+    if model > 0xff: raise ValueError(f'execution model {model} (mesh / task shaders have no Vulkan path here)')
+    if len(vin) > 0x7f: raise ValueError(f'{len(vin)} vertex inputs')
+    out = bytearray(struct.pack('<BBBB3HH', model, len(binds), len(vin) | c1_pad, fout & 0xff, *[min(x, 0xffff) for x in local], len(c1)))
     for b, vk, img, n in sorted(binds):
         k, reg, aux, written = kind_of(res, b)
         if k == KIND_SBUF: img = written                                # buffers have no image shape: the byte says whether the shader writes it
-        out += struct.pack('<BBBBIHH', b, vk, k, img, reg, n, aux)
+        if n > 0xffff: raise ValueError(f'binding {b}: an array of {n} descriptors')
+        out += struct.pack('<BBBBIHH', b, vk, k, img, reg & 0xffffffff, n, aux & 0xffff)
     for loc, ct in sorted(vin): out += struct.pack('<BB', loc, ct)
     out += c1
     if passthrough and gsm: out += b'\0' * (-len(out) % 4) + struct.pack(f'<{len(gsm)}I', *gsm)

@@ -1065,7 +1065,17 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
             uint64_t addr = 0, size = 0, off = ~0ull;
             if (b->kind == VKS_SUPPORT) off = support_buffer(), size = SUPPORT_SIZE, sup_bi = W->nbi - (int)n;
             else if (b->kind == VKS_CBUF) {
-                if (b->reg == 1 && s->c1_len) { off = ring_put((uint64_t)(uintptr_t)s->c1, s->c1_len); size = (s->c1_len + 15) & ~15u; }
+                if (b->reg == 1 && s->c1_len && s->c1_pad) {   // a 64 KB bank stored without its trailing zeros: 64 KB in the ring, zero past the stored bytes (once per shader and submission)
+                    uint64_t key = (uint64_t)(uintptr_t)s->c1 | 1;   // an odd address: no guest range is cached under it
+                    uint32_t hi = (uint32_t)((key ^ 65536 * 0x9E3779B97F4A7C15ull) * 0xff51afd7ed558ccdull >> 51) & (RH_CAP - 1); off = ~0ull;
+                    for (int q = 0; q < 32; q++, hi = (hi + 1) & (RH_CAP - 1)) { if (g_rh[hi].addr == key && g_rh[hi].size == 65536) { off = g_rh[hi].off; break; } if (!g_rh[hi].addr) break; }
+                    if (off == ~0ull && (off = ring_alloc(65536)) != ~0ull) {
+                        memcpy(RG.p + off, s->c1, s->c1_len); memset(RG.p + off + s->c1_len, 0, 65536 - s->c1_len);
+                        if (!g_rh[hi].addr && g_nrh_used < RH_CAP) { g_rh[hi] = (ring_hit){key, 65536, off}; g_rh_idx[g_nrh_used++] = (uint16_t)hi; }
+                    }
+                    size = 65536;
+                }
+                else if (b->reg == 1 && s->c1_len) { off = ring_put((uint64_t)(uintptr_t)s->c1, s->c1_len); size = (s->c1_len + 15) & ~15u; }
                 else if (b->reg >= 3 && b->reg - 3 < 18) { addr = D.ubo[st][b->reg - 3].addr; size = D.ubo[st][b->reg - 3].size; }
             } else if (b->kind == VKS_SBUF) {
                 if (b->aux == 0 && k_c0_ssbo[st] != 0xffff && b->reg >= k_c0_ssbo[st] && (b->reg - k_c0_ssbo[st]) % DMSH_C0_ROW == 0 && (b->reg - k_c0_ssbo[st]) / DMSH_C0_ROW < 16) {
