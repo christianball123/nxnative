@@ -905,7 +905,7 @@ typedef struct {
     struct { uint8_t loc, binding, used, pad; uint32_t fmt, offset; } va[32]; uint32_t nva;
     struct { uint32_t stride, rate; } vb[17]; uint32_t vb_used;
 } pkey;
-typedef struct { pkey k; VkPipeline p; uint64_t hash; int used; } pentry;   // a refused pipeline is kept too (p null), so it is not tried again at every draw
+typedef struct { pkey k; VkPipeline p; uint64_t hash; int used; _Atomic int state; } pentry;   // state 1: being built in the background (pipe_get), 2: built there   // a refused pipeline is kept too (p null), so it is not tried again at every draw
 #define PC_CAP (1u << 14)
 static pentry *g_pc; static uint32_t g_npc;
 static VkPipelineCache g_pcache;
@@ -931,7 +931,8 @@ static int pb_skip(uint64_t key) {
 // AYN Thor, and building them on the submit thread froze the game; several at once ran the system out of memory. A shader over DM_VK_ASYNC_CS_KB (default 256 KB of SPIR-V; 0: all built
 // at once) is built on one background thread, one at a time; its dispatches are skipped until the pipeline is there. Mesa keeps what it built in its disk cache
 // (~/.cache/mesa_shader_cache), so the next run gets it in milliseconds
-typedef struct pb_job { VkComputePipelineCreateInfo ci; uint64_t key; size_t bytes; VkPipeline *out; _Atomic int *state; struct pb_job *next; } pb_job;
+typedef struct pb_job { VkComputePipelineCreateInfo ci; uint64_t key; size_t bytes; VkPipeline *out; _Atomic int *state; struct pb_job *next; const vks_prog *gpr; pkey gk; } pb_job;   // gpr: a graphics pipeline (pipe_make with gk)
+static VkPipeline pipe_make(const vks_prog *pr, const pkey *k);
 static pthread_mutex_t g_pbq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pbq_cv = PTHREAD_COND_INITIALIZER;
 static pb_job *g_pbq_head, *g_pbq_tail; static int g_pbq_n;
 static void *pb_worker(void *a) {
@@ -941,15 +942,24 @@ static void *pb_worker(void *a) {
         while (!g_pbq_head) pthread_cond_wait(&g_pbq_cv, &g_pbq_mu);
         pb_job *j = g_pbq_head; g_pbq_head = j->next; if (!g_pbq_head) g_pbq_tail = NULL; int left = --g_pbq_n;
         pthread_mutex_unlock(&g_pbq_mu);
-        uint64_t t0 = mono_ns(); VkPipeline p = VK_NULL_HANDLE;
-        VkResult r = vkCreateComputePipelines_(VK.dev, g_pcache, 1, &j->ci, NULL, &p);
-        LOG("[vk] background build of compute shader %016llx (%zu KB of SPIR-V): %s in %.1f s, %d more waiting", (unsigned long long)j->key, j->bytes >> 10,
-            r ? "refused" : "done", (mono_ns() - t0) / 1e9, left);
-        *j->out = r ? VK_NULL_HANDLE : p; if (!r && p) g_pipes++;
+        uint64_t t0 = mono_ns(); VkPipeline p = VK_NULL_HANDLE; VkResult r;
+        if (j->gpr) { p = pipe_make(j->gpr, &j->gk); r = p ? VK_SUCCESS : VK_ERROR_UNKNOWN; }
+        else r = vkCreateComputePipelines_(VK.dev, g_pcache, 1, &j->ci, NULL, &p);
+        double secs = (mono_ns() - t0) / 1e9;
+        if (!j->gpr || secs >= 0.5 || r) LOG("[vk] background build of %s shader %016llx (%zu KB of SPIR-V): %s in %.1f s, %d more waiting", j->gpr ? "graphics pipeline with" : "compute",
+                                             (unsigned long long)j->key, j->bytes >> 10, r ? "refused" : "done", secs, left);
+        *j->out = r ? VK_NULL_HANDLE : p; if (!r && p && !j->gpr) g_pipes++;
         atomic_store_explicit(j->state, 2, memory_order_release);
         free(j);
     }
     return NULL;
+}
+static void pb_enqueue(pb_job *j) {
+    static int started; if (!started) { pthread_t th; if (pthread_create(&th, NULL, pb_worker, NULL)) return; pthread_detach(th); started = 1; }
+    atomic_store(j->state, 1);
+    pthread_mutex_lock(&g_pbq_mu);
+    if (g_pbq_tail) g_pbq_tail->next = j; else g_pbq_head = j; g_pbq_tail = j; ++g_pbq_n;
+    pthread_cond_signal(&g_pbq_cv); pthread_mutex_unlock(&g_pbq_mu);
 }
 static int pb_async(const VkComputePipelineCreateInfo *ci, const vks_shader *cs, VkPipeline *out, _Atomic int *state) {   // 1: queued
     static long limit = -1; if (limit < 0) { const char *e = getenv("DM_VK_ASYNC_CS_KB"); limit = e && *e ? atol(e) : 256; }
@@ -1065,7 +1075,22 @@ static VkPipeline pipe_get(const vks_prog *pr, const pkey *k) {
     uint64_t h = pkey_hash(k); uint32_t i = (uint32_t)(h >> 40) & (PC_CAP - 1);
     for (uint32_t n = 0; n < PC_CAP; n++, i = (i + 1) & (PC_CAP - 1)) {
         if (!g_pc[i].used) break;
-        if (g_pc[i].hash == h && !memcmp(&g_pc[i].k, k, sizeof *k)) PG_RET(g_pc[i].p);
+        if (g_pc[i].hash == h && !memcmp(&g_pc[i].k, k, sizeof *k)) {
+            if (atomic_load_explicit(&g_pc[i].state, memory_order_acquire) == 1) return VK_NULL_HANDLE;   // still being built: the draw is skipped
+            PG_RET(g_pc[i].p);
+        }
+    }
+    // A new pipeline whose shaders are large is built in the background, its draws skipped until then: Turnip took 12 s and more over some of Ocarina of Time's first-scene
+    // pipelines on the AYN Thor, the game frozen behind each. Mesa's disk cache has them for the next run. DM_VK_ASYNC_GFX_KB: the SPIR-V size from which (default 64 KB; 0: never)
+    static long glim = -1; if (glim < 0) { const char *e = getenv("DM_VK_ASYNC_GFX_KB"); glim = e && *e ? atol(e) : 64; }
+    size_t bytes = 0; uint64_t big = 0, bigsz = 0;
+    for (int m = 0; m < VKS_NGFX; m++) if (pr->st[m]) { bytes += (size_t)pr->st[m]->nspv * 4; if (pr->st[m]->nspv > bigsz) { bigsz = pr->st[m]->nspv; big = pr->st[m]->key; } }
+    if (glim && bytes >= (size_t)glim << 10 && g_npc < PC_CAP * 3 / 4 && !g_pc[i].used && !movie_net(big)) {
+        if (!g_pcache) { VkPipelineCacheCreateInfo pc = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, 0, NULL}; vkCreatePipelineCache_(VK.dev, &pc, NULL, &g_pcache); }
+        g_pc[i].k = *k; g_pc[i].p = VK_NULL_HANDLE; g_pc[i].hash = h; g_pc[i].used = 1; g_npc++;
+        pb_job *j = calloc(1, sizeof *j); j->gpr = pr; j->gk = *k; j->key = big; j->bytes = bytes; j->out = &g_pc[i].p; j->state = &g_pc[i].state;
+        pb_enqueue(j);
+        return VK_NULL_HANDLE;
     }
     VkPipeline p = pipe_make(pr, k);
     if (g_npc < PC_CAP * 3 / 4 && !g_pc[i].used) { g_pc[i].k = *k; g_pc[i].p = p; g_pc[i].hash = h; g_pc[i].used = 1; g_npc++; }
