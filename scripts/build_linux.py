@@ -271,6 +271,12 @@ if [ ! -f /run/.containerenv ] && [ -n "{box}" ]; then
     echo "running on the host"
 fi
 cd "$here"
+# Settings to try without Steam's launch options: one NAME=value per line in ~/.config/nxnative/env (lines starting with # are ignored)
+if [ -f "$HOME/.config/nxnative/env" ]; then
+    while IFS= read -r line; do
+        case "$line" in ''|'#'*) ;; *=*) export "$line"; echo "setting from ~/.config/nxnative/env: $line" ;; esac
+    done < "$HOME/.config/nxnative/env"
+fi
 export DM_WINDOW=1 DM_FULLSCREEN="${{DM_FULLSCREEN:-1}}"
 echo "starting the game (DISPLAY=$DISPLAY WAYLAND_DISPLAY=$WAYLAND_DISPLAY XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR)"
 exec ./run.sh "$@"

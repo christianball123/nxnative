@@ -475,6 +475,8 @@ static vtex *prep_tex(const tex_t *t) {
 // ---------------------------------------------------------------- GPU profile: timestamps around each render pass and dispatch, summed per kind of pass (size, targets,
 // first fragment shader) and logged with the replay summary: where the GPU's time goes. DM_VK_PROFILE=0 turns it off
 #define PQ_CAP 2048
+// DM_VK_ABTEST=gs: draws with a geometry stage are skipped every other profile period (the profile says which), to measure what they cost
+static int g_ab_skip_gs, g_ab = -1;
 static VkQueryPool g_pq; static uint32_t g_npq; static int g_prof = -1;
 typedef struct { uint64_t key, fs; uint32_t w, h, ncol, depth, compute; double ms; uint64_t n, draws; } pkind;
 static pkind g_pk[512]; static int g_npk;
@@ -535,6 +537,8 @@ static void prof_report(void) {
         k->n = 0;
     }
     g_npk = 0; g_prof_total_ms = 0; g_prof_subs = 0;
+    if (g_ab < 0) { const char *e = getenv("DM_VK_ABTEST"); g_ab = e && !strcmp(e, "gs"); }
+    if (g_ab) { g_ab_skip_gs = !g_ab_skip_gs; LOG("[vk] A/B test: the next period %s draws with a geometry stage", g_ab_skip_gs ? "SKIPS" : "draws"); }
 }
 
 static int pass_begin(void) {
@@ -948,7 +952,7 @@ static void do_draw(const draw_args *a) {
     if (pr->st[VKS_TCS] || pr->st[VKS_TES]) { g_skip[SK_TESS]++; return; }
     VkPrimitiveTopology topo = topo_of(a->prim);
     static int gs_on = -1; if (gs_on < 0) { const char *e = getenv("DM_VK_GEOMETRY"); gs_on = !(e && *e == '0'); if (!gs_on) LOG("[vk] DM_VK_GEOMETRY=0: draws with a geometry stage are skipped"); }
-    if (pr->st[VKS_GS] && !gs_on) { g_skip[SK_TESS]++; return; }
+    if (pr->st[VKS_GS] && (!gs_on || g_ab_skip_gs)) { g_skip[SK_TESS]++; return; }
     if (topo == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM || topo == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) { g_skip[SK_PRIM]++; return; }
     if (!a->count) return;
     if (!ring_init() || !dummies_init()) return;
