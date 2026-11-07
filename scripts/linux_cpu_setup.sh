@@ -12,7 +12,7 @@ if [ "$1" = --remove ]; then
     rm -f "$helper" "$rule"; echo "removed $helper and $rule"; exit 0
 fi
 user="${SUDO_USER:-}"; [ -n "$user" ] && [ "$user" != root ] || { echo "run it with sudo from your own account"; exit 1; }
-mkdir -p /usr/local/bin
+mkdir -p /etc/nxnative   # in /etc: /usr, and /usr/local on ArmadaOS, are read-only
 cat > "$helper" <<'H'
 #!/bin/sh
 # nxnative: the CPU's speed setting for a game session. on: the performance governor (the setting before kept in /run/nxnative-cpu); off: that setting back
