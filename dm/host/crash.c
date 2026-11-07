@@ -115,6 +115,7 @@ static void hsym_load(void) {
     if (f == MAP_FAILED) return;
     const hs_ehdr *eh = (const hs_ehdr *)f;
     if (memcmp(eh->ident, "\177ELF", 4) || eh->shoff + (uint64_t)eh->shnum * sizeof(hs_shdr) > (uint64_t)len) return;
+    if (eh->type == 2) g_exe_base = 0;   // ET_EXEC: the symbols are absolute addresses (a PIE's are offsets from where it was loaded)
     const hs_shdr *sh = (const hs_shdr *)(f + eh->shoff);
     for (int i = 0; i < eh->shnum; i++) {
         if (sh[i].type != 2 || sh[i].link >= eh->shnum) continue;   // SHT_SYMTAB
@@ -127,7 +128,7 @@ static void hsym_load(void) {
     }
 }
 static const hsym *hsym_find(uint64_t a) {
-    if (!g_nhsym || a < g_exe_base) return NULL;
+    if (!g_nhsym || a < g_exe_base) return NULL;   // (base 0 for a non-PIE executable)
     uint64_t r = a - g_exe_base; size_t lo = 0, hi = g_nhsym;
     while (lo < hi) { size_t m = (lo + hi) / 2; if (g_hsym[m].a <= r) lo = m + 1; else hi = m; }
     if (!lo) return NULL;

@@ -970,6 +970,7 @@ static int gs_mask(const vks_shader *s, uint32_t *mask) {
             int gst = 0; for (int x = 0; x < NST; x++) if (k_nvn2model[x] == s->model) gst = x;   // the NVN stage of the geometry shader
             const p_bind_buf *u = &D.ubo[gst][slot - 3];
             if (!u->addr || (uint64_t)dw * 4 + 4 > u->size) return 0;
+            { static int n; if (n++ < 6) LOG("[vk] geometry mask program: c%u dword %u of a %llu-byte buffer at %p (program %p, %u words)", slot, dw, (unsigned long long)u->size, (void *)(uintptr_t)u->addr, (const void *)s->gsm, s->ngsm); }
             memcpy(&st[sp - 1], (const uint8_t *)(uintptr_t)u->addr + (uint64_t)dw * 4, 4);
         } else {
             if (sp < 2) return 0;
