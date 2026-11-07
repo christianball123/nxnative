@@ -513,7 +513,7 @@ typedef struct {
 } subslot;
 static subslot g_pend = {.dp = g_dp_store[1], .pm = g_pm_store[1]};
 static pthread_mutex_t g_cm_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cm_done, g_cm_work; static int g_cm_go, g_cm_started, g_async = -1;
-static uint64_t g_t_gpu;   // the completion thread's waits for the GPU (how long submissions ran after their hand-over)
+static uint64_t g_t_gpu, g_t_land, g_t_wake, g_t_post, g_n_post, g_t_handed;   // the completion thread's waits for the GPU (how long submissions ran after their hand-over)
 static void cm_init(void) {
     pthread_condattr_t ca; pthread_condattr_init(&ca); pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
     pthread_cond_init(&g_cm_done, &ca); pthread_cond_init(&g_cm_work, NULL); pthread_condattr_destroy(&ca);
@@ -534,6 +534,7 @@ static void slot_land(subslot *s) {
         vkResetFences_(VK.dev, 1, &s->fence);
         g_t_gpu += mono_ns() - t0;
     }
+    uint64_t tl = mono_ns();
     prof_collect(s->pq, s->npq, s->pm, s->npm);
     for (int i = 0; i < s->nstage; i++) {
         stage_t *st = &s->stage[i];
@@ -542,7 +543,7 @@ static void slot_land(subslot *s) {
     }
     for (int i = 0; i < s->nwb; i++) wb_land(&s->wb[i]);
     // its events and counters, in record order
-    uint64_t now = gpu_ticks();
+    uint64_t now = gpu_ticks(), tp = mono_ns(); g_n_post += s->npost;
     for (int i = 0; i < s->npost; i++) {
         post_op *o = &s->post[i];
         if (o->kind == 1) { dm_guest_write_prepare((void *)o->val, 4); if (o->mode == 1) *o->val += o->v; else *o->val = o->v; }
@@ -552,11 +553,13 @@ static void slot_land(subslot *s) {
             dm_guest_write_prepare((void *)(uintptr_t)o->addr, sizeof rec); memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
         }
     }
+    uint64_t te = mono_ns(); g_t_post += te - tp; g_t_land += te - tl;
 }
 static void *cm_thread(void *u) {
     (void)u;
     for (;;) {
         pthread_mutex_lock(&g_cm_mu); while (!g_cm_go) pthread_cond_wait(&g_cm_work, &g_cm_mu); g_cm_go = 0; pthread_mutex_unlock(&g_cm_mu);
+        g_t_wake += mono_ns() - g_t_handed;
         slot_land(&g_pend);
         pthread_mutex_lock(&g_cm_mu); atomic_store(&g_done, g_pend.id); atomic_store(&g_pend_busy, 0); pthread_cond_broadcast(&g_cm_done); pthread_mutex_unlock(&g_cm_mu);
     }
@@ -607,6 +610,7 @@ static void slot_handover(uint64_t id, int failed) {
     RG.base = RG.base ? 0 : RING_SIZE / 2;
     rec_reset();
     if (!g_cm_started) { pthread_once(&g_cm_once, cm_init); pthread_t th; pthread_create(&th, NULL, cm_thread, NULL); pthread_detach(th); g_cm_started = 1; }
+    g_t_handed = mono_ns();
     pthread_mutex_lock(&g_cm_mu); atomic_store(&g_pend_busy, 1); g_cm_go = 1; pthread_cond_signal(&g_cm_work); pthread_mutex_unlock(&g_cm_mu);
 }
 uint64_t mtl_sub_commit(void) {
@@ -663,6 +667,9 @@ uint64_t mtl_sub_commit(void) {
                        "waits for a write-back in flight %llu; storage write-backs %.2f MB per submission, %.3f MB of it changed; ring %.2f MB per submission",
             (unsigned long long)g_t_n, g_t_rec / 1e6 / g_t_n, g_t_submit / 1e6 / g_t_n, g_t_wait / 1e6 / g_t_n, g_t_done / 1e6 / g_t_n, g_t_gpu / 1e6 / g_t_n,
             (unsigned long long)g_hazard_waits, g_wb_bytes / 1048576.0 / g_t_n, g_wb_changed / 1048576.0 / g_t_n, ring_mb_per_sub(g_t_n));
+        if (g_t_n) LOG("[vk] completion per submission: thread wake-up %.2f ms, after the fence %.2f ms (events and counters %.2f ms, %.0f of them)", g_t_wake / 1e6 / g_t_n, g_t_land / 1e6 / g_t_n,
+                       g_t_post / 1e6 / g_t_n, (double)g_n_post / g_t_n);
+        g_t_wake = g_t_land = g_t_post = g_n_post = 0;
         g_wb_bytes = g_wb_changed = 0;
         g_t_rec = g_t_submit = g_t_wait = g_t_done = g_t_n = g_t_gpu = 0; g_hazard_waits = 0;
         prof_report();
