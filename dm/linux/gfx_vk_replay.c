@@ -454,7 +454,7 @@ static void mtl_exec_body(const uint8_t *p);
 // The submission being recorded belongs to one thread at a time: from mtl_sub_begin (or the first mtl_exec) to mtl_sub_commit. Others that need the recorded work on the
 // GPU (a fence, a wait, a present, a texture's release) take it too and hand the batch over (sub_flush)
 static pthread_mutex_t g_rec_mu = PTHREAD_MUTEX_INITIALIZER; static __thread int t_rec_held;
-static uint64_t g_early_syncs; static _Atomic uint64_t g_wait_sync_ns, g_wait_acq_ns;   // how long the game blocked for the GPU in sync waits (an acquired texture's sync apart)
+static uint64_t g_early_syncs; static _Atomic uint64_t g_wait_sync_ns, g_wait_acq_ns, g_wait_flush_ns, g_wait_gpu_ns, g_wait_gpu_n, g_wait_unsub;   // how long the game blocked for the GPU in sync waits (an acquired texture's sync apart)
 static int g_batch = -1, g_deferred; static uint64_t g_batched, g_gpu_subs, g_flush_why[8];
 enum { FL_COMMIT, FL_PRESENT, FL_FENCE, FL_WAIT, FL_RELEASE, FL_MAX, FL_NEED };
 static const char *const k_flush[] = {"a game submission that could not wait", "a present", "a fence", "a wait", "a texture release", "four batched", "other"};
@@ -741,8 +741,9 @@ static uint64_t sub_commit_locked(int force) {
             (unsigned long long)g_hazard_waits, g_wb_bytes / 1048576.0 / g_t_n, g_wb_changed / 1048576.0 / g_t_n, ring_mb_per_sub(g_t_n));
         if (g_gpu_subs) { char fw[400]; int o = 0; fw[0] = 0; for (int i = 0; i < 7; i++) if (g_flush_why[i] && o < 380) o += snprintf(fw + o, sizeof fw - o, "%s%llu at %s", o ? ", " : "", (unsigned long long)g_flush_why[i], k_flush[i]);
             static uint64_t tlast; uint64_t tn = mono_ns(); double secs = tlast ? (tn - tlast) / 1e9 : 0; tlast = tn;
-            LOG("[vk] batching: %.2f game submissions per GPU submission; batches handed over at: %s; the game blocked for the GPU %.0f ms a second in sync waits, %.0f in acquired-texture syncs; syncs done early %llu",
-                (double)(g_gpu_subs + g_batched) / g_gpu_subs, o ? fw : "none", secs > 0 ? atomic_exchange(&g_wait_sync_ns, 0) / 1e6 / secs : 0.0, secs > 0 ? atomic_exchange(&g_wait_acq_ns, 0) / 1e6 / secs : 0.0, (unsigned long long)g_early_syncs); g_early_syncs = 0;
+            LOG("[vk] batching: %.2f game submissions per GPU submission; batches handed over at: %s; the game blocked for the GPU %.0f ms a second in sync waits, %.0f in acquired-texture syncs; syncs done early %llu; of the blocking: handing batched work over %.0f ms, waiting for the GPU %.0f ms (%llu waits); syncs not handed over yet %llu",
+                (double)(g_gpu_subs + g_batched) / g_gpu_subs, o ? fw : "none", secs > 0 ? atomic_exchange(&g_wait_sync_ns, 0) / 1e6 / secs : 0.0, secs > 0 ? atomic_exchange(&g_wait_acq_ns, 0) / 1e6 / secs : 0.0, (unsigned long long)g_early_syncs,
+                secs > 0 ? atomic_exchange(&g_wait_flush_ns, 0) / 1e6 / secs : 0.0, secs > 0 ? atomic_exchange(&g_wait_gpu_ns, 0) / 1e6 / secs : 0.0, (unsigned long long)atomic_exchange(&g_wait_gpu_n, 0), (unsigned long long)atomic_exchange(&g_wait_unsub, 0)); g_early_syncs = 0;
             g_gpu_subs = g_batched = 0; memset(g_flush_why, 0, sizeof g_flush_why); }
         if (g_t_n) LOG("[vk] completion per submission: thread wake-up %.2f ms, after the fence %.2f ms (events and counters %.2f ms, %.0f of them)", g_t_wake / 1e6 / g_t_n, g_t_land / 1e6 / g_t_n,
                        g_t_post / 1e6 / g_t_n, (double)g_n_post / g_t_n);
@@ -788,12 +789,14 @@ static int early_done(uint64_t fence) {
 static int wait_timed(uint64_t fence, uint64_t timeout_ns) {
     if (fence <= atomic_load(&g_done)) return 1;
     if (fence > atomic_load(&g_fence) && g_deferred) {   // batched work: handed over first (a poll does it only when the recording is free)
-        if (timeout_ns) flush_from(FL_WAIT);
+        if (timeout_ns) { uint64_t t0 = mono_ns(); flush_from(FL_WAIT); atomic_fetch_add(&g_wait_flush_ns, mono_ns() - t0); }
         else if (t_rec_held) sub_flush(FL_WAIT);
         else if (!pthread_mutex_trylock(&g_rec_mu)) { sub_flush(FL_WAIT); pthread_mutex_unlock(&g_rec_mu); }
     }
     if (early_done(fence)) return 1;
+    if (timeout_ns && fence > atomic_load(&g_fence)) atomic_fetch_add(&g_wait_unsub, 1);
     if (!timeout_ns || fence > atomic_load(&g_fence)) return 0;
+    uint64_t tg = mono_ns();
     pthread_once(&g_cm_once, cm_init);
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t lim = timeout_ns > 3600ull * 1000000000ull ? 3600ull * 1000000000ull : timeout_ns, ns = (uint64_t)ts.tv_nsec + lim % 1000000000ull;
@@ -801,6 +804,7 @@ static int wait_timed(uint64_t fence, uint64_t timeout_ns) {
     pthread_mutex_lock(&g_cm_mu);
     while (fence > atomic_load(&g_done)) if (pthread_cond_timedwait(&g_cm_done, &g_cm_mu, &ts)) break;
     pthread_mutex_unlock(&g_cm_mu);
+    atomic_fetch_add(&g_wait_gpu_ns, mono_ns() - tg); atomic_fetch_add(&g_wait_gpu_n, 1);
     return fence <= atomic_load(&g_done);
 }
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) {
