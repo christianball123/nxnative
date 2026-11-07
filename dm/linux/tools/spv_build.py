@@ -40,7 +40,10 @@ print(f'translator {v.stdout.strip()} on .NET ({shutil.which("dotnet")})', flush
 
 # Stand-ins for the Mac tools: the Metal compiler and spirv-cross fail (dmsh_build.py then records those shaders as failed after their SPIR-V was caught)
 fake = Path(tempfile.mkdtemp(prefix='spv_build_'))
-(fake / 'xcrun').write_text('#!/bin/sh\necho "no Metal compiler on Linux (SPIR-V capture)" >&2\nexit 1\n')
+# dmsh_build.py asks xcrun where the Metal tools are when it starts (-f metal, --show-sdk-path): answered with stand-ins that fail when run
+(fake / 'xcrun').write_text('#!/bin/sh\nfor a; do case "$a" in --show-sdk-path) echo /nonexistent-macos-sdk; exit 0;; -f) echo "$(dirname "$0")/no-metal"; exit 0;; esac; done\n'
+                            'echo "no Metal compiler on Linux (SPIR-V capture)" >&2\nexit 1\n')
+(fake / 'no-metal').write_text('#!/bin/sh\necho "no Metal compiler on Linux (SPIR-V capture)" >&2\nexit 1\n')
 (fake / 'spirv-cross').write_text('#!/bin/sh\n[ "$1" = "--version" ] && { echo "spirv-cross (none: Linux SPIR-V capture)"; exit 0; }\nexit 1\n')
 (fake / 'xlate').write_text(f'#!/bin/sh\nexec "{sys.executable}" "{Path(__file__).resolve()}" --xlate "$@"\n')
 for f in fake.iterdir(): f.chmod(0o755)
