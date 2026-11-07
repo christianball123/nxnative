@@ -142,10 +142,43 @@ kern_return_t thread_info(mach_port_t th, int flavor, thread_info_t info, mach_m
     bi->run_state = st == 'R' ? TH_STATE_RUNNING : st == 'D' ? TH_STATE_UNINTERRUPTIBLE : st == 'T' || st == 't' ? TH_STATE_STOPPED : TH_STATE_WAITING;
     return KERN_SUCCESS;
 }
-// Suspending another thread to read its registers (hang dumps, the sampling probe) has no Linux counterpart that is safe from inside the process: refused, and the callers skip the dump
-kern_return_t thread_suspend(mach_port_t th) { (void)th; return KERN_FAILURE; }
-kern_return_t thread_resume(mach_port_t th) { (void)th; return KERN_FAILURE; }
-kern_return_t thread_get_state(mach_port_t th, int flavor, thread_state_t st, mach_msg_type_number_t *cnt) { (void)th; (void)flavor; (void)st; (void)cnt; return KERN_FAILURE; }
+// Suspending another thread to read its registers (hang dumps: what a thread spinning in guest code is running). A real-time signal stops it in a handler that copies its registers
+// and waits there until thread_resume. One thread at a time (the dumps walk the threads one by one). A thread in a system call is taken out of it (EINTR / restart): only the
+// watchdog's dumps use this, and the process exits after them
+#include <signal.h>
+#include <ucontext.h>
+#define DM_SUSPEND_SIG (SIGRTMIN + 3)
+static _Atomic int g_sus_tid, g_sus_got, g_sus_resume, g_sus_left;
+static struct __darwin_arm_thread_state64 g_sus_st;
+static void sus_handler(int sig, siginfo_t *si, void *uc_) {
+    (void)sig; (void)si;
+    if (atomic_load(&g_sus_tid) != (int)syscall(SYS_gettid)) return;
+    ucontext_t *uc = uc_;
+    memcpy(&g_sus_st, &uc->uc_mcontext.regs[0], sizeof g_sus_st.__x + 3 * 8);   // x0-x28, fp, lr
+    g_sus_st.__sp = uc->uc_mcontext.sp; g_sus_st.__pc = uc->uc_mcontext.pc; g_sus_st.__cpsr = (uint32_t)uc->uc_mcontext.pstate;
+    atomic_store(&g_sus_got, 1);
+    for (int i = 0; i < 2000 && !atomic_load(&g_sus_resume); i++) { struct timespec t = {0, 1000000}; nanosleep(&t, NULL); }   // 2 s at most
+    atomic_store(&g_sus_left, 1);
+}
+kern_return_t thread_suspend(mach_port_t th) {
+    static int installed;
+    if (!installed) { struct sigaction sa = {.sa_sigaction = sus_handler, .sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK}; sigemptyset(&sa.sa_mask); sigaction(DM_SUSPEND_SIG, &sa, NULL); installed = 1; }
+    if (!th || (int)th == (int)syscall(SYS_gettid)) return KERN_FAILURE;
+    atomic_store(&g_sus_got, 0); atomic_store(&g_sus_resume, 0); atomic_store(&g_sus_left, 0); atomic_store(&g_sus_tid, (int)th);
+    if (syscall(SYS_tgkill, getpid(), (int)th, DM_SUSPEND_SIG)) { atomic_store(&g_sus_tid, 0); return KERN_FAILURE; }
+    for (int i = 0; i < 200 && !atomic_load(&g_sus_got); i++) { struct timespec t = {0, 1000000}; nanosleep(&t, NULL); }
+    if (!atomic_load(&g_sus_got)) { atomic_store(&g_sus_resume, 1); atomic_store(&g_sus_tid, 0); return KERN_FAILURE; }   // blocked the signal, or did not run in 200 ms
+    return KERN_SUCCESS;
+}
+kern_return_t thread_resume(mach_port_t th) {
+    (void)th; atomic_store(&g_sus_resume, 1);
+    for (int i = 0; i < 200 && !atomic_load(&g_sus_left); i++) { struct timespec t = {0, 1000000}; nanosleep(&t, NULL); }
+    atomic_store(&g_sus_tid, 0); return KERN_SUCCESS;
+}
+kern_return_t thread_get_state(mach_port_t th, int flavor, thread_state_t st, mach_msg_type_number_t *cnt) {
+    (void)cnt; if (flavor != ARM_THREAD_STATE64 || (int)th != atomic_load(&g_sus_tid) || !atomic_load(&g_sus_got)) return KERN_FAILURE;
+    memcpy(st, &g_sus_st, sizeof g_sus_st); return KERN_SUCCESS;
+}
 kern_return_t thread_policy_set(mach_port_t th, int flavor, thread_policy_t p, mach_msg_type_number_t cnt) { (void)th; (void)flavor; (void)p; (void)cnt; return KERN_NOT_SUPPORTED; }
 kern_return_t thread_policy_get(mach_port_t th, int flavor, thread_policy_t p, mach_msg_type_number_t *cnt, boolean_t *def) { (void)th; (void)flavor; (void)p; (void)cnt; if (def) *def = 1; return KERN_NOT_SUPPORTED; }
 

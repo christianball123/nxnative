@@ -662,6 +662,9 @@ int thr_find_by_name(const char *name, pthread_t *out) {
 // During a state dump, take the backtrace of other guest threads: suspend → read registers → walk the frame pointer chain (both guest code and gate blocks keep the x29 chain) → resume; only main / sdk frames are printed
 static void thr_bt(thr_t *t) {
     if (!t->mport || t->exited || t->mport == mach_thread_self()) return;
+#ifdef __linux__
+    if (t->wkind) return;   // a waiting thread's stack is printed from its SVC; the signal that stops a thread (compat.c) would take it out of its wait
+#endif
     if (thread_suspend(t->mport) != KERN_SUCCESS) return;
     arm_thread_state64_t st; mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
     if (thread_get_state(t->mport, ARM_THREAD_STATE64, (thread_state_t)&st, &n) == KERN_SUCCESS) {
