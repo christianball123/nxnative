@@ -1100,6 +1100,8 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                         if (hit) { pass_end(); g_fb_split++; }
                     }
                     if (b->binding < 64 && bkind[b->binding] && v) bsc[b->binding] = v->sc;
+                    if (v && storage && v->sc != 1.0f) { static int ns; if (ns++ < 10) LOG("[YELLOW] [vk] shader %016llx binds the scaled render target serial %llu as a shader image (binding %u): its writes land at unscaled texels",
+                                                                   (unsigned long long)s->key, (unsigned long long)r->t.serial, b->binding); }
                     if (!v) why = 1;
                     else if (storage && !v->storage) why = 2;
                     else { iv = tex_view(v, &r->t, &r->v, r->has_v, b->image, storage); if (storage && iv) gpu_wrote(v); if (!iv) why = 3; }

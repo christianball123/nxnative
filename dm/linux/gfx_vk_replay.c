@@ -227,7 +227,7 @@ static vtex *tex_get(const tex_t *t) {
         if (g_sc != 1.0f && gw == sw && gh == sh) {
             int rt = g_rt_hint || (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE);
             const char *why = !rt ? "not a render target" : ci.imageType != VK_IMAGE_TYPE_2D || ci.arrayLayers != 1 ? "not a single 2D image" : ci.mipLevels != 1 ? "mipmapped" : samples != 1 ? "multisampled" :
-                              (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) ? "a shader image" : (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) ? "linear" : NULL;
+                              (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) ? "linear" : NULL;
             if (!why) { sc = g_sc; ci.extent.width = (uint32_t)(gw * sc + 0.5f); ci.extent.height = (uint32_t)(gh * sc + 0.5f); }
             static int n4; if (n4++ < 60) LOG("[vk] texture serial %llu (format %d %ux%u, flags %#x, first use as a target %d): %s%s", (unsigned long long)t->serial, f, gw, gh, t->d.flags, g_rt_hint,
                                               why ? "not scaled: " : "scaled", why ? why : "");
