@@ -254,6 +254,17 @@ if [ -f /.flatpak-info ]; then   # Steam from Flathub: out of its sandbox first 
 fi
 # Steam gives a game its controller layout only while the window in front belongs to a process it started: the game runs straight on the host when the host has
 # what it loads (SDL3, the Vulkan loader; the GPU driver is the system's), and goes through the toolbox only when not (DM_TOOLBOX=1 forces it)
+# The CPU at full speed while the game runs (the Thor's automatic setting cost about a fifth of the frame rate), back to what it was when the game ends: only when
+# scripts/linux_cpu_setup.sh was run once (it allows this one helper without a password)
+cpu_on=0
+if [ ! -f /run/.containerenv ] && [ -x /usr/local/bin/nxnative-cpu ] && [ "${{DM_CPU_FULL:-1}}" != 0 ] && ! grep -qs "^DM_CPU_FULL=0" "$HOME/.config/nxnative/env" && sudo -n /usr/local/bin/nxnative-cpu on 2>/dev/null; then
+    cpu_on=1; echo "CPU at full speed for the game (DM_CPU_FULL=0 leaves it alone)"
+fi
+cpu_off() {{ if [ "$cpu_on" = 1 ]; then sudo -n /usr/local/bin/nxnative-cpu off 2>/dev/null; cpu_on=0; echo "CPU speed setting restored"; fi; }}
+trap 'cpu_off' EXIT
+trap 'cpu_off; exit 143' TERM
+trap 'cpu_off; exit 130' INT
+trap 'cpu_off; exit 129' HUP
 if [ ! -f /run/.containerenv ] && [ -n "{box}" ]; then
     need_box="${{DM_TOOLBOX:-0}}"
     if [ "$need_box" != 1 ]; then
@@ -266,7 +277,7 @@ if [ ! -f /run/.containerenv ] && [ -n "{box}" ]; then
         unset LD_PRELOAD LD_LIBRARY_PATH   # Steam's own environment does not belong in the toolbox
         tb="$(command -v toolbox || echo /usr/bin/toolbox)"
         echo "entering toolbox {box} with $tb"
-        exec "$tb" run -c "{box}" "$here/play.sh" "$@"
+        "$tb" run -c "{box}" "$here/play.sh" "$@"; exit $?
     fi
     echo "running on the host"
 fi
@@ -279,6 +290,7 @@ if [ -f "$HOME/.config/nxnative/env" ]; then
 fi
 export DM_WINDOW=1 DM_FULLSCREEN="${{DM_FULLSCREEN:-1}}"
 echo "starting the game (DISPLAY=$DISPLAY WAYLAND_DISPLAY=$WAYLAND_DISPLAY XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR)"
+if [ "$cpu_on" = 1 ]; then ./run.sh "$@"; exit $?; fi
 exec ./run.sh "$@"
 ''')
     play.chmod(0o755)
