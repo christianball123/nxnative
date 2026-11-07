@@ -906,6 +906,36 @@ typedef struct { pkey k; VkPipeline p; uint64_t hash; int used; } pentry;   // a
 #define PC_CAP (1u << 14)
 static pentry *g_pc; static uint32_t g_npc;
 static VkPipelineCache g_pcache;
+// Pipeline builds the driver hangs in, or takes seconds over: Turnip's compiler looped inside vkCreate*Pipelines on Ocarina of Time's title screen, its Presentation Thread at
+// 100 % CPU for 25 s and more and the game frozen behind it. The shaders of the build under way are kept for the hang dump (crash.c's wait dump), a build over 1 s is logged with its
+// time, and DM_VK_SKIP_SHADERS=<key>,<key>,... (16-digit hex keys as the log prints them) leaves out every pipeline with one of those shaders: its draws or dispatches are skipped
+static _Atomic uint64_t g_pb_key[3], g_pb_t0;
+static void pb_dump(void) {
+    uint64_t t0 = atomic_load(&g_pb_t0); if (!t0) { fprintf(stderr, "[dm] [vk] no pipeline being built\n"); return; }
+    fprintf(stderr, "[dm] [vk] pipeline being built for %.1f s: shaders %016llx %016llx %016llx (DM_VK_SKIP_SHADERS=<key> leaves it out)\n", (mono_ns() - t0) / 1e9,
+            (unsigned long long)atomic_load(&g_pb_key[0]), (unsigned long long)atomic_load(&g_pb_key[1]), (unsigned long long)atomic_load(&g_pb_key[2]));
+}
+static int pb_skip(uint64_t key) {
+    static uint64_t list[64]; static int n = -1;
+    if (n < 0) { n = 0; const char *e = getenv("DM_VK_SKIP_SHADERS");
+        for (const char *c = e; c && *c && n < 64; ) { char *end; uint64_t v = strtoull(c, &end, 16); if (end == c) break; list[n++] = v; c = *end ? end + 1 : end; }
+        if (n) LOG("[vk] DM_VK_SKIP_SHADERS: %d shader(s) left out", n); }
+    for (int i = 0; key && i < n; i++) if (list[i] == key) return 1;
+    return 0;
+}
+static int pb_begin(uint64_t a, uint64_t b, uint64_t c) {   // 0: one of them is left out
+    static int hooked; if (!hooked) { void crash_set_wait_dump(void (*)(void)); crash_set_wait_dump(pb_dump); hooked = 1; }
+    if (pb_skip(a) || pb_skip(b) || pb_skip(c)) { static int n; if (n++ < 20) LOG("[vk] pipeline left out (DM_VK_SKIP_SHADERS): shaders %016llx %016llx %016llx", (unsigned long long)a, (unsigned long long)b, (unsigned long long)c); return 0; }
+    atomic_store(&g_pb_key[0], a); atomic_store(&g_pb_key[1], b); atomic_store(&g_pb_key[2], c); atomic_store(&g_pb_t0, mono_ns());
+    return 1;
+}
+static void pb_end(void);
+static VkResult pb_end_r(VkResult r) { pb_end(); return r; }
+static void pb_end(void) {
+    uint64_t ms = (mono_ns() - atomic_load(&g_pb_t0)) / 1000000; atomic_store(&g_pb_t0, 0);
+    if (ms >= 1000) LOG("[RED] [vk] a pipeline took %llu ms to build: shaders %016llx %016llx %016llx", (unsigned long long)ms,
+                        (unsigned long long)atomic_load(&g_pb_key[0]), (unsigned long long)atomic_load(&g_pb_key[1]), (unsigned long long)atomic_load(&g_pb_key[2]));
+}
 static uint64_t pkey_hash(const pkey *k) { uint64_t h = 1469598103934665603ull; const uint8_t *p = (const uint8_t *)k; for (size_t i = 0; i < sizeof *k; i++) h = (h ^ p[i]) * 1099511628211ull; return h; }
 static VkPipeline pipe_make(const vks_prog *pr, const pkey *k) {
     VkPipelineShaderStageCreateInfo st[5]; uint32_t ns = 0;
@@ -949,7 +979,11 @@ static VkPipeline pipe_make(const vks_prog *pr, const pkey *k) {
     VkPipeline p = VK_NULL_HANDLE;
     if (pr->st[VKS_GS]) { static int n; if (n++ < 30) { LOG("[vk] making a pipeline with geometry shader %016llx (vertex %016llx, fragment %016llx)",
         (unsigned long long)pr->st[VKS_GS]->key, pr->st[VKS_VS] ? (unsigned long long)pr->st[VKS_VS]->key : 0ull, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull); fflush(stderr); } }
+#define PB_KEY(i_) (pr->st[i_] ? pr->st[i_]->key : 0)
+    if (!pb_begin(PB_KEY(VKS_VS), PB_KEY(VKS_FS), PB_KEY(VKS_GS))) return VK_NULL_HANDLE;
+#undef PB_KEY
     VkResult r = vkCreateGraphicsPipelines_(VK.dev, g_pcache, 1, &ci, NULL, &p);
+    pb_end();
     if (r) {
         static int n; if (n++ < 10) {
             char va_s[256] = ""; int o = 0;
@@ -1505,7 +1539,8 @@ static void dispatch_op(const p_dispatch *d) {
             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, pr->mod[VKS_CS], "main", NULL}, pr->layout, VK_NULL_HANDLE, -1};
         if (!g_pcache) { VkPipelineCacheCreateInfo pc = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, 0, NULL}; vkCreatePipelineCache_(VK.dev, &pc, NULL, &g_pcache); }
         VkPipeline p = VK_NULL_HANDLE;
-        if (vkCreateComputePipelines_(VK.dev, g_pcache, 1, &ci, NULL, &p)) { static int n; if (n++ < 10) LOG("[RED] [vk] a compute pipeline was refused: shader %016llx", (unsigned long long)pr->st[VKS_CS]->key); }
+        if (!pb_begin(pr->st[VKS_CS]->key, 0, 0)) p = VK_NULL_HANDLE;
+        else if (pb_end_r(vkCreateComputePipelines_(VK.dev, g_pcache, 1, &ci, NULL, &p))) { static int n; if (n++ < 10) LOG("[RED] [vk] a compute pipeline was refused: shader %016llx", (unsigned long long)pr->st[VKS_CS]->key); }
         g_cp[i].serial = pr->serial; g_cp[i].p = p; if (p) g_pipes++;
     }
     if (!g_cp[i].p) return;
