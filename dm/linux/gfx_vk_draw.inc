@@ -69,12 +69,29 @@ void ring_forget(uint64_t addr, uint64_t n) {
     }
 }
 // Storage buffers shaders wrote in this submission: copied back into guest memory when it completes, so the game (and the next submission's copies) see the results
-typedef struct { uint64_t addr, size, off; } wback;
-static wback *g_wb; static int g_nwb, g_cwb; static uint64_t g_wb_bytes;
+// Only the bytes the GPU changed go back (orig: the copy as recorded): the submission completes while the game runs on, and the rest of the buffer may hold what the CPU
+// wrote since (the next frame's data); writing the whole range back put the old bytes over it
+typedef struct { uint64_t addr, size, off; uint8_t *orig; } wback;
+static wback *g_wb; static int g_nwb, g_cwb; static uint64_t g_wb_bytes, g_wb_changed;
 static void wb_add(uint64_t addr, uint64_t size, uint64_t off) {
     for (int i = 0; i < g_nwb; i++) if (g_wb[i].addr == addr && g_wb[i].size == size) return;
     if (g_nwb == g_cwb) { g_cwb = g_cwb ? 2 * g_cwb : 64; g_wb = realloc(g_wb, g_cwb * sizeof *g_wb); }
-    g_wb[g_nwb++] = (wback){addr, size, off};
+    uint8_t *o = malloc(size); if (o) memcpy(o, RG.p + off, size);
+    g_wb[g_nwb++] = (wback){addr, size, off, o};
+}
+static void wb_land(const wback *w) {   // on the completion thread
+    uint8_t *g = (uint8_t *)(uintptr_t)w->addr; const uint8_t *r = RG.p + w->off;
+    g_wb_bytes += w->size;
+    if (!w->orig) { dm_guest_write_prepare(g, w->size); memcpy(g, r, w->size); return; }
+    uint64_t i = 0;
+    while (i < w->size) {
+        if (w->size - i >= 8) { uint64_t a, b; memcpy(&a, r + i, 8); memcpy(&b, w->orig + i, 8); if (a == b) { i += 8; continue; } }
+        else if (r[i] == w->orig[i]) { i++; continue; }
+        while (r[i] == w->orig[i]) i++;   // the first changed byte (one is in these 8, or it is this one)
+        uint64_t j = i; while (j < w->size && r[j] != w->orig[j]) j++;   // the run of changed bytes (an unchanged byte may be one the CPU wrote since: left alone)
+        dm_guest_write_prepare(g + i, j - i); memcpy(g + i, r + i, j - i); g_wb_changed += j - i;
+        i = j;
+    }
 }
 static uint64_t ring_bytes(const void *p, uint64_t n) { uint64_t off = ring_alloc(n); if (off != ~0ull) memcpy(RG.p + off, p, n); return off; }
 

@@ -543,7 +543,7 @@ static void slot_land(subslot *s) {
         if (st->rb_dst) { dm_guest_write_prepare(st->rb_dst, (st->rb_rows - 1) * st->rb_row + st->rb_n); for (size_t r = 0; r < st->rb_rows; r++) memcpy(st->rb_dst + r * st->rb_row, (uint8_t *)st->p + r * st->rb_src_row, st->rb_n); }
         if (st->dump_fmt) dump_write(st);
     }
-    for (int i = 0; i < s->nwb; i++) { dm_guest_write_prepare((void *)(uintptr_t)s->wb[i].addr, s->wb[i].size); memcpy((void *)(uintptr_t)s->wb[i].addr, RG.p + s->wb[i].off, s->wb[i].size); g_wb_bytes += s->wb[i].size; }
+    for (int i = 0; i < s->nwb; i++) wb_land(&s->wb[i]);
     // its events and counters, in record order
     uint64_t now = gpu_ticks();
     for (int i = 0; i < s->npost; i++) {
@@ -580,6 +580,7 @@ static void slot_clean(subslot *s) {
     for (int i = 0; i < s->ntbv; i++) vkDestroyBufferView_(VK.dev, s->tbv[i], NULL);
     s->ntbv = 0;
     for (int i = 0; i < s->ndp; i++) vkResetDescriptorPool_(VK.dev, s->dp[i], 0);
+    for (int i = 0; i < s->nwb; i++) free(s->wb[i].orig);
     s->npost = 0; s->nwb = 0; s->npq = 0; s->npm = 0;
 }
 #define SWP(a, b) do { __typeof__(a) t_ = (a); (a) = (b); (b) = t_; } while (0)
@@ -662,9 +663,10 @@ uint64_t mtl_sub_commit(void) {
             (unsigned long long)f, (unsigned long long)g_draws, (unsigned long long)g_draws_ready, (unsigned long long)g_dispatches, (unsigned long long)g_disp_ready,
             (unsigned long long)np, (unsigned long long)nm, (unsigned long long)nf, ds);
         if (g_t_n) LOG("[vk] time per submission (last %llu): recording %.2f ms, submit %.2f ms, waiting for the one before %.2f ms, after %.2f ms; GPU still busy at hand-over %.2f ms; "
-                       "waits for a write-back in flight %llu; ring %.2f MB per submission",
+                       "waits for a write-back in flight %llu; storage write-backs %.2f MB per submission, %.3f MB of it changed; ring %.2f MB per submission",
             (unsigned long long)g_t_n, g_t_rec / 1e6 / g_t_n, g_t_submit / 1e6 / g_t_n, g_t_wait / 1e6 / g_t_n, g_t_done / 1e6 / g_t_n, g_t_gpu / 1e6 / g_t_n,
-            (unsigned long long)g_hazard_waits, ring_mb_per_sub(g_t_n));
+            (unsigned long long)g_hazard_waits, g_wb_bytes / 1048576.0 / g_t_n, g_wb_changed / 1048576.0 / g_t_n, ring_mb_per_sub(g_t_n));
+        g_wb_bytes = g_wb_changed = 0;
         g_t_rec = g_t_submit = g_t_wait = g_t_done = g_t_n = g_t_gpu = 0; g_hazard_waits = 0;
         prof_report();
     }
