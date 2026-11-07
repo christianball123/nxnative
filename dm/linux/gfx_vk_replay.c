@@ -276,13 +276,19 @@ typedef struct { uint64_t lo, hi; } grange;
 static struct { grange *r; int n, cap; uint64_t lo, hi; _Atomic int busy; } g_pr[NSUB - 1];
 static uint64_t g_hazard_waits;
 static void pend_wait(void); static void pend_wait_slot(int i);
-static inline void pend_hazard(uint64_t addr, uint64_t n) {
+static struct { const char *file; int line; uint64_t n, bytes, ns; } g_hz[16];   // the waits by the replay line that read the bytes (logged with the time per submission)
+static uint64_t mono_ns(void);
+static void hz_note(const char *file, int line, uint64_t n, uint64_t ns) {
+    for (int i = 0; i < 16; i++) if ((g_hz[i].line == line && g_hz[i].file == file) || !g_hz[i].line) { g_hz[i].file = file; g_hz[i].line = line; g_hz[i].n++; g_hz[i].bytes += n; g_hz[i].ns += ns; return; }
+}
+static inline void pend_hazard_(uint64_t addr, uint64_t n, const char *file, int line) {
     if (!addr || !n) return;
     for (int s = 0; s < NSUB - 1; s++) {
         if (!atomic_load_explicit(&g_pr[s].busy, memory_order_acquire) || addr >= g_pr[s].hi || addr + n <= g_pr[s].lo) continue;
-        for (int i = 0; i < g_pr[s].n; i++) if (addr < g_pr[s].r[i].hi && g_pr[s].r[i].lo < addr + n) { g_hazard_waits++; pend_wait_slot(s); break; }
+        for (int i = 0; i < g_pr[s].n; i++) if (addr < g_pr[s].r[i].hi && g_pr[s].r[i].lo < addr + n) { g_hazard_waits++; uint64_t t0 = mono_ns(); pend_wait_slot(s); hz_note(file, line, n, mono_ns() - t0); break; }
     }
 }
+#define pend_hazard(a, n) pend_hazard_((a), (n), __FILE__, __LINE__)
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; } post_op;   // 1 event, 2 counter
 static post_op *g_post; static int g_npost, g_postcap;
 static struct { p_set_rt rt; int has_rt; int64_t copy_stride, copy_img_stride; } R;
@@ -750,6 +756,9 @@ static uint64_t sub_commit_locked(int force) {
                        g_t_post / 1e6 / g_t_n, (double)g_n_post / g_t_n);
         g_t_wake = g_t_land = g_t_post = g_n_post = 0;
         g_wb_bytes = g_wb_changed = 0;
+        if (g_hz[0].line) { char hb[400]; int o = 0; for (int i = 0; i < 16 && g_hz[i].line && o < 380; i++) o += snprintf(hb + o, sizeof hb - o, "%s%s:%d: %llu waits, %.1f ms, %llu bytes read each", i ? "; " : "", strrchr(g_hz[i].file, '/') ? strrchr(g_hz[i].file, '/') + 1 : g_hz[i].file, g_hz[i].line,
+                (unsigned long long)g_hz[i].n, g_hz[i].ns / 1e6, (unsigned long long)(g_hz[i].bytes / g_hz[i].n));
+            LOG("[vk] waits for a write-back in flight, by where the bytes are read: %s", hb); memset(g_hz, 0, sizeof g_hz); }
         g_t_rec = g_t_submit = g_t_wait = g_t_done = g_t_n = g_t_gpu = 0; g_hazard_waits = 0;
         prof_report();
     }
