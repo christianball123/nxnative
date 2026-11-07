@@ -257,10 +257,10 @@ fi
 # The CPU at full speed while the game runs (the Thor's automatic setting cost about a fifth of the frame rate), back to what it was when the game ends: only when
 # scripts/linux_cpu_setup.sh was run once (it allows this one helper without a password)
 cpu_on=0
-if [ ! -f /run/.containerenv ] && [ -x /usr/local/bin/nxnative-cpu ] && [ "${{DM_CPU_FULL:-1}}" != 0 ] && ! grep -qs "^DM_CPU_FULL=0" "$HOME/.config/nxnative/env" && sudo -n /usr/local/bin/nxnative-cpu on 2>/dev/null; then
+if [ ! -f /run/.containerenv ] && [ -x /etc/nxnative/nxnative-cpu ] && [ "${{DM_CPU_FULL:-1}}" != 0 ] && ! grep -qs "^DM_CPU_FULL=0" "$HOME/.config/nxnative/env" && sudo -n /etc/nxnative/nxnative-cpu on 2>/dev/null; then
     cpu_on=1; echo "CPU at full speed for the game (DM_CPU_FULL=0 leaves it alone)"
 fi
-cpu_off() {{ if [ "$cpu_on" = 1 ]; then sudo -n /usr/local/bin/nxnative-cpu off 2>/dev/null; cpu_on=0; echo "CPU speed setting restored"; fi; }}
+cpu_off() {{ if [ "$cpu_on" = 1 ]; then sudo -n /etc/nxnative/nxnative-cpu off 2>/dev/null; cpu_on=0; echo "CPU speed setting restored"; fi; }}
 trap 'cpu_off' EXIT
 trap 'cpu_off; exit 143' TERM
 trap 'cpu_off; exit 130' INT

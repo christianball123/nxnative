@@ -1,12 +1,12 @@
 #!/bin/sh
 # One-time setup on the Linux host (ArmadaOS on the AYN Thor and the like): lets play.sh put the CPU at full speed while a game runs and back afterwards, without a
-# password. Installs /usr/local/bin/nxnative-cpu (on / off) and a sudoers rule allowing only that helper for your user.
+# password. Installs /etc/nxnative/nxnative-cpu (on / off) and a sudoers rule allowing only that helper for your user.
 #   sudo sh scripts/linux_cpu_setup.sh            install
 #   sudo sh scripts/linux_cpu_setup.sh --remove   remove both
 set -e
 [ "$(id -u)" = 0 ] || { echo "run it with sudo: sudo sh $0"; exit 1; }
 [ ! -f /run/.containerenv ] || { echo "run it on the host, not inside the toolbox (type exit first)"; exit 1; }
-helper=/usr/local/bin/nxnative-cpu rule=/etc/sudoers.d/nxnative-cpu
+helper=/etc/nxnative/nxnative-cpu rule=/etc/sudoers.d/nxnative-cpu
 if [ "$1" = --remove ]; then
     [ -x "$helper" ] && "$helper" off || true
     rm -f "$helper" "$rule"; echo "removed $helper and $rule"; exit 0
