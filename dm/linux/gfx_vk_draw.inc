@@ -576,7 +576,8 @@ static void clears_into_pass(VkRenderingAttachmentInfo *ca, VkRenderingAttachmen
     if (img) full_barrier();
 }
 static uint64_t g_fb_split;
-static int fb_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_FEEDBACK_SPLIT"); on = !(e && *e == '0'); } return on; }
+// DM_VK_FEEDBACK_SPLIT: 0 off, 1 (default) when a draw of the pass wrote the target, 2 when the pass drew anything at all
+static int fb_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_FEEDBACK_SPLIT"); on = e && *e >= '0' && *e <= '2' ? *e - '0' : 1; } return on; }
 static void clear_color(const p_clear_color *c) {
     if (!R.has_rt || c->index < 0 || c->index >= R.rt.n || !R.rt.color[c->index]) return;
     if (P.open) { vtex *pv = tex_get(R.rt.color[c->index]); if (!pv || !(pv->bad & 2)) pass_end(); }   // its first use records commands outside a pass
@@ -1021,7 +1022,8 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                     // Only when a draw of this pass wrote it (dirty: the colour channels or the depth / stencil writes on): particles reading the depth they test against,
                     // with depth writes off, do not end the pass each
                     if (v && P.open && fb_on()) {
-                        int hit = P.dv == v && P.ddirty; for (uint32_t c = 0; c < P.ncol && c < 8 && !hit; c++) hit = P.cv[c] == v && (P.cdirty >> c & 1);
+                        int any = fb_on() == 2 && g_drawn > P.draws0;
+                        int hit = P.dv == v && (P.ddirty || any); for (uint32_t c = 0; c < P.ncol && c < 8 && !hit; c++) hit = P.cv[c] == v && ((P.cdirty >> c & 1) || any);
                         if (hit) { pass_end(); g_fb_split++; }
                     }
                     if (!v) why = 1;
