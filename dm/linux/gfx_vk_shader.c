@@ -92,10 +92,12 @@ static VkShaderModule module_for(const vks_shader *s, uint32_t set) {
 }
 static const VkShaderStageFlags k_stage[6] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
                                                VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_COMPUTE_BIT};
-static VkDescriptorSetLayout set_layout(const vks_shader *s) {   // s null: an empty set (a stage the program does not have, below one it has)
+static VkDescriptorSetLayout set_layout(const vks_shader *s, int dyn) {   // s null: an empty set (a stage the program does not have, below one it has); dyn: uniform buffers dynamic
     VkDescriptorSetLayoutBinding b[256]; uint32_t n = 0;
-    for (int i = 0; s && i < s->nb && n < 256; i++)
-        b[n++] = (VkDescriptorSetLayoutBinding){s->b[i].binding, (VkDescriptorType)s->b[i].vktype, s->b[i].count ? s->b[i].count : 1, k_stage[s->model], NULL};
+    for (int i = 0; s && i < s->nb && n < 256; i++) {
+        VkDescriptorType t = (VkDescriptorType)s->b[i].vktype; if (dyn && t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) t = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        b[n++] = (VkDescriptorSetLayoutBinding){s->b[i].binding, t, s->b[i].count ? s->b[i].count : 1, k_stage[s->model], NULL};
+    }
     VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, n, b};   // sets come from per-submission pools (a shader can have more bindings than the push limit)
     VkDescriptorSetLayout l = VK_NULL_HANDLE;
     if (vkCreateDescriptorSetLayout_(VK.dev, &ci, NULL, &l)) LOG("[RED] [vk] shader %016llx: its descriptor set layout was refused", s ? (unsigned long long)s->key : 0ull);
@@ -138,10 +140,16 @@ static vks_prog *prog_build(const prog_t *p, uint64_t serial, int gs_class) {
         if (r->compute) nset = 1;
         r->nset = nset;
         for (int m = 0; m < 6; m++) if (r->st[m] && (m == VKS_CS) == (r->compute != 0)) { r->mod[m] = module_for(r->st[m], (uint32_t)vks_set_of(m)); if (!r->mod[m]) r->ok = 0; }
+        // Uniform buffers as dynamic ones (their ring offsets given at bind time), when the program's count is within the GPU's limit: draws that differ only in
+        // their uniform data reuse one descriptor set (gfx_vk_draw.inc bind_sets). DM_VK_DYN_UBO=0: static ones
+        static int dyn_on = -1; if (dyn_on < 0) { const char *e = getenv("DM_VK_DYN_UBO"); dyn_on = !(e && *e == '0'); }
+        uint32_t nubo = 0;
+        for (int m = 0; m < 6; m++) if (r->st[m] && (m == VKS_CS) == (r->compute != 0)) for (int i = 0; i < r->st[m]->nb; i++) if (r->st[m]->b[i].vktype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) nubo += r->st[m]->b[i].count ? r->st[m]->b[i].count : 1;
+        r->dyn = dyn_on && nubo && nubo <= VK.limits.maxDescriptorSetUniformBuffersDynamic;
         for (int k = 0; k < nset && r->ok; k++) {
             const vks_shader *s = NULL;
             for (int m = 0; m < 6; m++) if (r->st[m] && vks_set_of(m) == k && (m == VKS_CS) == (r->compute != 0)) s = r->st[m];
-            r->set[k] = set_layout(s); if (!r->set[k]) r->ok = 0;
+            r->set[k] = set_layout(s, r->dyn); if (!r->set[k]) r->ok = 0;
         }
         if (r->ok && nset > (int)VK.limits.maxBoundDescriptorSets) { r->ok = 0; LOG("[RED] [vk] a program needs %d descriptor sets, the GPU allows %u", nset, VK.limits.maxBoundDescriptorSets); }
         if (r->ok) {

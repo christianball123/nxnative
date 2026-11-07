@@ -151,6 +151,7 @@ static vtex *tex_find(uint64_t serial) {
     if (v && v->alias) { vtex *b = tex_slot(v->alias, 0); if (b && b->img) return b; }
     return v;
 }
+static _Atomic int g_dsc_stale;   // gfx_vk_draw.inc
 static int g_rt_hint;   // the texture asked for is about to be a render target (a pass's attachment, a target clear): only those may be scaled (resolution scaling)
 static vtex *tex_get(const tex_t *t) {
     if (!t || !t->serial || !VK.ok) return NULL;
@@ -275,6 +276,7 @@ static void sub_wait_all(void);
 void mtl_tex_release(tex_t *t) {
     if (!t || !t->serial) return;
     sub_wait_all();   // a submission in flight may still read its storage back into guest memory: done first, so nothing lands in memory the game reuses
+    atomic_store(&g_dsc_stale, 1);   // descriptor sets that may hold its views are not reused (gfx_vk_draw.inc ws_commit)
     pthread_mutex_lock(&g_tex_mu);
     vtex *v = tex_slot(t->serial, 0);
     if (v) {
@@ -870,6 +872,7 @@ static uint64_t sub_commit_locked(int force) {
         if (g_hz[0].line) { char hb[400]; int o = 0; for (int i = 0; i < 16 && g_hz[i].line && o < 380; i++) o += snprintf(hb + o, sizeof hb - o, "%s%s:%d: %llu waits, %.1f ms, %llu bytes read each", i ? "; " : "", strrchr(g_hz[i].file, '/') ? strrchr(g_hz[i].file, '/') + 1 : g_hz[i].file, g_hz[i].line,
                 (unsigned long long)g_hz[i].n, g_hz[i].ns / 1e6, (unsigned long long)(g_hz[i].bytes / g_hz[i].n));
             LOG("[vk] waits for a write-back in flight, by where the bytes are read: %s", hb); memset(g_hz, 0, sizeof g_hz); }
+        if (g_dsc_hit + g_dsc_miss) { LOG("[vk] descriptor sets: %.0f%% reused (%llu reused, %llu written)", 100.0 * g_dsc_hit / (g_dsc_hit + g_dsc_miss), (unsigned long long)g_dsc_hit, (unsigned long long)g_dsc_miss); g_dsc_hit = g_dsc_miss = 0; }
         if (g_fwd_n || g_fwd_miss || g_fwd_post) { LOG("[vk] results in flight forwarded: on the GPU %llu times, counters and events written at once %llu times; %llu could not be (the CPU had written them, partly covered, or the forwarding buffer had moved on)",
             (unsigned long long)g_fwd_n, (unsigned long long)g_fwd_post, (unsigned long long)g_fwd_miss); g_fwd_n = g_fwd_miss = g_fwd_post = 0; }
         g_t_rec = g_t_submit = g_t_wait = g_t_done = g_t_n = g_t_gpu = 0; g_hazard_waits = 0;

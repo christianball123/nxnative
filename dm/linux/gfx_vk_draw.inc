@@ -454,7 +454,7 @@ static VkDescriptorSet desc_alloc(VkDescriptorSetLayout l) {
             if (g_ndp == DP_MAX) return VK_NULL_HANDLE;
             VkDescriptorPoolSize ps[] = {{VK_DESCRIPTOR_TYPE_SAMPLER, 4096}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192},
                                          {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4096}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 2048},
-                                         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192}};
+                                         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 32768}};
             VkDescriptorPoolCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 8192, sizeof ps / sizeof *ps, ps};
             if (vkCreateDescriptorPool_(VK.dev, &ci, NULL, &g_dp[g_ndp])) return VK_NULL_HANDLE;
             g_ndp++;
@@ -999,7 +999,7 @@ static uint32_t handle_of(int st, const vks_bind *b, int *ok) {
     }
     return 0;
 }
-typedef struct { VkWriteDescriptorSet w[256]; VkDescriptorBufferInfo bi[512]; VkDescriptorImageInfo ii[512]; VkBufferView tv[512]; uint32_t nw, nbi, nii, ntv; } wset;
+typedef struct { VkWriteDescriptorSet w[256]; VkDescriptorBufferInfo bi[512]; VkDescriptorImageInfo ii[512]; VkBufferView tv[512]; uint32_t nw, nbi, nii, ntv; int dyn; uint32_t ndo; struct { uint32_t binding, off; } dofs[64]; } wset;   // dofs: the dynamic uniform buffers' offsets
 static wset g_ws;
 
 // Texture buffers (NVN_TEXTURE_TARGET_BUFFER): the texture's storage (width texels of its format) copied into the ring like a uniform buffer, and a buffer view of
@@ -1031,7 +1031,7 @@ static VkBufferView tbuf_view(int st, const vks_bind *b, int storage) {
     return view;
 }
 static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
-    wset *W = &g_ws; W->nw = W->nbi = W->nii = W->ntv = 0;
+    wset *W = &g_ws; W->nw = W->nbi = W->nii = W->ntv = 0; W->ndo = 0;
     int sup_bi = -1; float bsc[64]; uint8_t bkind[64]; memset(bkind, 0, sizeof bkind);   // the support buffer's descriptor; each texture / image binding's resolution scale
     for (int i = 0; i < s->nb; i++) { const vks_bind *b = &s->b[i];   // every texture and image the translator indexes (not arrays, not separate samplers), scale 1 until known
         if (b->binding < 64 && (b->count <= 1) && b->vktype != VK_DESCRIPTOR_TYPE_SAMPLER && (b->kind == VKS_TEX || b->kind == VKS_IMG)) { bkind[b->binding] = (uint8_t)b->kind; bsc[b->binding] = 1.0f; } }
@@ -1063,6 +1063,11 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
             }
             if (off == ~0ull && addr && size) return -1;   // the ring is full
             for (uint32_t k = 0; k < n; k++) bi[k] = off != ~0ull ? (VkDescriptorBufferInfo){RG.b, off, size} : (VkDescriptorBufferInfo){DZ.zbuf, 0, 65536};
+            if (W->dyn && uni) {   // dynamic: the offset goes in at bind time (one per array element, in binding order)
+                w->descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+                for (uint32_t k = 0; k < n && W->ndo < 64; k++) { W->dofs[W->ndo].binding = b->binding << 8 | k; W->dofs[W->ndo++].off = (uint32_t)bi[k].offset; bi[k].offset = 0; }
+                if (b->kind == VKS_SUPPORT) sup_bi = -2 - (int)(W->ndo - n);   // its dynamic offset's index (patched below for resolution scales)
+            }
             break;
         }
         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {   // texture buffers: the guest's bytes in the ring, seen through a buffer view
@@ -1147,22 +1152,68 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
         for (int i = 0; i < 64 && n < 72; i++) if (bkind[i] == VKS_IMG) sc[n++] = bsc[i];
         uint64_t off = support_buffer_sc(rt, sc, n);
         if (off != ~0ull) W->bi[sup_bi].offset = off;
+    } else if (scaled && sup_bi <= -2) {
+        float sc[72]; int n = 0;
+        for (int i = 0; i < 64 && n < 72; i++) if (bkind[i] == VKS_TEX) sc[n++] = bsc[i];
+        for (int i = 0; i < 64 && n < 72; i++) if (bkind[i] == VKS_IMG) sc[n++] = bsc[i];
+        uint64_t off = support_buffer_sc(rt, sc, n);
+        if (off != ~0ull) W->dofs[-2 - sup_bi].off = (uint32_t)off;
     }
-    vkUpdateDescriptorSets_(VK.dev, W->nw, W->w, 0, NULL);
+    (void)set;
     return 1;
+}
+// Descriptor sets reused within a submission: a set's content (everything but the dynamic uniform buffer offsets) hashed with its layout; the same content again
+// binds the set already written. Draws mostly differ only in their uniform data, so with dynamic uniform buffers most need no new set (each new one cost a pool
+// allocation and a descriptor update, a large part of the replay's time per draw)
+#define DSC_CAP 8192
+static struct { uint64_t h; VkDescriptorSet set; } g_dsc[DSC_CAP]; static uint32_t g_dsc_n; static uint64_t g_dsc_hit, g_dsc_miss;
+static _Atomic int g_dsc_stale;   // a texture was released (its views are gone): no set made before is reused
+static void dsc_reset(void) { if (g_dsc_n) { memset(g_dsc, 0, sizeof g_dsc); g_dsc_n = 0; } }
+static uint64_t ws_hash(VkDescriptorSetLayout l) {
+    wset *W = &g_ws; uint64_t h = 1469598103934665603ull ^ (uint64_t)(uintptr_t)l;
+    #define HM(x) do { uint64_t x_ = (uint64_t)(x); h ^= x_; h *= 1099511628211ull; h ^= h >> 29; } while (0)
+    for (uint32_t i = 0; i < W->nw; i++) {
+        const VkWriteDescriptorSet *w = &W->w[i]; HM(w->dstBinding); HM(w->descriptorType); HM(w->descriptorCount);
+        for (uint32_t k = 0; k < w->descriptorCount; k++) {
+            if (w->pBufferInfo) { HM((uintptr_t)w->pBufferInfo[k].buffer); HM(w->pBufferInfo[k].offset); HM(w->pBufferInfo[k].range); }
+            if (w->pImageInfo) { HM((uintptr_t)w->pImageInfo[k].imageView); HM((uintptr_t)w->pImageInfo[k].sampler); HM(w->pImageInfo[k].imageLayout); }
+            if (w->pTexelBufferView) HM((uintptr_t)w->pTexelBufferView[k]);
+        }
+    }
+    #undef HM
+    return h ? h : 1;
+}
+static VkDescriptorSet ws_commit(VkDescriptorSetLayout l) {   // the set for what write_set gathered (reused, or allocated and written)
+    if (atomic_exchange(&g_dsc_stale, 0)) dsc_reset();
+    wset *W = &g_ws; uint64_t h = ws_hash(l); uint32_t i = (uint32_t)(h >> 40) & (DSC_CAP - 1);
+    for (int k = 0; k < 16; k++, i = (i + 1) & (DSC_CAP - 1)) {
+        if (g_dsc[i].h == h) { g_dsc_hit++; return g_dsc[i].set; }
+        if (!g_dsc[i].h) break;
+    }
+    VkDescriptorSet set = desc_alloc(l); if (!set) return VK_NULL_HANDLE;
+    for (uint32_t k = 0; k < W->nw; k++) W->w[k].dstSet = set;
+    vkUpdateDescriptorSets_(VK.dev, W->nw, W->w, 0, NULL);
+    g_dsc_miss++;
+    if (!g_dsc[i].h && g_dsc_n < DSC_CAP * 3 / 4) { g_dsc[i].h = h; g_dsc[i].set = set; g_dsc_n++; }
+    return set;
 }
 // The sets of a program, written and bound (graphics: one per stage, empty for absent stages; compute: set 0)
 static int bind_sets(const vks_prog *pr, VkPipelineBindPoint bp) {
-    VkDescriptorSet sets[5]; int nset = pr->nset;
+    VkDescriptorSet sets[5]; int nset = pr->nset; uint32_t dofs[128], ndo = 0;
     for (int k = 0; k < nset; k++) {
-        sets[k] = desc_alloc(pr->set[k]); if (!sets[k]) return 0;
         const vks_shader *s = NULL;
         for (int m = 0; m < 6; m++) if (pr->st[m] && vks_set_of(m) == k && (m == VKS_CS) == (pr->compute != 0)) s = pr->st[m];
-        if (!s) continue;
+        if (!s) { g_ws.nw = 0; sets[k] = ws_commit(pr->set[k]); if (!sets[k]) return 0; continue; }
         int st = 0; for (int x = 0; x < NST; x++) if (k_nvn2model[x] == s->model) st = x;
-        int r = write_set(s, st, sets[k]); if (r <= 0) return r;
+        g_ws.dyn = pr->dyn;
+        int r = write_set(s, st, VK_NULL_HANDLE); if (r <= 0) return r;
+        sets[k] = ws_commit(pr->set[k]); if (!sets[k]) return 0;
+        // this set's dynamic offsets, in binding order
+        wset *W = &g_ws;
+        for (uint32_t a = 1; a < W->ndo; a++) for (uint32_t b2 = a; b2 > 0 && W->dofs[b2 - 1].binding > W->dofs[b2].binding; b2--) { __typeof__(W->dofs[0]) t = W->dofs[b2]; W->dofs[b2] = W->dofs[b2 - 1]; W->dofs[b2 - 1] = t; }
+        for (uint32_t a = 0; a < W->ndo && ndo < 128; a++) dofs[ndo++] = W->dofs[a].off;
     }
-    vkCmdBindDescriptorSets_(g_cb, bp, pr->layout, 0, (uint32_t)nset, sets, 0, NULL);
+    vkCmdBindDescriptorSets_(g_cb, bp, pr->layout, 0, (uint32_t)nset, sets, ndo, ndo ? dofs : NULL);
     return 1;
 }
 
@@ -1614,7 +1665,7 @@ static void linear_readbacks(void) {
 static void rec_reset(void) {   // a new submission starts recording: the ring half and the descriptor pools it was given are its own from the start
     RG.used = RG.base; DZ.support_off = 0; g_support_n++;
     if (g_nrh_used) { memset(g_rh, 0, sizeof g_rh); g_nrh_used = 0; }
-    g_dp_cur = 0;
+    g_dp_cur = 0; dsc_reset();
 }
 static void draw_summary(char *out, size_t n) {
     int o = snprintf(out, n, "drawn %llu (%llu of them quads), dispatched %llu, pipelines %llu, textures uploaded %llu (%.0f MB, %llu failed, %llu again after CPU writes, %llu untracked; linear textures read back %llu times, %.0f MB)", (unsigned long long)g_drawn, (unsigned long long)g_quads, (unsigned long long)g_disp_done,
