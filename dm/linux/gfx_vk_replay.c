@@ -323,7 +323,7 @@ static stage_t *g_stage; static int g_nstage, g_stagecap;
 static void post(post_op o) { if (g_npost == g_postcap) { g_postcap = g_postcap ? g_postcap * 2 : 64; g_post = realloc(g_post, g_postcap * sizeof *g_post); } g_post[g_npost++] = o; }
 static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g = (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; } return nvn_timestamp_from_ns(g); }
 
-static void prof_cb_begin(void); static void prof_cb_end(void); static void prof_report(void);   // gfx_vk_draw.inc: the GPU profile
+static void prof_cb_begin(void); static void prof_cb_end(void); static void prof_report(void); static void bs_reset(void);   // gfx_vk_draw.inc: the GPU profile
 static int cb_begin(void) {
     if (!VK.ok) return 0;
     if (!g_pool) {
@@ -343,6 +343,7 @@ static int cb_begin(void) {
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT};
         vkCmdPipelineBarrier_(g_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         prof_cb_begin();
+        bs_reset();   // nothing bound in this command buffer yet (gfx_vk_draw.inc)
     }
     return 1;
 }
@@ -880,7 +881,7 @@ static uint64_t sub_commit_locked(int force) {
         if (g_hz[0].line) { char hb[400]; int o = 0; for (int i = 0; i < 16 && g_hz[i].line && o < 380; i++) o += snprintf(hb + o, sizeof hb - o, "%s%s:%d: %llu waits, %.1f ms, %llu bytes read each", i ? "; " : "", strrchr(g_hz[i].file, '/') ? strrchr(g_hz[i].file, '/') + 1 : g_hz[i].file, g_hz[i].line,
                 (unsigned long long)g_hz[i].n, g_hz[i].ns / 1e6, (unsigned long long)(g_hz[i].bytes / g_hz[i].n));
             LOG("[vk] waits for a write-back in flight, by where the bytes are read: %s", hb); memset(g_hz, 0, sizeof g_hz); }
-        if (g_dsc_hit + g_dsc_miss) { LOG("[vk] descriptor sets: %.0f%% reused (%llu reused, %llu written)", 100.0 * g_dsc_hit / (g_dsc_hit + g_dsc_miss), (unsigned long long)g_dsc_hit, (unsigned long long)g_dsc_miss); g_dsc_hit = g_dsc_miss = 0; }
+        if (g_dsc_hit + g_dsc_miss) { LOG("[vk] descriptor sets: %.0f%% reused (%llu reused, %llu written); binds skipped as already bound %llu", 100.0 * g_dsc_hit / (g_dsc_hit + g_dsc_miss), (unsigned long long)g_dsc_hit, (unsigned long long)g_dsc_miss, (unsigned long long)BS.saved); g_dsc_hit = g_dsc_miss = 0; }
         if (g_fwd_n || g_fwd_miss || g_fwd_post) { LOG("[vk] results in flight forwarded: on the GPU %llu times, counters and events written at once %llu times; %llu could not be (the CPU had written them, partly covered, or the forwarding buffer had moved on)",
             (unsigned long long)g_fwd_n, (unsigned long long)g_fwd_post, (unsigned long long)g_fwd_miss); g_fwd_n = g_fwd_miss = g_fwd_post = 0; }
         g_t_rec = g_t_submit = g_t_wait = g_t_done = g_t_n = g_t_gpu = 0; g_hazard_waits = 0;

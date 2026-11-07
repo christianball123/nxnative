@@ -959,16 +959,26 @@ static VkPipeline pipe_make(const vks_prog *pr, const pkey *k) {
     return p;
 }
 static VkPipeline pipe_get(const vks_prog *pr, const pkey *k) {
+    static pkey last; static VkPipeline last_p;   // the same state as the draw before (most draws): no hash
+    if (last_p && !memcmp(&last, k, sizeof *k)) return last_p;
     if (!g_pc) g_pc = calloc(PC_CAP, sizeof *g_pc);
+    VkPipeline p0 = VK_NULL_HANDLE;
+    #define PG_RET(x) do { p0 = (x); if (p0) { last = *k; last_p = p0; } return p0; } while (0)
     uint64_t h = pkey_hash(k); uint32_t i = (uint32_t)(h >> 40) & (PC_CAP - 1);
     for (uint32_t n = 0; n < PC_CAP; n++, i = (i + 1) & (PC_CAP - 1)) {
         if (!g_pc[i].used) break;
-        if (g_pc[i].hash == h && !memcmp(&g_pc[i].k, k, sizeof *k)) return g_pc[i].p;
+        if (g_pc[i].hash == h && !memcmp(&g_pc[i].k, k, sizeof *k)) PG_RET(g_pc[i].p);
     }
     VkPipeline p = pipe_make(pr, k);
     if (g_npc < PC_CAP * 3 / 4 && !g_pc[i].used) { g_pc[i].k = *k; g_pc[i].p = p; g_pc[i].hash = h; g_pc[i].used = 1; g_npc++; }
-    return p;
+    PG_RET(p);
+    #undef PG_RET
 }
+// What the command buffer has bound already (per command buffer: cb_begin clears it): the same pipeline, vertex buffers, index buffer, viewports, scissors and descriptor
+// sets as the draw before are not bound again (each bind is driver work on the CPU, about 1,650 draws a frame)
+static struct { VkPipeline pipe; VkDeviceSize vo[17]; VkBuffer vb[17]; uint32_t vset; VkDeviceSize io; VkIndexType it; int ib; uint32_t nvp; VkViewport vp[16]; VkRect2D sc[16];
+                VkPipelineLayout lay; VkDescriptorSet sets[5]; uint32_t nset, ndo, dofs[128]; uint64_t saved; } BS;
+static void bs_reset(void) { memset(&BS, 0, sizeof BS); }
 
 // ---------------------------------------------------------------- descriptors: one set for a shader, from the bound state of its NVN stage
 // A texture binding's handle words (spv_pack.py): a word in the driver table c2 names a slot (combined BindTexture slots, separate textures, images, separate samplers);
@@ -1213,7 +1223,9 @@ static int bind_sets(const vks_prog *pr, VkPipelineBindPoint bp) {
         for (uint32_t a = 1; a < W->ndo; a++) for (uint32_t b2 = a; b2 > 0 && W->dofs[b2 - 1].binding > W->dofs[b2].binding; b2--) { __typeof__(W->dofs[0]) t = W->dofs[b2]; W->dofs[b2] = W->dofs[b2 - 1]; W->dofs[b2 - 1] = t; }
         for (uint32_t a = 0; a < W->ndo && ndo < 128; a++) dofs[ndo++] = W->dofs[a].off;
     }
+    if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS && BS.lay == pr->layout && BS.nset == (uint32_t)nset && BS.ndo == ndo && !memcmp(BS.sets, sets, nset * sizeof *sets) && !memcmp(BS.dofs, dofs, ndo * 4)) { BS.saved++; return 1; }
     vkCmdBindDescriptorSets_(g_cb, bp, pr->layout, 0, (uint32_t)nset, sets, ndo, ndo ? dofs : NULL);
+    if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) { BS.lay = pr->layout; BS.nset = (uint32_t)nset; BS.ndo = ndo; memcpy(BS.sets, sets, nset * sizeof *sets); memcpy(BS.dofs, dofs, ndo * 4); }
     return 1;
 }
 
@@ -1369,15 +1381,14 @@ static void do_draw(const draw_args *a) {
         if (!pass_begin()) { g_skip[SK_NORT]++; return; }
         // the pass was begun again with the same targets: the sets bound above are still bound (binding state is command-buffer state, not render-pass state)
     }
-    vkCmdBindPipeline_(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    VkBuffer vbufs[17]; VkDeviceSize voffs[17]; uint32_t nb = 0;
+    if (BS.pipe != pipe) { vkCmdBindPipeline_(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); BS.pipe = pipe; } else BS.saved++;
     for (uint32_t b = 0; b < 17; b++) if (k.vb_used >> b & 1) {
         // vkCmdBindVertexBuffers binds a contiguous range of bindings: bind each on its own
         VkBuffer vb = (int)b == zb ? DZ.zbuf : RG.b; VkDeviceSize vo = (int)b == zb ? 0 : vb_off[b];
-        vkCmdBindVertexBuffers_(g_cb, b, 1, &vb, &vo); nb++;
+        if ((BS.vset >> b & 1) && BS.vb[b] == vb && BS.vo[b] == vo) { BS.saved++; continue; }
+        vkCmdBindVertexBuffers_(g_cb, b, 1, &vb, &vo); BS.vb[b] = vb; BS.vo[b] = vo; BS.vset |= 1u << b;
     }
-    (void)vbufs; (void)voffs; (void)nb;
-    if (indexed) vkCmdBindIndexBuffer_(g_cb, RG.b, ib_off, it);
+    if (indexed) { if (!BS.ib || BS.io != ib_off || BS.it != it) { vkCmdBindIndexBuffer_(g_cb, RG.b, ib_off, it); BS.ib = 1; BS.io = ib_off; BS.it = it; } else BS.saved++; }
     // the viewports (NVN x, y, w, h; depth range from SetDepthRange); upper-left origin: negative height (see the top of this file). One unless a geometry stage picks one
     static int flipy = -1; if (flipy < 0) { const char *e = getenv("DM_VK_FLIP_Y"); flipy = e && *e ? atoi(e) : -1; if (flipy < 0) flipy = 2; }
     int flip = flipy == 2 ? !ll : flipy;
@@ -1401,8 +1412,10 @@ static void do_draw(const draw_args *a) {
         vps[i] = (VkViewport){vx, flip ? vy + vh : vy, vw, flip ? -vh : vh, D.dr[0], D.dr[1]};
         scs[i] = (VkRect2D){{sx, sy}, {sw, sh}};   // NVN's other scissors are not recorded (hle_nvn.c SetScissors keeps index 0)
     }
-    vkCmdSetViewport_(g_cb, 0, nvp, vps);
-    vkCmdSetScissor_(g_cb, 0, nvp, scs);
+    if (BS.nvp != nvp || memcmp(BS.vp, vps, nvp * sizeof *vps) || memcmp(BS.sc, scs, nvp * sizeof *scs)) {
+        vkCmdSetViewport_(g_cb, 0, nvp, vps); vkCmdSetScissor_(g_cb, 0, nvp, scs);
+        BS.nvp = nvp; memcpy(BS.vp, vps, nvp * sizeof *vps); memcpy(BS.sc, scs, nvp * sizeof *scs);
+    } else BS.saved++;
     if (g_dump_subs && g_dump_lines < 4000) { g_dump_lines++;
         LOG("[vk] dump:   pass %d draw: vertex %016llx fragment %016llx, %u vertices × %u (prim %d), viewport %.0f,%.0f %.0fx%.0f (asked %.0f,%.0f %.0fx%.0f), scissor %d,%d %ux%u, colour mask %#x, blend %#x (target 0: %u %u %u / %u %u %u), alpha test %u, depth test %d write %d",
             g_dump_pass, pr->st[VKS_VS] ? (unsigned long long)pr->st[VKS_VS]->key : 0ull, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull, a->count, a->instances, a->prim,
@@ -1415,7 +1428,7 @@ static void do_draw(const draw_args *a) {
     uint32_t inst = a->instances ? a->instances : 1;
     for (uint32_t v = 0; v < (k.nogs ? nvp : 1); v++) {
         if (k.nogs && !(gmask >> v & 1)) continue;
-        if (k.nogs) { vkCmdSetViewport_(g_cb, 0, 1, &vps[v]); vkCmdSetScissor_(g_cb, 0, 1, &scs[v]); }
+        if (k.nogs) { vkCmdSetViewport_(g_cb, 0, 1, &vps[v]); vkCmdSetScissor_(g_cb, 0, 1, &scs[v]); BS.nvp = 0; }
         if (indexed) vkCmdDrawIndexed_(g_cb, icount, inst, 0, quads && !a->indexed ? 0 : a->base_vertex, a->base_instance);
         else vkCmdDraw_(g_cb, a->count, inst, a->first, a->base_instance);
     }
