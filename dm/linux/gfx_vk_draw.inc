@@ -494,7 +494,109 @@ static int g_dump_subs, g_dump_pass, g_dump_lines, g_dump_light;
 static vtex *g_dump_tex[64]; static int g_ndump_tex; static uint64_t g_dump_saved[512]; static int g_ndump_saved;   // sampled textures to save after the pass (once per dump)   // frame dumps (below)
 static void prof_mark(int begin, uint32_t w, uint32_t h, uint32_t ncol, uint32_t depth, uint32_t compute, uint64_t fs, uint64_t draws);
 static uint64_t g_pass_fs;
-static void pass_end(void) { if (P.open) { vkCmdEndRendering_(g_cb); prof_mark(0, P.w, P.h, P.ncol, P.dv != NULL, 0, g_pass_fs, g_drawn - P.draws0); full_barrier(); P.open = 0; dump_pass(); } }
+// Render target clears go into the render pass (a tile-based GPU such as the Adreno then starts its tiles from the clear value instead of loading the whole target from
+// memory, and a clear between draws no longer splits the pass). Outside a pass a clear waits here until the next pass begins: one of its attachments takes it as its load
+// operation. Anything else that ends a pass (copies, dispatches, the submission's end) does the waiting clears first, as image clears
+typedef struct { vtex *v; uint32_t lv, l0, nlay; VkImageAspectFlags asp; float rgba[4]; float depth; uint32_t stencil; int done; } pclear;
+static pclear g_pcl[24]; static int g_npcl; static uint64_t g_clear_load, g_clear_att, g_clear_img;
+static void pcl_image(const pclear *c) {
+    VkImageSubresourceRange rr = {c->asp, c->lv, 1, c->l0, c->nlay};
+    if (c->asp & VK_IMAGE_ASPECT_COLOR_BIT) {
+        VkClearColorValue cv; memcpy(cv.float32, c->rgba, 16);
+        if (fmt_int(c->v->fmt)) for (int i = 0; i < 4; i++) cv.uint32[i] = (uint32_t)c->rgba[i];
+        vkCmdClearColorImage_(g_cb, c->v->img, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &rr);
+    } else { VkClearDepthStencilValue z = {c->depth, c->stencil}; vkCmdClearDepthStencilImage_(g_cb, c->v->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rr); }
+    g_clear_img++;
+}
+static void clears_flush(void) {
+    if (!g_npcl) return;
+    int any = 0;
+    for (int i = 0; i < g_npcl; i++) if (!g_pcl[i].done && g_pcl[i].v->img) { pcl_image(&g_pcl[i]); any = 1; }
+    g_npcl = 0;
+    if (any) full_barrier();
+}
+static void pass_end(void) { if (P.open) { vkCmdEndRendering_(g_cb); prof_mark(0, P.w, P.h, P.ncol, P.dv != NULL, 0, g_pass_fs, g_drawn - P.draws0); full_barrier(); P.open = 0; dump_pass(); } else clears_flush(); }
+static VkClearValue pcl_value(const pclear *c, VkFormat vf) {
+    VkClearValue cv; memset(&cv, 0, sizeof cv);
+    if (c->asp & VK_IMAGE_ASPECT_COLOR_BIT) { memcpy(cv.color.float32, c->rgba, 16); if (fmt_int(vf)) for (int i = 0; i < 4; i++) cv.color.uint32[i] = (uint32_t)c->rgba[i]; }
+    else { cv.depthStencil.depth = c->depth; cv.depthStencil.stencil = c->stencil; }
+    return cv;
+}
+static int lvl_is(const vtex *v, uint32_t lv, uint32_t w, uint32_t h) { return (v->w >> lv ? v->w >> lv : 1) == w && (v->h >> lv ? v->h >> lv : 1) == h; }
+// A clear of target v (level lv, layers l0..l0+nlay): into the open pass, or kept for the next one. 0: not taken (the caller ends the pass and clears the image)
+static int clear_defer(vtex *v, uint32_t lv, uint32_t l0, uint32_t nlay, VkImageAspectFlags asp, const float *rgba, float depth, uint32_t stencil) {
+    static int off = -1; if (off < 0) { const char *e = getenv("DM_VK_CLEAR_IN_PASS"); off = e && *e == '0'; }
+    if (off || v->is3d || nlay != 1) return 0;
+    pclear c = {v, lv, l0, nlay, asp, {0}, depth, stencil, 0}; if (rgba) memcpy(c.rgba, rgba, 16);
+    if (P.open) {
+        VkClearAttachment ca = {asp, 0, pcl_value(&c, VK_FORMAT_UNDEFINED)};
+        int ok = 0;
+        if (asp & VK_IMAGE_ASPECT_COLOR_BIT) {
+            for (uint32_t i = 0; i < P.ncol && i < 8; i++) if (P.cv[i] == v && P.clv[i] == lv && P.cl0[i] == l0) { ca.colorAttachment = i; ca.clearValue = pcl_value(&c, P.cf[i]); ok = 1; break; }
+        } else ok = P.dv == v && P.dlv == lv && P.dl0 == l0 && (!(asp & VK_IMAGE_ASPECT_DEPTH_BIT) || P.has_d) && (!(asp & VK_IMAGE_ASPECT_STENCIL_BIT) || P.has_s);
+        if (ok && lvl_is(v, lv, P.w, P.h)) {
+            VkClearRect r = {{{0, 0}, {P.w, P.h}}, 0, 1};
+            vkCmdClearAttachments_(g_cb, 1, &ca, 1, &r); g_clear_att++; g_cb_ops++;
+            return 1;
+        }
+        pass_end();
+    }
+    for (int i = 0; i < g_npcl; i++)   // the same clear again: the later value
+        if (g_pcl[i].v == v && g_pcl[i].lv == lv && g_pcl[i].l0 == l0 && g_pcl[i].asp == asp) { g_pcl[i] = c; return 1; }
+    if (g_npcl == (int)(sizeof g_pcl / sizeof *g_pcl)) clears_flush();
+    g_pcl[g_npcl++] = c;
+    return 1;
+}
+// At a pass's start (attachments known, before vkCmdBeginRendering): the waiting clears its attachments take as their load operation; the rest are done as image clears.
+// All of one image's clears go the same way, so they stay in order
+static void clears_into_pass(VkRenderingAttachmentInfo *ca, VkRenderingAttachmentInfo *da, VkRenderingAttachmentInfo *sa, uint32_t w, uint32_t h) {
+    if (!g_npcl) return;
+    int take[24];
+    for (int i = 0; i < g_npcl; i++) {
+        pclear *c = &g_pcl[i]; take[i] = 0;
+        if (!lvl_is(c->v, c->lv, w, h)) continue;
+        if (c->asp & VK_IMAGE_ASPECT_COLOR_BIT) { for (uint32_t k = 0; k < P.ncol && k < 8; k++) if (P.cv[k] == c->v && P.clv[k] == c->lv && P.cl0[k] == c->l0) take[i] = 1 + k; }
+        else if (P.dv == c->v && P.dlv == c->lv && P.dl0 == c->l0 && (!(c->asp & VK_IMAGE_ASPECT_DEPTH_BIT) || P.has_d) && (!(c->asp & VK_IMAGE_ASPECT_STENCIL_BIT) || P.has_s)) take[i] = 100;
+    }
+    for (int i = 0; i < g_npcl; i++) if (!take[i]) for (int j = 0; j < g_npcl; j++) if (g_pcl[j].v == g_pcl[i].v) take[j] = 0;
+    int img = 0;
+    for (int i = 0; i < g_npcl; i++) {
+        pclear *c = &g_pcl[i];
+        if (!take[i]) { if (c->v->img) { pcl_image(c); img = 1; } continue; }
+        if (take[i] == 100) {
+            if (c->asp & VK_IMAGE_ASPECT_DEPTH_BIT) { da->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; da->clearValue.depthStencil.depth = c->depth; }
+            if (c->asp & VK_IMAGE_ASPECT_STENCIL_BIT) { sa->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; sa->clearValue.depthStencil.stencil = c->stencil; }
+        } else { ca[take[i] - 1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca[take[i] - 1].clearValue = pcl_value(c, P.cf[take[i] - 1]); }
+        g_clear_load++;
+    }
+    g_npcl = 0;
+    if (img) full_barrier();
+}
+static void clear_color(const p_clear_color *c) {
+    if (!R.has_rt || c->index < 0 || c->index >= R.rt.n || !R.rt.color[c->index]) return;
+    if (P.open) { vtex *pv = tex_get(R.rt.color[c->index]); if (!pv || !(pv->bad & 2)) pass_end(); }   // its first use records commands outside a pass
+    vtex *v = use(R.rt.color[c->index]); if (!v) return;
+    gpu_wrote(v);
+    static int warned; if (c->mask != 0xf && !warned++) LOG("[vk] a colour clear with channel mask %#x was done on all channels (stage B has no masked clears)", c->mask);
+    uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.cview[c->index], R.rt.has_cview[c->index], &lv, &nl, &l0, &nlay);
+    if (clear_defer(v, lv, l0, nlay, VK_IMAGE_ASPECT_COLOR_BIT, c->rgba, 0, 0)) return;
+    pass_end();
+    pclear pc = {v, lv, l0, nlay, VK_IMAGE_ASPECT_COLOR_BIT, {0}, 0, 0, 0}; memcpy(pc.rgba, c->rgba, 16);
+    pcl_image(&pc); full_barrier();
+}
+static void clear_ds(const p_clear_ds *c) {
+    if (!R.has_rt || !R.rt.depth) return;
+    if (P.open) { vtex *pv = tex_get(R.rt.depth); if (!pv || !(pv->bad & 2)) pass_end(); }
+    vtex *v = use(R.rt.depth); if (!v) return;
+    gpu_wrote(v);
+    VkImageAspectFlags a = fmt_aspects(v->fmt) & ((c->depth_mask ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (c->stencil_mask ? VK_IMAGE_ASPECT_STENCIL_BIT : 0));
+    if (!a) return;
+    uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.dview, R.rt.has_dview, &lv, &nl, &l0, &nlay);
+    if (clear_defer(v, lv, l0, nlay, a, NULL, c->depth, (uint32_t)c->stencil)) return;
+    pass_end();
+    pclear pc = {v, lv, l0, nlay, a, {0}, c->depth, (uint32_t)c->stencil, 0};
+    pcl_image(&pc); full_barrier();
+}
 // A texture a draw reads, ready for it: its first use (layout, zero fill) and its guest content are command-buffer work outside a render pass, so a pass open then is ended first
 static vtex *prep_tex(const tex_t *t) {
     vtex *v = tex_get(t); if (!v) return NULL;
@@ -624,8 +726,9 @@ static int pass_begin(void) {
             }
         }
     }
-    if (!any) return 0;
+    if (!any) { clears_flush(); return 0; }
     if (!cb_begin()) return 0;
+    clears_into_pass(ca, &da, &sa, w, h);
     P.w = w; P.h = h; P.samples = samples ? samples : 1; P.draws0 = g_drawn;
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, 1, 0, nc, ca, P.has_d ? &da : NULL, P.has_s ? &sa : NULL};
     g_pass_fs = 0; prof_mark(1, w, h, nc, P.dv != NULL, 0, 0, 0);
@@ -1412,6 +1515,7 @@ static void draw_summary(char *out, size_t n) {
     if (g_storage_unsup && o < (int)n) o += snprintf(out + o, n - o, "; shader images in a format that cannot be written %llu", (unsigned long long)g_storage_unsup);
     if (g_tex_unreg && o < (int)n) o += snprintf(out + o, n - o, "; bound texture IDs not registered %llu", (unsigned long long)g_tex_unreg);
     if (g_ring_forgot && o < (int)n) o += snprintf(out + o, n - o, "; copies made again after the command stream changed their bytes %llu", (unsigned long long)g_ring_forgot);
+    if ((g_clear_load || g_clear_att || g_clear_img) && o < (int)n) o += snprintf(out + o, n - o, "; render target clears: as a pass's load %llu, inside a pass %llu, as image clears %llu", (unsigned long long)g_clear_load, (unsigned long long)g_clear_att, (unsigned long long)g_clear_img);
     if ((g_tbuf_n || g_tbuf_miss) && o < (int)n) o += snprintf(out + o, n - o, "; texture buffers bound %llu, unusable %llu", (unsigned long long)g_tbuf_n, (unsigned long long)g_tbuf_miss);
     if (g_tex_unres && o < (int)n) o += snprintf(out + o, n - o, "; texture handles not decoded %llu", (unsigned long long)g_tex_unres);
     if (g_unsup_sbuf_ubo && o < (int)n) snprintf(out + o, n - o, "; storage buffers addressed through uniforms (not bound) %llu", (unsigned long long)g_unsup_sbuf_ubo);

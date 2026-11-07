@@ -336,28 +336,6 @@ void ring_forget(uint64_t addr, uint64_t n);   // gfx_vk_draw.inc: guest bytes c
 static void tex_fill(vtex *v, const tex_t *t);   // gfx_vk_draw.inc: a texture the GPU has not written gets its guest-memory content
 
 // ---------------------------------------------------------------- operations
-static void clear_color(const p_clear_color *c) {
-    if (!R.has_rt || c->index < 0 || c->index >= R.rt.n || !R.rt.color[c->index]) return;
-    vtex *v = use(R.rt.color[c->index]); if (!v) return;
-    gpu_wrote(v);
-    static int warned; if (c->mask != 0xf && !warned++) LOG("[vk] a colour clear with channel mask %#x was done on all channels (stage B has no masked clears)", c->mask);
-    uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.cview[c->index], R.rt.has_cview[c->index], &lv, &nl, &l0, &nlay);
-    VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 1, l0, nlay};
-    VkClearColorValue cv; memcpy(cv.float32, c->rgba, 16);
-    if (fmt_int(v->fmt)) for (int i = 0; i < 4; i++) cv.uint32[i] = (uint32_t)c->rgba[i];
-    vkCmdClearColorImage_(g_cb, v->img, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &rr); full_barrier();
-}
-static void clear_ds(const p_clear_ds *c) {
-    if (!R.has_rt || !R.rt.depth) return;
-    vtex *v = use(R.rt.depth); if (!v) return;
-    gpu_wrote(v);
-    VkImageAspectFlags a = fmt_aspects(v->fmt) & ((c->depth_mask ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (c->stencil_mask ? VK_IMAGE_ASPECT_STENCIL_BIT : 0));
-    if (!a) return;
-    uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.dview, R.rt.has_dview, &lv, &nl, &l0, &nlay);
-    VkImageSubresourceRange rr = {a, lv, 1, l0, nlay};
-    VkClearDepthStencilValue z = {c->depth, (uint32_t)c->stencil};
-    vkCmdClearDepthStencilImage_(g_cb, v->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rr); full_barrier();
-}
 static void clear_tex(const p_clear_tex *c) {
     vtex *v = use(c->tex); if (!v) return;
     gpu_wrote(v);
@@ -472,8 +450,8 @@ static void mtl_exec_body(const uint8_t *p) {
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); pend_hazard(d, n); memcpy((void *)(uintptr_t)d, a + 16, n); ring_forget(d, n); break; }
         case OP_COPY_STRIDE: { const p_copy_stride *cs = (const p_copy_stride *)a; if (cs->image) R.copy_img_stride = cs->stride; else R.copy_stride = cs->stride; break; }
         case OP_SET_RT: if (VK.ok) pass_end(); R.rt = *(const p_set_rt *)a; R.has_rt = 1; break;
-        case OP_CLEAR_COLOR: if (VK.ok) { pass_end(); clear_color((const p_clear_color *)a); } break;
-        case OP_CLEAR_DS: if (VK.ok) { pass_end(); clear_ds((const p_clear_ds *)a); } break;
+        case OP_CLEAR_COLOR: if (VK.ok) clear_color((const p_clear_color *)a); break;   // into the render pass when it can (gfx_vk_draw.inc)
+        case OP_CLEAR_DS: if (VK.ok) clear_ds((const p_clear_ds *)a); break;
         case OP_CLEAR_TEX: if (VK.ok) { pass_end(); clear_tex((const p_clear_tex *)a); } break;
         case OP_COPY_B2T: if (VK.ok) { pass_end(); copy_b2t((const p_copy_b2t *)a); } break;
         case OP_COPY_T2B: if (VK.ok) { pass_end(); copy_t2b((const p_copy_t2t *)a); } break;
