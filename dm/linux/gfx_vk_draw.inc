@@ -488,7 +488,7 @@ static const char *k_sk[SK_N] = {"shaders not ready", "no render target", "tesse
 static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g_tex_missing, g_tex_unres, g_tex_unreg, g_storage_unsup;
 
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
-static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0, cser[8]; VkFormat cvf[8]; } P;
+static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0, cser[8]; VkFormat cvf[8]; vtex *clr[10]; int nclr; } P;   // clr: attachments this pass cleared (load op or in-pass clear)
 static void dump_pass(void);
 static int g_dump_subs, g_dump_pass, g_dump_lines, g_dump_light;
 static vtex *g_dump_tex[64]; static int g_ndump_tex; static uint64_t g_dump_saved[512]; static int g_ndump_saved;   // sampled textures to save after the pass (once per dump)   // frame dumps (below)
@@ -498,7 +498,7 @@ static uint64_t g_pass_fs;
 // memory, and a clear between draws no longer splits the pass). Outside a pass a clear waits here until the next pass begins: one of its attachments takes it as its load
 // operation. Anything else that ends a pass (copies, dispatches, the submission's end) does the waiting clears first, as image clears
 typedef struct { vtex *v; uint32_t lv, l0, nlay; VkImageAspectFlags asp; float rgba[4]; float depth; uint32_t stencil; int done; } pclear;
-static pclear g_pcl[24]; static int g_npcl; static uint64_t g_clear_load, g_clear_att, g_clear_img, g_clear_why[128], g_clear_untaken; static uint32_t g_cur_op;   // why: the op that made waiting clears image clears
+static pclear g_pcl[24]; static int g_npcl; static uint64_t g_clear_load, g_clear_att, g_clear_img, g_clear_why[128], g_clear_untaken, g_clear_split; static uint32_t g_cur_op;   // why: the op that made waiting clears image clears
 static void pcl_image(const pclear *c) {
     VkImageSubresourceRange rr = {c->asp, c->lv, 1, c->l0, c->nlay};
     if (c->asp & VK_IMAGE_ASPECT_COLOR_BIT) {
@@ -537,7 +537,7 @@ static int clear_defer(vtex *v, uint32_t lv, uint32_t l0, uint32_t nlay, VkImage
         } else ok = P.dv == v && P.dlv == lv && P.dl0 == l0 && (!(asp & VK_IMAGE_ASPECT_DEPTH_BIT) || P.has_d) && (!(asp & VK_IMAGE_ASPECT_STENCIL_BIT) || P.has_s);
         if (ok && lvl_is(v, lv, P.w, P.h)) {
             VkClearRect r = {{{0, 0}, {P.w, P.h}}, 0, 1};
-            vkCmdClearAttachments_(g_cb, 1, &ca, 1, &r); g_clear_att++; g_cb_ops++;
+            vkCmdClearAttachments_(g_cb, 1, &ca, 1, &r); g_clear_att++; g_cb_ops++; if (P.nclr < 10) P.clr[P.nclr++] = v;
             return 1;
         }
         pass_end();
@@ -568,7 +568,7 @@ static void clears_into_pass(VkRenderingAttachmentInfo *ca, VkRenderingAttachmen
             if (c->asp & VK_IMAGE_ASPECT_DEPTH_BIT) { da->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; da->clearValue.depthStencil.depth = c->depth; }
             if (c->asp & VK_IMAGE_ASPECT_STENCIL_BIT) { sa->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; sa->clearValue.depthStencil.stencil = c->stencil; }
         } else { ca[take[i] - 1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca[take[i] - 1].clearValue = pcl_value(c, P.cf[take[i] - 1]); }
-        g_clear_load++;
+        g_clear_load++; if (P.nclr < 10) P.clr[P.nclr++] = c->v;
     }
     g_npcl = 0;
     if (img) full_barrier();
@@ -1007,6 +1007,9 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                 int why = 0;   // 1 no image (format or size refused), 2 the format cannot be a shader image (storage), 3 no view of the shader's image type
                 if (r && b->vktype != VK_DESCRIPTOR_TYPE_SAMPLER) {
                     vtex *v = prep_tex(&r->t);
+                    // a target this pass cleared, also read by its shaders: a tile-based GPU has the clear only in its tiles, the texture reads memory. The pass ends (its
+                    // clear stored) and begins again loading it, so the shaders read the cleared target as with an image clear (Mario Tennis Fever's picture went black)
+                    if (v && P.open) for (int c = 0; c < P.nclr; c++) if (P.clr[c] == v) { pass_end(); g_clear_split++; break; }
                     if (!v) why = 1;
                     else if (storage && !v->storage) why = 2;
                     else { iv = tex_view(v, &r->t, &r->v, r->has_v, b->image, storage); if (storage && iv) gpu_wrote(v); if (!iv) why = 3; }
@@ -1516,7 +1519,7 @@ static void draw_summary(char *out, size_t n) {
     if (g_storage_unsup && o < (int)n) o += snprintf(out + o, n - o, "; shader images in a format that cannot be written %llu", (unsigned long long)g_storage_unsup);
     if (g_tex_unreg && o < (int)n) o += snprintf(out + o, n - o, "; bound texture IDs not registered %llu", (unsigned long long)g_tex_unreg);
     if (g_ring_forgot && o < (int)n) o += snprintf(out + o, n - o, "; copies made again after the command stream changed their bytes %llu", (unsigned long long)g_ring_forgot);
-    if ((g_clear_load || g_clear_att || g_clear_img) && o < (int)n) o += snprintf(out + o, n - o, "; render target clears: as a pass's load %llu, inside a pass %llu, as image clears %llu (%llu not attachments of the next pass", (unsigned long long)g_clear_load, (unsigned long long)g_clear_att, (unsigned long long)g_clear_img, (unsigned long long)g_clear_untaken);
+    if ((g_clear_load || g_clear_att || g_clear_img) && o < (int)n) o += snprintf(out + o, n - o, "; render target clears: as a pass's load %llu, inside a pass %llu, as image clears %llu (%llu not attachments of the next pass; passes split for a cleared target read as a texture %llu", (unsigned long long)g_clear_load, (unsigned long long)g_clear_att, (unsigned long long)g_clear_img, (unsigned long long)g_clear_untaken, (unsigned long long)g_clear_split);
     for (int r = 0; r < 4 && o < (int)n; r++) { int b = -1; for (int i = 0; i < 128; i++) if (g_clear_why[i] && (b < 0 || g_clear_why[i] > g_clear_why[b])) b = i; if (b < 0) break;
         o += snprintf(out + o, n - o, ", %llu before op %d", (unsigned long long)g_clear_why[b], b); g_clear_why[b] = 0; }
     if (o < (int)n) o += snprintf(out + o, n - o, ")");
