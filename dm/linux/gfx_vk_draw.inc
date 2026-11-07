@@ -488,7 +488,7 @@ static const char *k_sk[SK_N] = {"shaders not ready", "no render target", "tesse
 static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g_tex_missing, g_tex_unres, g_tex_unreg, g_storage_unsup;
 
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
-static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0, cser[8]; VkFormat cvf[8]; vtex *clr[10]; int nclr; } P;   // clr: attachments this pass cleared (load op or in-pass clear)
+static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0, cser[8]; VkFormat cvf[8]; vtex *clr[10]; int nclr; uint32_t cdirty; int ddirty; } P;   // clr: attachments this pass cleared (load op or in-pass clear)
 static void dump_pass(void);
 static int g_dump_subs, g_dump_pass, g_dump_lines, g_dump_light;
 static vtex *g_dump_tex[64]; static int g_ndump_tex; static uint64_t g_dump_saved[512]; static int g_ndump_saved;   // sampled textures to save after the pass (once per dump)   // frame dumps (below)
@@ -1018,8 +1018,10 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                     // sit in its caches (or compressed, or in a tile), and the texture reads memory. The pass ends (written out) and begins again. On the Thor's GPU,
                     // passes rendered straight to memory (TU_DEBUG=sysmem, and render target clears in passes, which change the driver's choice) read garbage there
                     // and Mario Tennis Fever's picture went black. NVN orders such reads with a texture barrier, which the replay records as nothing
-                    if (v && P.open && g_drawn > P.draws0 && fb_on()) {
-                        int hit = P.dv == v; for (uint32_t c = 0; c < P.ncol && c < 8 && !hit; c++) hit = P.cv[c] == v;
+                    // Only when a draw of this pass wrote it (dirty: the colour channels or the depth / stencil writes on): particles reading the depth they test against,
+                    // with depth writes off, do not end the pass each
+                    if (v && P.open && fb_on()) {
+                        int hit = P.dv == v && P.ddirty; for (uint32_t c = 0; c < P.ncol && c < 8 && !hit; c++) hit = P.cv[c] == v && (P.cdirty >> c & 1);
                         if (hit) { pass_end(); g_fb_split++; }
                     }
                     if (!v) why = 1;
@@ -1278,6 +1280,8 @@ static void do_draw(const draw_args *a) {
         else vkCmdDraw_(g_cb, a->count, inst, a->first, a->base_instance);
     }
     g_drawn++; g_cb_ops++;
+    for (uint32_t c = 0; c < P.ncol && c < 8; c++) if (P.cv[c] && (k.chmask >> (4 * c) & 0xf)) P.cdirty |= 1u << c;
+    if (P.dv && ((k.ds.dt && k.ds.dw) || k.ds.st)) P.ddirty = 1;
 }
 static void draw_op(uint32_t op, const uint8_t *a, uint32_t size) {
     if (op == OP_DRAW) {
