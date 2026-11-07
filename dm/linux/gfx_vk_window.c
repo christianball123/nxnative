@@ -457,10 +457,15 @@ void vkw_present(uint64_t n, VkImage gimg, uint32_t gw, uint32_t gh, const int c
     VkResult r = vkAcquireNextImageKHR_(VK.dev, W.sc, UINT64_MAX, W.acquired[s], VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { W.resized = 1; pthread_mutex_unlock(&VK.qmu); return; }
     if (r && r != VK_SUBOPTIMAL_KHR) { LOG("[RED] [vk] vkAcquireNextImageKHR failed (%d)", r); pthread_mutex_unlock(&VK.qmu); return; }
+    // the present's own GPU time (the blits into the window), from this slot's last use (its fence is done): logged with the frame rate
+    static VkQueryPool pq; static int pq_used[SWAP_MAX]; static double pms; static uint64_t pn;
+    if (!pq && VK.limits.timestampPeriod > 0) { VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * SWAP_MAX, 0}; if (vkCreateQueryPool_(VK.dev, &qi, NULL, &pq)) pq = VK_NULL_HANDLE; }
+    if (pq && pq_used[s]) { uint64_t t2[2]; if (!vkGetQueryPoolResults_(VK.dev, pq, 2 * s, 2, sizeof t2, t2, 8, VK_QUERY_RESULT_64_BIT) && t2[1] > t2[0]) { pms += (t2[1] - t2[0]) * VK.limits.timestampPeriod / 1e6; pn++; } }
     vkResetFences_(VK.dev, 1, &W.fence[s]);
     VkCommandBuffer cb = W.cb[s]; vkResetCommandBuffer_(cb, 0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
     vkBeginCommandBuffer_(cb, &bi);
+    if (pq) { vkCmdResetQueryPool_(cb, pq, 2 * s, 2); vkCmdWriteTimestamp_(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pq, 2 * s); }
     barrier(cb, W.img[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     if (gimg) {
@@ -508,6 +513,7 @@ void vkw_present(uint64_t n, VkImage gimg, uint32_t gw, uint32_t gh, const int c
         vkCmdClearColorImage_(cb, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &rr);
     }
     barrier(cb, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    if (pq) { vkCmdWriteTimestamp_(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pq, 2 * s + 1); pq_used[s] = 1; }
     vkEndCommandBuffer_(cb);
     VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &W.acquired[s], &ws, 1, &cb, 1, &W.done[s]};
@@ -519,6 +525,7 @@ void vkw_present(uint64_t n, VkImage gimg, uint32_t gw, uint32_t gh, const int c
     else if (r) LOG("[RED] [vk] vkQueuePresentKHR failed (%d)", r);
     W.frames++;
     if (W.frames == 1) LOG("[vk] first frame in the window");
+    if (W.frames % 600 == 0 && pn) { LOG("[vk] present: %.2f ms GPU per frame (the blits into the window, last %llu frames)", pms / pn, (unsigned long long)pn); pms = 0; pn = 0; }
     if (W.frames % 60 == 0) {
         double t = now_s(); static double last; static uint64_t lastf;
         if (last) { char title[200]; snprintf(title, sizeof title, "nxnative - %s - %.1f fps - frame %llu", W.devname, (W.frames - lastf) / (t - last), (unsigned long long)n); S.SetWindowTitle(W.win, title); }

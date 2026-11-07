@@ -622,7 +622,7 @@ static uint32_t g_gs_vps = 4;   // viewports a passthrough geometry shader's dra
 typedef struct { uint64_t key, fs; uint32_t w, h, ncol, depth, compute; double ms; uint64_t n, draws; } pkind;
 static pkind g_pk[512]; static int g_npk;
 typedef struct { uint32_t q0; uint64_t key, fs; uint32_t w, h, ncol, depth, compute; uint64_t draws; } pmark;
-static pmark g_pm_store[3][PQ_CAP / 2], *g_pm = g_pm_store[0]; static int g_npm; static pthread_mutex_t g_prof_mu = PTHREAD_MUTEX_INITIALIZER; static double g_prof_total_ms; static uint64_t g_prof_subs;
+static pmark g_pm_store[3][PQ_CAP / 2], *g_pm = g_pm_store[0]; static int g_npm; static pthread_mutex_t g_prof_mu = PTHREAD_MUTEX_INITIALIZER; static double g_prof_total_ms, g_prof_gap_ms; static uint64_t g_prof_subs;
 static uint32_t g_pm_cur = ~0u;
 static int prof_on(void) {
     if (g_prof < 0) { const char *e = getenv("DM_VK_PROFILE"); g_prof = !(e && *e == '0') && VK.limits.timestampPeriod > 0; }
@@ -656,6 +656,9 @@ static void prof_collect(VkQueryPool pq, uint32_t npq, const pmark *pm, int npm)
     pthread_mutex_lock(&g_prof_mu);
     double per = VK.limits.timestampPeriod / 1e6;
     g_prof_total_ms += (ts[npq - 1] - ts[0]) * per; g_prof_subs++;
+    // the GPU's time from the end of the submission before to the start of this one: other work on the GPU (the window's present, the compositor) or idle
+    static uint64_t last_end; if (last_end && ts[0] > last_end) { double gap = (ts[0] - last_end) * per; if (gap < 200) g_prof_gap_ms += gap; }
+    last_end = ts[npq - 1];
     for (int i = 0; i < npm; i++) {
         const pmark *m = &pm[i]; if (m->q0 + 1 >= npq) continue;
         double ms = (ts[m->q0 + 1] - ts[m->q0]) * per; if (ms < 0 || ms > 1000) continue;
@@ -671,7 +674,7 @@ static void prof_report(void) {
     pthread_mutex_lock(&g_prof_mu);
     if (!g_prof_subs) { pthread_mutex_unlock(&g_prof_mu); return; }
     double sum = 0; for (int i = 0; i < g_npk; i++) sum += g_pk[i].ms;
-    LOG("[vk] GPU profile (last %llu submissions): %.2f ms GPU per submission, %.2f ms of it in passes and dispatches; the most expensive kinds:", (unsigned long long)g_prof_subs, g_prof_total_ms / g_prof_subs, sum / g_prof_subs);
+    LOG("[vk] GPU profile (last %llu submissions): %.2f ms GPU per submission, %.2f ms of it in passes and dispatches; between submissions (other GPU work or idle) %.2f ms; the most expensive kinds:", (unsigned long long)g_prof_subs, g_prof_total_ms / g_prof_subs, sum / g_prof_subs, g_prof_gap_ms / g_prof_subs);
     for (int r = 0; r < 14; r++) {
         int b = -1; for (int i = 0; i < g_npk; i++) if (g_pk[i].n && (b < 0 || g_pk[i].ms > g_pk[b].ms)) b = i;
         if (b < 0) break;
@@ -680,7 +683,7 @@ static void prof_report(void) {
             (unsigned long long)k->n, k->n ? (double)k->draws / k->n : 0.0, (unsigned long long)k->fs);
         k->n = 0;
     }
-    g_npk = 0; g_prof_total_ms = 0; g_prof_subs = 0;
+    g_npk = 0; g_prof_total_ms = 0; g_prof_gap_ms = 0; g_prof_subs = 0;
     pthread_mutex_unlock(&g_prof_mu);
     if (g_ab < 0) { const char *e = getenv("DM_VK_ABTEST"); g_ab = e && !strcmp(e, "gs"); }
     if (g_ab) { g_ab_skip_gs = !g_ab_skip_gs; LOG("[vk] A/B test: the next period %s draws with a geometry stage", g_ab_skip_gs ? "SKIPS" : "draws"); }
