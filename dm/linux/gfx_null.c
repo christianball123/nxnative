@@ -41,6 +41,14 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
 }
 void mtl_present_wait(uint64_t ticket) { (void)ticket; }
 double mtl_presented_time(uint64_t n) { pthread_mutex_lock(&g_pmu); double t = n && n + 64 > atomic_load(&g_presents) ? g_times[n % 64] : 0; pthread_mutex_unlock(&g_pmu); return t; }
+void mtl_present_progress(uint64_t *queued, uint64_t *done) { uint64_t n = atomic_load(&g_presents); if (queued) *queued = n; if (done) *done = n; }   // presents are shown as they come (hle_vi.c frame history)
+void mtl_present_layer(uint32_t w, uint32_t h) { (void)w; (void)h; }    // the window scales the picture to fit, whatever its shape
+void mtl_present_screen(uint32_t w, uint32_t h) { (void)w; (void)h; }
+void mtl_pool_addressed(const void *mem, uint64_t size) { (void)mem; (void)size; }   // Metal's raw global memory: the Vulkan replay copies what it reads
+int mtl_addr_known(uint64_t addr, uint64_t len) { (void)addr; (void)len; return 0; }   // as mtl_addr here: no pool lookup (shaders are keyed from their own bytes)
+void mtl_tex_gpu_written(const tex_t *t) { (void)t; }   // the Vulkan replay tracks GPU writes itself (gfx_vk_replay.c gpu_wrote)
+void mtl_pool_stats(uint64_t s[6]) { for (int i = 0; i < 6; i++) s[i] = 0; }
+int front_ctrl_support(int min, int max) { (void)min; (void)max; return -1; }   // no prompt window: the caller answers as the player closing it
 int mtl_fps_target(void) {
     static int env = -2; if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; }
     int nvn_game_fps(void); int g = nvn_game_fps(); return env > 0 ? env : g == 30 || g == 120 ? g : 60;
