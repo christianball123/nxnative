@@ -764,15 +764,15 @@ uint64_t mtl_last_fence(void) { if (g_deferred) flush_from(FL_FENCE); return ato
 static int early_done(uint64_t fence) {
     // DM_VK_EARLY_SYNC: 0 waits for the GPU, 1 (default) early unless results are read back, 2 early also past linear textures' read-backs (the game then may read
     // a linear texture's content of a frame before)
-    // 3 also past texture-to-buffer copies (the game may read the copy of a frame before)
-    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_EARLY_SYNC"); on = e && *e >= '0' && *e <= '3' ? *e - '0' : 1;
+    // 3 also past texture-to-buffer copies (the game may read the copy of a frame before), 4 also past storage buffer write-backs (the same)
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_EARLY_SYNC"); on = e && *e >= '0' && *e <= '4' ? *e - '0' : 1;
         if (on) LOG("[vk] syncs: done once their work is handed to the GPU, unless it reads results back%s (DM_VK_EARLY_SYNC=0 waits for the GPU, 2 also past linear textures, 3 also past texture copies)",
-                    on == 3 ? " (only storage write-backs count)" : on == 2 ? " (not counting linear textures)" : ""); }
+                    on == 4 ? " (none count)" : on == 3 ? " (only storage write-backs count)" : on == 2 ? " (not counting linear textures)" : ""); }
     if (!on || fence > atomic_load(&g_fence)) return 0;
     pthread_once(&g_cm_once, cm_init);
     pthread_mutex_lock(&g_cm_mu);
     int ok = 1;
-    for (int i = 0; i < NSUB - 1; i++) if (atomic_load(&g_pr[i].busy) && g_sl[i].id <= fence && (g_sl[i].cpu_out == 1 || (g_sl[i].cpu_out == 2 && on < 2) || (g_sl[i].cpu_out == 3 && on < 3))) ok = 0;
+    for (int i = 0; i < NSUB - 1; i++) if (atomic_load(&g_pr[i].busy) && g_sl[i].id <= fence && ((g_sl[i].cpu_out == 1 && on < 4) || (g_sl[i].cpu_out == 2 && on < 2) || (g_sl[i].cpu_out == 3 && on < 3))) ok = 0;
     if (ok) {
         uint64_t now = gpu_ticks();
         for (int i = 0; i < NSUB - 1; i++) {
@@ -800,7 +800,8 @@ static int wait_timed(uint64_t fence, uint64_t timeout_ns) {
     if (timeout_ns && fence > atomic_load(&g_fence)) atomic_fetch_add(&g_wait_unsub, 1);
     if (!timeout_ns || fence > atomic_load(&g_fence)) return 0;
     static _Atomic int nlog;
-    if (atomic_fetch_add(&nlog, 1) < 12) {   // why this sync waits for the GPU (the first few)
+    int nl = atomic_fetch_add(&nlog, 1);
+    if (nl < 4 || nl % 500 == 0) {   // why this sync waits for the GPU (the first few, then one in 500)
         char sl[256]; int o = 0;
         for (int i = 0; i < NSUB - 1; i++) o += snprintf(sl + o, sizeof sl - o, " [slot %d: submission %llu, %s, read-backs kind %d, %d stages, %d write-backs, %d linear]", i, (unsigned long long)g_sl[i].id,
                                                           atomic_load(&g_pr[i].busy) ? "in flight" : "done", g_sl[i].cpu_out, g_sl[i].nstage, g_sl[i].nwb, g_sl[i].nlw);
