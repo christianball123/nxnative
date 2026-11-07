@@ -43,6 +43,7 @@ static int entry_of(uint64_t key, vks_shader *s) {
             s->key = key; s->model = p[0]; s->nb = p[1]; s->nvin = p[2]; s->fout = p[3]; memcpy(s->local, p + 4, 6); memcpy(&s->c1_len, p + 10, 2);
             s->b = (const vks_bind *)(p + 12); s->vin = p + 12 + sizeof(vks_bind) * s->nb; s->c1 = s->vin + 2 * s->nvin;
             uint32_t h = 12 + sizeof(vks_bind) * s->nb + 2 * s->nvin + s->c1_len; h += -h & 3;
+            if (s->model == 3 && s->local[0] == 1 && s->local[1]) { s->gsm = (const uint32_t *)(p + h); s->ngsm = s->local[1]; h += 4 * s->ngsm; }   // the mask program after c1
             if (h >= e.len) return 0;
             s->spv = (const uint32_t *)(p + h); s->nspv = (e.len - h) / 4;
             return s->spv[0] == 0x07230203;

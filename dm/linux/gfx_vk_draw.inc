@@ -946,6 +946,31 @@ static int quad_indices(int prim, const draw_args *a, uint64_t *off, uint32_t *c
 }
 
 // ---------------------------------------------------------------- a draw
+// A passthrough geometry shader's viewport mask from its program (tools/spv_gsmask.py) and the geometry stage's bound uniform buffers; 0 when it cannot be worked out
+static int gs_mask(const vks_shader *s, uint32_t *mask) {
+    uint32_t st[32]; int sp = 0;
+    for (uint32_t i = 0; i < s->ngsm; i++) {
+        uint32_t o = s->gsm[i];
+        if (o == 1) { if (sp >= 32 || i + 1 >= s->ngsm) return 0; st[sp++] = s->gsm[++i]; }
+        else if (o == 2) {
+            if (sp < 1 || i + 1 >= s->ngsm) return 0;
+            uint32_t slot = s->gsm[++i], dw = st[sp - 1];
+            if (slot < 3 || slot - 3 >= 18) return 0;
+            int gst = 0; for (int x = 0; x < NST; x++) if (k_nvn2model[x] == s->model) gst = x;   // the NVN stage of the geometry shader
+            const p_bind_buf *u = &D.ubo[gst][slot - 3];
+            if (!u->addr || (uint64_t)dw * 4 + 4 > u->size) return 0;
+            memcpy(&st[sp - 1], (const uint8_t *)(uintptr_t)u->addr + (uint64_t)dw * 4, 4);
+        } else {
+            if (sp < 2) return 0;
+            uint32_t b = st[--sp], a = st[sp - 1], r;
+            switch (o) { case 3: r = a + b; break; case 4: r = a - b; break; case 5: r = a * b; break; case 6: r = a & b; break; case 7: r = a | b; break; case 8: r = a ^ b; break;
+                         case 9: r = a << (b & 31); break; case 10: r = a >> (b & 31); break; case 11: r = (uint32_t)((int32_t)a >> (b & 31)); break; default: return 0; }
+            st[sp - 1] = r;
+        }
+    }
+    if (sp != 1) return 0;
+    *mask = st[0]; return 1;
+}
 static void do_draw(const draw_args *a) {
     state_init();
     const vks_prog *pr = g_gfx_prog;
@@ -979,7 +1004,11 @@ static void do_draw(const draw_args *a) {
     // Adreno (they took half the GPU time of a Mario Tennis Fever frame), so the draw goes without it, once per viewport: a triangle the mask left out of a viewport
     // is cut by that viewport's scissor in the cascades it was made for. DM_VK_GS_LOOP=0: through the geometry shader
     static int gsl = -1; if (gsl < 0) { const char *e = getenv("DM_VK_GS_LOOP"); gsl = !(e && *e == '0'); const char *n = getenv("DM_SPV_VIEWPORTS"); if (n && atoi(n) >= 1 && atoi(n) <= 16) g_gs_vps = (uint32_t)atoi(n); }
-    k.nogs = pr->st[VKS_GS] && pr->st[VKS_GS]->local[0] == 1 && gsl;
+    uint32_t gmask = 0;
+    k.nogs = pr->st[VKS_GS] && pr->st[VKS_GS]->ngsm && gsl && gs_mask(pr->st[VKS_GS], &gmask);
+    if (k.nogs) { static int n; if (n++ < 8) LOG("[vk] a passthrough geometry shader's draw goes without it: viewport mask %#x (shader %016llx)", gmask, (unsigned long long)pr->st[VKS_GS]->key); }
+    else if (pr->st[VKS_GS] && pr->st[VKS_GS]->local[0] == 1) { static int n; if (n++ < 4) LOG("[vk] a passthrough geometry shader's mask could not be worked out here (shader %016llx, program %u words): through the geometry shader", (unsigned long long)pr->st[VKS_GS]->key, pr->st[VKS_GS]->ngsm); }
+    if (k.nogs && !(gmask & ((1u << g_gs_vps) - 1))) { g_drawn++; return; }   // in no viewport
     if (k.atest) { static int n; if (n++ < 10) LOG("[vk] alpha test: function %u reference %.3f, fragment shader %016llx", g_at_func, g_at_ref, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull); }
     for (int i = 0; i < 8; i++) k.blend[i].target = 0;
     // vertex inputs: each location the vertex shader reads gets NVN attribute <location>, or the zero buffer
@@ -1086,6 +1115,7 @@ static void do_draw(const draw_args *a) {
     vkCmdSetDepthBias_(g_cb, D.po.units, D.po.clamp, D.po.factor);
     uint32_t inst = a->instances ? a->instances : 1;
     for (uint32_t v = 0; v < (k.nogs ? nvp : 1); v++) {
+        if (k.nogs && !(gmask >> v & 1)) continue;
         if (k.nogs) { vkCmdSetViewport_(g_cb, 0, 1, &vps[v]); vkCmdSetScissor_(g_cb, 0, 1, &scs[v]); }
         if (indexed) vkCmdDrawIndexed_(g_cb, icount, inst, 0, quads && !a->indexed ? 0 : a->base_vertex, a->base_instance);
         else vkCmdDraw_(g_cb, a->count, inst, a->first, a->base_instance);

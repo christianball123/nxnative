@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import spv_passthrough
 import spv_alpha
 import spv_outinit
+import spv_gsmask
 from pathlib import Path
 
 KIND_SUPPORT, KIND_CBUF, KIND_SBUF, KIND_TEX, KIND_IMG, KIND_UNKNOWN = range(6)
@@ -136,8 +137,12 @@ def entry(spv_path, res_path, job_path=None):
     data = Path(spv_path).read_bytes()
     words = struct.unpack(f'<{len(data) // 4}I', data)
     if words[0] != 0x07230203: raise ValueError('not SPIR-V')
-    passthrough = False
-    if spv_passthrough.is_passthrough(words):   # NVIDIA passthrough geometry shader → an ordinary one (spv_passthrough.py); one it cannot rewrite stays as it is
+    passthrough = False; gsm = None
+    if spv_passthrough.is_passthrough(words):
+        try:
+            r0 = json.load(open(res_path)) if os.path.exists(res_path) else {}
+            gsm = spv_gsmask.mask_program(words, {c['binding']: c['slot'] for c in r0.get('cbufs', [])})   # the mask, when uniforms alone make it (spv_gsmask.py)
+        except Exception: gsm = None   # NVIDIA passthrough geometry shader → an ordinary one (spv_passthrough.py); one it cannot rewrite stays as it is
         try: words = spv_passthrough.rewrite(words); passthrough = True
         except Exception as e: print(f'[YELLOW] {Path(spv_path).stem}: passthrough geometry shader not rewritten ({e}): kept as it is', flush=True)
     words = add_image_caps(strip_unused(words))
@@ -145,7 +150,7 @@ def entry(spv_path, res_path, job_path=None):
     words, _ = spv_outinit.init_outputs(words)   # vertex shaders: outputs start at Maxwell's (0, 0, 0, 1) (spv_outinit.py)
     data = struct.pack(f'<{len(words)}I', *words)
     model, binds, vin, fout, local = reflect(words)
-    if passthrough: local = (1, 0, 0)   # a rewritten passthrough geometry shader (local size x 1 of a geometry entry): the host may draw without it, once per viewport
+    if passthrough: local = (1, len(gsm) if gsm else 0, 0)   # a rewritten passthrough geometry shader (local x 1), and its mask program's words (local y; after c1)
     res = json.load(open(res_path)) if os.path.exists(res_path) else {}
     try: c1 = bytes.fromhex(json.load(open(job_path)).get('c1') or '') if job_path and os.path.exists(job_path) else b''
     except ValueError: c1 = b''
@@ -156,6 +161,7 @@ def entry(spv_path, res_path, job_path=None):
         out += struct.pack('<BBBBIHH', b, vk, k, img, reg, n, aux)
     for loc, ct in sorted(vin): out += struct.pack('<BB', loc, ct)
     out += c1
+    if passthrough and gsm: out += b'\0' * (-len(out) % 4) + struct.pack(f'<{len(gsm)}I', *gsm)
     out += b'\0' * (-len(out) % 4)
     return bytes(out + data)
 
