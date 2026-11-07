@@ -477,7 +477,8 @@ static vtex *prep_tex(const tex_t *t) {
 #define PQ_CAP 2048
 // DM_VK_ABTEST=gs: draws with a geometry stage are skipped every other profile period (the profile says which), to measure what they cost
 static int g_ab_skip_gs, g_ab = -1;
-static VkQueryPool g_pq; static uint32_t g_npq; static int g_prof = -1;
+static VkQueryPool g_pq;
+static uint32_t g_gs_vps = 4;   // viewports a passthrough geometry shader's draw goes to without it (DM_SPV_VIEWPORTS, as spv_passthrough.py)
 typedef struct { uint64_t key, fs; uint32_t w, h, ncol, depth, compute; double ms; uint64_t n, draws; } pkind;
 static pkind g_pk[512]; static int g_npk;
 typedef struct { uint32_t q0; uint64_t key, fs; uint32_t w, h, ncol, depth, compute; uint64_t draws; } pmark;
@@ -676,7 +677,7 @@ typedef struct {
     uint64_t prog;
     VkFormat cf[8], df; uint32_t ncol, samples;
     uint32_t topo, front_ccw, depth_gl, rast_discard, depth_clamp, prim_restart;
-    blend_st blend[8]; uint32_t blend_en, chmask; ds_st ds; poly_st poly; uint8_t a2c, atest, pad[2];
+    blend_st blend[8]; uint32_t blend_en, chmask; ds_st ds; poly_st poly; uint8_t a2c, atest, nogs, pad;
     struct { uint8_t loc, binding, used, pad; uint32_t fmt, offset; } va[32]; uint32_t nva;
     struct { uint32_t stride, rate; } vb[17]; uint32_t vb_used;
 } pkey;
@@ -690,7 +691,7 @@ static VkPipeline pipe_make(const vks_prog *pr, const pkey *k) {
     // the alpha test's switch (tools/spv_alpha.py: a bool specialization constant, SpecId 200; a shader without it ignores the entry)
     static const VkSpecializationMapEntry at_me = {200, 0, 4}; VkBool32 at_on = k->atest ? VK_TRUE : VK_FALSE;
     VkSpecializationInfo at_si = {1, &at_me, 4, &at_on};
-    for (int m = 0; m < VKS_NGFX; m++) if (pr->mod[m])
+    for (int m = 0; m < VKS_NGFX; m++) if (pr->mod[m] && !(m == VKS_GS && k->nogs))
         st[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, (VkShaderStageFlagBits)(1u << (m == VKS_FS ? 4 : m)), pr->mod[m], "main", m == VKS_FS && k->atest ? &at_si : NULL};
     VkVertexInputBindingDescription vb[17]; uint32_t nvb = 0;
     for (uint32_t b = 0; b < 17; b++) if (k->vb_used >> b & 1) vb[nvb++] = (VkVertexInputBindingDescription){b, k->vb[b].stride, (VkVertexInputRate)k->vb[b].rate};
@@ -701,7 +702,7 @@ static VkPipeline pipe_make(const vks_prog *pr, const pkey *k) {
         k->prim_restart && k->topo != VK_PRIMITIVE_TOPOLOGY_POINT_LIST && k->topo != VK_PRIMITIVE_TOPOLOGY_LINE_LIST && k->topo != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
     VkPipelineViewportDepthClipControlCreateInfoEXT dcc = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, NULL, VK_TRUE};
     // a geometry stage may pick the viewport (Mario Tennis Fever's shadow cascades: 4): all 16 then; otherwise 1
-    uint32_t nvp = pr->st[VKS_GS] && VK.limits.maxViewports > 1 ? (VK.limits.maxViewports < 16 ? VK.limits.maxViewports : 16) : 1;
+    uint32_t nvp = pr->st[VKS_GS] && !k->nogs && VK.limits.maxViewports > 1 ? (VK.limits.maxViewports < 16 ? VK.limits.maxViewports : 16) : 1;
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, k->depth_gl ? &dcc : NULL, 0, nvp, NULL, nvp, NULL};
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, k->depth_clamp, k->rast_discard,
         k->poly.mode == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : k->poly.mode == NVN_POLYGON_MODE_POINT ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_FILL,
@@ -974,6 +975,11 @@ static void do_draw(const draw_args *a) {
     // NVN's alpha test (as OpenGL, none when colour 0 goes to an integer target): the pipeline turns the shader's test on, the support buffer holds function and reference
     g_at_func = D.color.alpha_func && D.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS && !(P.cf[0] && fmt_int(P.cf[0])) ? D.color.alpha_func : 0;
     k.atest = g_at_func != 0; g_at_ref = D.alpha_ref;
+    // A rewritten passthrough geometry shader (tools/spv_pack.py marks it) only copies each triangle to the viewports its mask picks; geometry shaders are slow on
+    // Adreno (they took half the GPU time of a Mario Tennis Fever frame), so the draw goes without it, once per viewport: a triangle the mask left out of a viewport
+    // is cut by that viewport's scissor in the cascades it was made for. DM_VK_GS_LOOP=0: through the geometry shader
+    static int gsl = -1; if (gsl < 0) { const char *e = getenv("DM_VK_GS_LOOP"); gsl = !(e && *e == '0'); const char *n = getenv("DM_SPV_VIEWPORTS"); if (n && atoi(n) >= 1 && atoi(n) <= 16) g_gs_vps = (uint32_t)atoi(n); }
+    k.nogs = pr->st[VKS_GS] && pr->st[VKS_GS]->local[0] == 1 && gsl;
     if (k.atest) { static int n; if (n++ < 10) LOG("[vk] alpha test: function %u reference %.3f, fragment shader %016llx", g_at_func, g_at_ref, pr->st[VKS_FS] ? (unsigned long long)pr->st[VKS_FS]->key : 0ull); }
     for (int i = 0; i < 8; i++) k.blend[i].target = 0;
     // vertex inputs: each location the vertex shader reads gets NVN attribute <location>, or the zero buffer
@@ -1049,6 +1055,7 @@ static void do_draw(const draw_args *a) {
     static int flipy = -1; if (flipy < 0) { const char *e = getenv("DM_VK_FLIP_Y"); flipy = e && *e ? atoi(e) : -1; if (flipy < 0) flipy = 2; }
     int flip = flipy == 2 ? !ll : flipy;
     uint32_t nvp = pr->st[VKS_GS] && VK.limits.maxViewports > 1 ? (VK.limits.maxViewports < 16 ? VK.limits.maxViewports : 16) : 1;
+    if (k.nogs) nvp = g_gs_vps;   // drawn once per viewport below
     VkViewport vps[16]; VkRect2D scs[16];
     int32_t sx = 0, sy = 0; uint32_t sw = P.w, sh = P.h;
     if (D.has_sc && D.sc.w >= 0 && D.sc.h >= 0) {
@@ -1078,8 +1085,11 @@ static void do_draw(const draw_args *a) {
     vkCmdSetBlendConstants_(g_cb, D.blend_color);
     vkCmdSetDepthBias_(g_cb, D.po.units, D.po.clamp, D.po.factor);
     uint32_t inst = a->instances ? a->instances : 1;
-    if (indexed) vkCmdDrawIndexed_(g_cb, icount, inst, 0, quads && !a->indexed ? 0 : a->base_vertex, a->base_instance);
-    else vkCmdDraw_(g_cb, a->count, inst, a->first, a->base_instance);
+    for (uint32_t v = 0; v < (k.nogs ? nvp : 1); v++) {
+        if (k.nogs) { vkCmdSetViewport_(g_cb, 0, 1, &vps[v]); vkCmdSetScissor_(g_cb, 0, 1, &scs[v]); }
+        if (indexed) vkCmdDrawIndexed_(g_cb, icount, inst, 0, quads && !a->indexed ? 0 : a->base_vertex, a->base_instance);
+        else vkCmdDraw_(g_cb, a->count, inst, a->first, a->base_instance);
+    }
     g_drawn++; g_cb_ops++;
 }
 static void draw_op(uint32_t op, const uint8_t *a, uint32_t size) {
