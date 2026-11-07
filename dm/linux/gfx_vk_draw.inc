@@ -526,7 +526,9 @@ static VkClearValue pcl_value(const pclear *c, VkFormat vf) {
 static int lvl_is(const vtex *v, uint32_t lv, uint32_t w, uint32_t h) { return (v->w >> lv ? v->w >> lv : 1) == w && (v->h >> lv ? v->h >> lv : 1) == h; }
 // A clear of target v (level lv, layers l0..l0+nlay): into the open pass, or kept for the next one. 0: not taken (the caller ends the pass and clears the image)
 static int clear_defer(vtex *v, uint32_t lv, uint32_t l0, uint32_t nlay, VkImageAspectFlags asp, const float *rgba, float depth, uint32_t stencil) {
-    static int off = -1; if (off < 0) { const char *e = getenv("DM_VK_CLEAR_IN_PASS"); off = e && *e == '0'; }
+    // off unless DM_VK_CLEAR_IN_PASS=1: with it on, Mario Tennis Fever's picture went black after a while on the Thor (Turnip), cause not found yet (no pass read a
+    // cleared target as a texture)
+    static int off = -1; if (off < 0) { const char *e = getenv("DM_VK_CLEAR_IN_PASS"); off = !(e && *e == '1'); }
     if (off || v->is3d || nlay != 1) return 0;
     pclear c = {v, lv, l0, nlay, asp, {0}, depth, stencil, 0}; if (rgba) memcpy(c.rgba, rgba, 16);
     if (P.open) {
