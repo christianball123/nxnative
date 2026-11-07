@@ -223,10 +223,14 @@ static vtex *tex_get(const tex_t *t) {
         if (g_sc < 0) { const char *e = getenv("DM_VK_SCALE"); g_sc = e ? (float)atof(e) : 1.0f; if (!(g_sc > 0.2f && g_sc < 1.0f)) g_sc = 1.0f;
             const char *z = getenv("DM_VK_SCALE_SIZE"); if (z) sscanf(z, "%ux%u", &sw, &sh);
             if (g_sc != 1.0f) LOG("[vk] resolution scale %.2f for %ux%u render targets (DM_VK_SCALE, DM_VK_SCALE_SIZE)", g_sc, sw, sh); }
-        if (g_sc != 1.0f && g_rt_hint && ci.imageType == VK_IMAGE_TYPE_2D && ci.arrayLayers == 1 && ci.mipLevels == 1 && samples == 1 && gw == sw && gh == sh && !v->storage && !v->mutable_fmt &&
-            !(t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) {
-            sc = g_sc; ci.extent.width = (uint32_t)(gw * sc + 0.5f); ci.extent.height = (uint32_t)(gh * sc + 0.5f);
-            static int n4; if (n4++ < 20) LOG("[vk] texture serial %llu (format %d %ux%u) scaled to %ux%u", (unsigned long long)t->serial, f, gw, gh, ci.extent.width, ci.extent.height);
+        // a render target: its first use is as one, or NVN made it compressible (render targets are; textures loaded from files are not)
+        if (g_sc != 1.0f && gw == sw && gh == sh) {
+            int rt = g_rt_hint || (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE);
+            const char *why = !rt ? "not a render target" : ci.imageType != VK_IMAGE_TYPE_2D || ci.arrayLayers != 1 ? "not a single 2D image" : ci.mipLevels != 1 ? "mipmapped" : samples != 1 ? "multisampled" :
+                              (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) ? "a shader image" : (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) ? "linear" : NULL;
+            if (!why) { sc = g_sc; ci.extent.width = (uint32_t)(gw * sc + 0.5f); ci.extent.height = (uint32_t)(gh * sc + 0.5f); }
+            static int n4; if (n4++ < 60) LOG("[vk] texture serial %llu (format %d %ux%u, flags %#x, first use as a target %d): %s%s", (unsigned long long)t->serial, f, gw, gh, t->d.flags, g_rt_hint,
+                                              why ? "not scaled: " : "scaled", why ? why : "");
         }
     }
     if (ci.extent.width >= 1280) { static int n3; if (n3++ < 80) LOG("[vk] large texture serial %llu: format %d %ux%u x%u levels %u, storage %p (memory %p, pool %p + %#llx)", (unsigned long long)t->serial, f, ci.extent.width, ci.extent.height, ci.arrayLayers, ci.mipLevels, key, (void *)t->mem, (void *)t->pool, (unsigned long long)t->off); }
@@ -382,7 +386,7 @@ static void tex_fill(vtex *v, const tex_t *t);   // gfx_vk_draw.inc: a texture t
 
 // ---------------------------------------------------------------- operations
 static void clear_tex(const p_clear_tex *c) {
-    vtex *v = use(c->tex); if (!v) return;
+    g_rt_hint = 1; vtex *v = use(c->tex); g_rt_hint = 0; if (!v) return;   // a cleared texture is a render target (resolution scaling)
     gpu_wrote(v);
     uint32_t lv, nl, l0, nlay; view_range(v, &c->view, c->has_view, &lv, &nl, &l0, &nlay);
     uint32_t w = v->w >> lv ? v->w >> lv : 1, h = v->h >> lv ? v->h >> lv : 1;

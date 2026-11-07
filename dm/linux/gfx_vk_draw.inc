@@ -796,6 +796,12 @@ static int pass_begin(void) {
             }
         }
     }
+    {   // attachments of different resolution scales (one scaled, one not): logged, the first few (the pass is drawn at the scaled size)
+        int ns = 0, nu = 0; for (uint32_t i = 0; i < nc && i < 8; i++) if (P.cv[i]) { if (P.cv[i]->sc != 1.0f) ns++; else nu++; }
+        if (P.dv) { if (P.dv->sc != 1.0f) ns++; else nu++; }
+        static int nm; if (ns && nu && nm++ < 10) LOG("[YELLOW] [vk] a pass mixes scaled and unscaled targets (colour serials %llu %llu %llu %llu, depth %s): resolution scaling breaks it",
+            (unsigned long long)P.cser[0], (unsigned long long)P.cser[1], (unsigned long long)P.cser[2], (unsigned long long)P.cser[3], P.dv ? (P.dv->sc != 1.0f ? "scaled" : "not scaled") : "none");
+    }
     if (!any) { clears_flush(); return 0; }
     if (!cb_begin()) return 0;
     clears_into_pass(ca, &da, &sa, w, h);
