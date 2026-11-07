@@ -130,6 +130,13 @@ static void tex_fill(vtex *v, const tex_t *t) {
     if (v && !v->gpu && !v->uploaded && t && !t->mem && texlog()) { static int n; if (n++ < 50) LOG("[vk] texture serial %llu format %#x %ux%u has no storage pointer: not uploaded", (unsigned long long)t->serial, t->d.format, t->d.width, t->d.height); }
     if (!v || (v->gpu && !v->linear) || v->uploaded || !t || !t->mem || v->samples > 1) return;
     v->uploaded = 1;
+    // A texture in a sparse virtual pool (flags 0x200, vmode 2): the CPU never writes there (NVN gives virtual pools no CPU mapping; what the CPU writes goes through
+    // the physical pool, and an aliased pool, vmode 1, reads that memory), and its unmapped pages have no memory behind them: reading them stopped the game with
+    // SIGBUS when Mario Tennis Fever's court loaded. Its contents are only what the GPU draws: nothing to upload
+    if (t->pool && (t->pool->flags & 0x200) && t->pool->vmode != 1) {
+        static int n; if (n++ < 10) LOG("[vk] texture serial %llu (%ux%u) is in a sparse virtual pool: starts empty, not read from memory", (unsigned long long)t->serial, t->d.width, t->d.height);
+        return;
+    }
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); if (!bpb) { UPFAIL("unknown format size"); return; }
     int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;
     uint32_t layers = v->is3d ? 1 : v->layers, levels = v->levels;
@@ -139,6 +146,10 @@ static void tex_fill(vtex *v, const tex_t *t) {
     for (uint32_t l = 0; l < levels; l++) {
         uint32_t w = v->w >> l ? v->w >> l : 1, h = v->h >> l ? v->h >> l : 1, d = v->is3d ? (v->d >> l ? v->d >> l : 1) : 1;
         total += (uint64_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * d * layers;
+    }
+    if (t->pool && t->pool->mem && t->pool->size && (t->mem < t->pool->mem || (uint64_t)(t->mem - t->pool->mem) + total > t->pool->size)) {   // past its pool: logged
+        static int n; if (n++ < 10) LOG("[YELLOW] [vk] texture serial %llu (%ux%u, %llu bytes) at offset %#llx runs past its pool (%#llx bytes, flags %#x, mode %d)", (unsigned long long)t->serial, t->d.width, t->d.height,
+            (unsigned long long)total, (unsigned long long)(t->mem - t->pool->mem), (unsigned long long)t->pool->size, t->pool->flags, t->pool->vmode);
     }
     stage_t *s = stage_new(total); if (!s) { UPFAIL("no staging memory"); return; }
     VkBufferImageCopy bic[32]; uint32_t nb = 0; uint64_t off = 0;
