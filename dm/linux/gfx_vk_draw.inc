@@ -955,6 +955,9 @@ static VkResult pb_compute(const VkComputePipelineCreateInfo *ci, VkPipeline *ou
         if (mono_ns() - t0 > lim) {
             atomic_store(&j->abandoned, 1);
             if (atomic_load(&j->done)) break;   // finished in between
+            // At most one driver thread is left spinning: four of them took the AYN Thor's ArmadaOS down with the game (each a core at full load, and the compiler's memory
+            // growing while the system had 2.6 GB left). A second hang ends the game cleanly instead; the shaders found so far are on the skip list for the next run
+            static int abandoned; int last = ++abandoned > 1;
             LOG("[RED] [vk] the driver did not finish compute shader %016llx's pipeline in %.0f s: left out (its dispatches are skipped), and from now on for this game", (unsigned long long)cs->key, limit);
             char dir[512], path[600]; const char *home = getenv("HOME");
             if (home) { snprintf(dir, sizeof dir, "%s/.local/share/nxnative/%s", home, DM_GAME_ID);
@@ -962,6 +965,7 @@ static VkResult pb_compute(const VkComputePipelineCreateInfo *ci, VkPipeline *ou
                 snprintf(path, sizeof path, "%s/hang_%016llx.spv", dir, (unsigned long long)cs->key); f = fopen(path, "wb"); if (f) { fwrite(cs->spv, 4, cs->nspv, f); fclose(f); LOG("[vk] its SPIR-V: %s", path); } }
             if (g_pb_list && g_pb_n && *g_pb_n < 64) g_pb_list[(*g_pb_n)++] = cs->key;
             { int tid = atomic_load(&j->tid); if (tid) setpriority(PRIO_PROCESS, (id_t)tid, 19); }   // the driver thread spins on: the lowest priority, so the game's own threads come first
+            if (last) { LOG("[RED] [vk] the driver hung on a second shader: the game stops here so the system stays up (the shaders it hung on are skipped from the next run on)"); fflush(stderr); _exit(3); }
             *out = VK_NULL_HANDLE; return VK_ERROR_UNKNOWN;
         }
         if (spin < 200) sched_yield(); else { struct timespec t = {0, 200000}; nanosleep(&t, NULL); }
