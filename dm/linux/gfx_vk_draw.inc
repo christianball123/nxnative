@@ -194,7 +194,7 @@ static int texlog(void) { static int on = -1; if (on < 0) { const char *e = gete
     (unsigned long long)t->serial, t->d.format, t->d.target, t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.flags, t->d.samples); } while (0)
 static void tex_fill(vtex *v, const tex_t *t) {
     if (v && !v->gpu && !v->uploaded && t && !t->mem && texlog()) { static int n; if (n++ < 50) LOG("[vk] texture serial %llu format %#x %ux%u has no storage pointer: not uploaded", (unsigned long long)t->serial, t->d.format, t->d.width, t->d.height); }
-    if (!v || (v->gpu && !v->linear) || v->uploaded || !t || !t->mem || v->samples > 1) return;
+    if (!v || (v->gpu && !v->linear) || v->uploaded || !t || !t->mem || v->samples > 1 || v->sc != 1.0f) return;   // a scaled render target: no guest content goes in
     v->uploaded = 1;
     // A texture in a sparse virtual pool (flags 0x200, vmode 2): the CPU never writes there (NVN gives virtual pools no CPU mapping; what the CPU writes goes through
     // the physical pool, and an aliased pool, vmode 1, reads that memory), and its unmapped pages have no memory behind them: reading them stopped the game with
@@ -432,6 +432,18 @@ static uint64_t support_buffer(void) {
     DZ.support_off = ring_bytes(b, sizeof b); last_f = g_at_func; last_r = ref; last_n = g_support_n;
     return DZ.support_off;
 }
+// The support buffer with resolution scales (Ryujinx SupportBuffer render_scale, at byte 192, a float per 16 bytes): [0] the render targets' scale (fragment shaders divide
+// their fragment coordinates by it), [1 + i] the scale of the stage's i-th texture (texel fetch coordinates are multiplied by it, texture sizes divided), then its images.
+// frag_scale_count (byte 176) stays 0: each stage has its own support buffer here, so a vertex shader's textures start at [1] as well
+static uint64_t g_support_sc;
+static uint64_t support_buffer_sc(float rt, const float *sc, int n) {
+    uint8_t b[SUPPORT_SIZE]; memset(b, 0, sizeof b);
+    float ref = g_at_func ? g_at_ref : 0.0f;
+    for (int i = 0; i < 73; i++) { float v = i == 0 ? rt : i - 1 < n ? sc[i - 1] : 1.0f; memcpy(b + 192 + 16 * i, &v, 4); }
+    memcpy(b + 1392, &g_at_func, 4); memcpy(b + 1396, &ref, 4);
+    g_support_sc++;
+    return ring_bytes(b, sizeof b);
+}
 
 // ---------------------------------------------------------------- descriptor pools, one chain per submission
 #define DP_MAX 64
@@ -535,7 +547,7 @@ static const char *k_sk[SK_N] = {"shaders not ready", "no render target", "tesse
 static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g_tex_missing, g_tex_unres, g_tex_unreg, g_storage_unsup;
 
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
-static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0, cser[8]; VkFormat cvf[8]; vtex *clr[10]; int nclr; uint32_t cdirty; int ddirty; } P;   // clr: attachments this pass cleared (load op or in-pass clear)
+static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0, cser[8]; VkFormat cvf[8]; vtex *clr[10]; int nclr; uint32_t cdirty; int ddirty; float sc; } P;   // sc: the targets' resolution scale   // clr: attachments this pass cleared (load op or in-pass clear)
 static void dump_pass(void);
 static int g_dump_subs, g_dump_pass, g_dump_lines, g_dump_light;
 static vtex *g_dump_tex[64]; static int g_ndump_tex; static uint64_t g_dump_saved[512]; static int g_ndump_saved;   // sampled textures to save after the pass (once per dump)   // frame dumps (below)
@@ -628,7 +640,7 @@ static int fb_on(void) { static int on = -1; if (on < 0) { const char *e = geten
 static void clear_color(const p_clear_color *c) {
     if (!R.has_rt || c->index < 0 || c->index >= R.rt.n || !R.rt.color[c->index]) return;
     if (P.open) { vtex *pv = tex_get(R.rt.color[c->index]); if (!pv || !(pv->bad & 2)) pass_end(); }   // its first use records commands outside a pass
-    vtex *v = use(R.rt.color[c->index]); if (!v) return;
+    g_rt_hint = 1; vtex *v = use(R.rt.color[c->index]); g_rt_hint = 0; if (!v) return;
     gpu_wrote(v);
     static int warned; if (c->mask != 0xf && !warned++) LOG("[vk] a colour clear with channel mask %#x was done on all channels (stage B has no masked clears)", c->mask);
     uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.cview[c->index], R.rt.has_cview[c->index], &lv, &nl, &l0, &nlay);
@@ -640,7 +652,7 @@ static void clear_color(const p_clear_color *c) {
 static void clear_ds(const p_clear_ds *c) {
     if (!R.has_rt || !R.rt.depth) return;
     if (P.open) { vtex *pv = tex_get(R.rt.depth); if (!pv || !(pv->bad & 2)) pass_end(); }
-    vtex *v = use(R.rt.depth); if (!v) return;
+    g_rt_hint = 1; vtex *v = use(R.rt.depth); g_rt_hint = 0; if (!v) return;
     gpu_wrote(v);
     VkImageAspectFlags a = fmt_aspects(v->fmt) & ((c->depth_mask ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (c->stencil_mask ? VK_IMAGE_ASPECT_STENCIL_BIT : 0));
     if (!a) return;
@@ -739,13 +751,13 @@ static int pass_begin(void) {
     if (P.open) return 1;
     if (!R.has_rt) return 0;
     VkRenderingAttachmentInfo ca[8], da, sa; uint32_t nc = 0, w = ~0u, h = ~0u, samples = 0; int any = 0;
-    memset(&P, 0, sizeof P);
+    memset(&P, 0, sizeof P); P.sc = 1.0f;
     for (int i = 0; i < R.rt.n && i < 8; i++) {
         ca[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, 0, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED,
                                             VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, {{{0}}}};
         P.cf[i] = VK_FORMAT_UNDEFINED; nc = i + 1;
         const tex_t *t = R.rt.color[i]; if (!t) continue;
-        vtex *v = prep_tex(t); if (!v || fmt_depth(v->fmt)) continue;
+        g_rt_hint = 1; vtex *v = prep_tex(t); g_rt_hint = 0; if (!v || fmt_depth(v->fmt)) continue;
         uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.cview[i], R.rt.has_cview[i], &lv, &nl, &l0, &nlay);
         VkFormat vf = tex_view_fmt2(v, t, &R.rt.cview[i], R.rt.has_cview[i]);
         if (R.rt.has_cview[i] && R.rt.cview[i].set_format) {   // which targets a game draws through a view of another format (logged once per texture and format, up to 40)
@@ -755,6 +767,7 @@ static int pass_begin(void) {
         }
         VkImageView iv = view_get_fmt(v, vf, v->is3d ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, v->is3d ? 0 : l0, 1, (VkComponentMapping){0, 0, 0, 0}, VK_IMAGE_ASPECT_COLOR_BIT, 2);
         if (!iv) continue;
+        if (v->sc != 1.0f) P.sc = v->sc;
         gpu_wrote(v); ca[i].imageView = iv; P.cf[i] = vf; P.cser[i] = t->serial; P.cvf[i] = vf; any = 1; P.cv[i] = v; P.clv[i] = lv; P.cl0[i] = v->is3d ? 0 : l0;
         uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1;
         if (lw < w) w = lw;
@@ -766,11 +779,12 @@ static int pass_begin(void) {
                                           VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, {{{0}}}};
     P.df = VK_FORMAT_UNDEFINED;
     if (R.rt.depth) {
-        vtex *v = prep_tex(R.rt.depth);
+        g_rt_hint = 1; vtex *v = prep_tex(R.rt.depth); g_rt_hint = 0;
         if (v && fmt_depth(v->fmt)) {
             uint32_t lv, nl, l0, nlay; view_range(v, &R.rt.dview, R.rt.has_dview, &lv, &nl, &l0, &nlay);
             VkImageView iv = view_get(v, VK_IMAGE_VIEW_TYPE_2D, lv, 1, l0, 1, (VkComponentMapping){0, 0, 0, 0}, fmt_aspects(v->fmt), 2);
             if (iv) {
+                if (v->sc != 1.0f) P.sc = v->sc;
                 gpu_wrote(v); P.df = v->fmt; any = 1; P.dv = v; P.dlv = lv; P.dl0 = l0;
                 VkImageAspectFlags a = fmt_aspects(v->fmt);
                 if (a & VK_IMAGE_ASPECT_DEPTH_BIT) { da.imageView = iv; P.has_d = 1; }
@@ -1012,6 +1026,9 @@ static VkBufferView tbuf_view(int st, const vks_bind *b, int storage) {
 }
 static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
     wset *W = &g_ws; W->nw = W->nbi = W->nii = W->ntv = 0;
+    int sup_bi = -1; float bsc[64]; uint8_t bkind[64]; memset(bkind, 0, sizeof bkind);   // the support buffer's descriptor; each texture / image binding's resolution scale
+    for (int i = 0; i < s->nb; i++) { const vks_bind *b = &s->b[i];   // every texture and image the translator indexes (not arrays, not separate samplers), scale 1 until known
+        if (b->binding < 64 && (b->count <= 1) && b->vktype != VK_DESCRIPTOR_TYPE_SAMPLER && (b->kind == VKS_TEX || b->kind == VKS_IMG)) { bkind[b->binding] = (uint8_t)b->kind; bsc[b->binding] = 1.0f; } }
     for (int i = 0; i < s->nb && W->nw < 256; i++) {
         const vks_bind *b = &s->b[i]; uint32_t n = b->count ? b->count : 1;
         VkWriteDescriptorSet *w = &W->w[W->nw++];
@@ -1023,7 +1040,7 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
             int uni = b->vktype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; uint64_t lim = uni ? VK.limits.maxUniformBufferRange : (64ull << 20);
             if (lim > 65536 && uni) lim = 65536;
             uint64_t addr = 0, size = 0, off = ~0ull;
-            if (b->kind == VKS_SUPPORT) off = support_buffer(), size = SUPPORT_SIZE;
+            if (b->kind == VKS_SUPPORT) off = support_buffer(), size = SUPPORT_SIZE, sup_bi = W->nbi - (int)n;
             else if (b->kind == VKS_CBUF) {
                 if (b->reg == 1 && s->c1_len) { off = ring_put((uint64_t)(uintptr_t)s->c1, s->c1_len); size = (s->c1_len + 15) & ~15u; }
                 else if (b->reg >= 3 && b->reg - 3 < 18) { addr = D.ubo[st][b->reg - 3].addr; size = D.ubo[st][b->reg - 3].size; }
@@ -1076,6 +1093,7 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                         int hit = P.dv == v && (P.ddirty || any); for (uint32_t c = 0; c < P.ncol && c < 8 && !hit; c++) hit = P.cv[c] == v && ((P.cdirty >> c & 1) || any);
                         if (hit) { pass_end(); g_fb_split++; }
                     }
+                    if (b->binding < 64 && bkind[b->binding] && v) bsc[b->binding] = v->sc;
                     if (!v) why = 1;
                     else if (storage && !v->storage) why = 2;
                     else { iv = tex_view(v, &r->t, &r->v, r->has_v, b->image, storage); if (storage && iv) gpu_wrote(v); if (!iv) why = 3; }
@@ -1111,6 +1129,16 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
             break;
         }
         }
+    }
+    // resolution scaling: this stage's own support buffer when a scale is not 1 (the translator's order: textures by binding, then images)
+    float rt = s->model == VKS_FS && P.sc > 0 ? P.sc : 1.0f; int scaled = rt != 1.0f;
+    for (int i = 0; i < 64 && !scaled; i++) scaled = bkind[i] && bsc[i] != 1.0f;
+    if (scaled && sup_bi >= 0) {
+        float sc[72]; int n = 0;
+        for (int i = 0; i < 64 && n < 72; i++) if (bkind[i] == VKS_TEX) sc[n++] = bsc[i];
+        for (int i = 0; i < 64 && n < 72; i++) if (bkind[i] == VKS_IMG) sc[n++] = bsc[i];
+        uint64_t off = support_buffer_sc(rt, sc, n);
+        if (off != ~0ull) W->bi[sup_bi].offset = off;
     }
     vkUpdateDescriptorSets_(VK.dev, W->nw, W->w, 0, NULL);
     return 1;
@@ -1297,15 +1325,16 @@ static void do_draw(const draw_args *a) {
     uint32_t nvp = pr->st[VKS_GS] && VK.limits.maxViewports > 1 ? (VK.limits.maxViewports < 16 ? VK.limits.maxViewports : 16) : 1;
     if (k.nogs) nvp = g_gs_vps;   // drawn once per viewport below
     VkViewport vps[16]; VkRect2D scs[16];
-    int32_t sx = 0, sy = 0; uint32_t sw = P.w, sh = P.h;
+    int32_t sx = 0, sy = 0; uint32_t sw = P.w, sh = P.h; float ps = P.sc > 0 ? P.sc : 1.0f;   // ps: the targets' resolution scale (guest coordinates to image texels)
     if (D.has_sc && D.sc.w >= 0 && D.sc.h >= 0) {
         int64_t x0 = D.sc.x > 0 ? D.sc.x : 0, y0 = D.sc.y > 0 ? D.sc.y : 0, x1 = (int64_t)D.sc.x + D.sc.w, y1 = (int64_t)D.sc.y + D.sc.h;
+        if (ps != 1.0f) { x0 = (int64_t)(x0 * ps); y0 = (int64_t)(y0 * ps); x1 = (int64_t)(x1 * ps + 0.999f); y1 = (int64_t)(y1 * ps + 0.999f); }
         if (x1 > P.w) x1 = P.w;
         if (y1 > P.h) y1 = P.h;
         sx = (int32_t)x0; sy = (int32_t)y0; sw = x1 > x0 ? (uint32_t)(x1 - x0) : 0; sh = y1 > y0 ? (uint32_t)(y1 - y0) : 0;
     }
     for (uint32_t i = 0; i < nvp; i++) {
-        float vx = D.vp[i][0], vy = D.vp[i][1], vw = D.vp[i][2], vh = D.vp[i][3];
+        float vx = D.vp[i][0] * ps, vy = D.vp[i][1] * ps, vw = D.vp[i][2] * ps, vh = D.vp[i][3] * ps;
         if (vw <= 0 || vh <= 0) { vx = 0; vy = 0; vw = (float)P.w; vh = (float)P.h; }
         float mw = (float)VK.limits.maxViewportDimensions[0], mh = (float)VK.limits.maxViewportDimensions[1];
         if (vw > mw) { vx += (vw - mw) / 2; vw = mw; }   // larger than the GPU allows (Vulkan refuses it): centred at the largest size

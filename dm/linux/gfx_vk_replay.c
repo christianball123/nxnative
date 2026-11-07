@@ -61,14 +61,14 @@ static int fmt_int(VkFormat f) {   // integer formats clear with integer values
                  case VK_FORMAT_A2B10G10R10_UINT_PACK32: return 1; default: return 0; }
 }
 
-// ---------------------------------------------------------------- textures: one VkImage per texture serial
+// ---------------------------------------------------------------- textures: one VkImage per texture serial (made at first use: a render target's first use decides whether it is scaled)
 struct vview;
 // gpu: the GPU has written it (render target, clear, copy destination, shader image): its content lives here and is never replaced from guest memory;
 // uploaded: its guest-memory content was copied in (stage C uploads a texture the GPU has not written at its first sampling, and again after the CPU writes it: mtl_tex_cpu_written)
 // linear: a LINEAR texture, which the CPU and GPU may both write: its guest memory stays the reference (GPU writes are read back into it after each submission: wrote)
 // tracked: its guest pages are write-protected since stamp (nvn_dirty.c), so a CPU write since its upload is seen (prep_tex) and it is uploaded again
 typedef struct { uint64_t serial; VkImage img; VkDeviceMemory mem; VkFormat fmt; uint32_t w, h, d, layers, levels, samples; int is3d, is1d, bad, gpu, uploaded, storage; struct vview *views;
-                 int linear, wrote, tracked, mutable_fmt, cube, twin; uint64_t alias; const void *gkey; uint8_t *gmem; uint64_t gsize, stamp; const void *span; uint32_t stride, rowbytes, rows; uint64_t bytes; } vtex;
+                 int linear, wrote, tracked, mutable_fmt, cube, twin; uint64_t alias; uint32_t gw, gh; float sc; const void *gkey; uint8_t *gmem; uint64_t gsize, stamp; const void *span; uint32_t stride, rowbytes, rows; uint64_t bytes; } vtex;
 static vtex **g_lw; static int g_nlw, g_clw;   // linear textures the GPU wrote in this submission
 static inline void gpu_wrote(vtex *v) {
     v->gpu = 1; v->uploaded = 1;   // the GPU's content is the newest now: nothing from guest memory goes over it (a linear texture's is read back at the submission's end)
@@ -140,7 +140,7 @@ static vtex *gm_find(const void *m, uint32_t w, uint32_t h, uint32_t layers, uin
         if (g_gm[i].m != m || gm_dead(i)) continue;
         vtex *b = tex_slot(g_gm[i].serial, 0);
         if (!*any || b->serial > (*any)->serial) *any = b;
-        int ok = b->w == w && b->h == h && b->layers == layers && b->levels >= levels && b->samples == samples && b->is3d == is3d && (f == b->fmt || (b->twin && f == fmt_twin(b->fmt)));
+        int ok = b->gw == w && b->gh == h && b->layers == layers && b->levels >= levels && b->samples == samples && b->is3d == is3d && (f == b->fmt || (b->twin && f == fmt_twin(b->fmt)));
         if (ok && !b->alias && (!best || b->serial > best->serial)) best = b;
     }
     return best;
@@ -151,6 +151,7 @@ static vtex *tex_find(uint64_t serial) {
     if (v && v->alias) { vtex *b = tex_slot(v->alias, 0); if (b && b->img) return b; }
     return v;
 }
+static int g_rt_hint;   // the texture asked for is about to be a render target (a pass's attachment, a target clear): only those may be scaled (resolution scaling)
 static vtex *tex_get(const tex_t *t) {
     if (!t || !t->serial || !VK.ok) return NULL;
     pthread_mutex_lock(&g_tex_mu);
@@ -203,7 +204,7 @@ static vtex *tex_get(const tex_t *t) {
         if (b == v) b = NULL;
         if (!b) b = other != v ? other : NULL;
         if (b) {
-            int shape = b->w == ci.extent.width && b->h == ci.extent.height && b->layers == ci.arrayLayers && b->levels >= ci.mipLevels && b->samples == samples && b->is3d == (ci.imageType == VK_IMAGE_TYPE_3D);
+            int shape = b->gw == ci.extent.width && b->gh == ci.extent.height && b->layers == ci.arrayLayers && b->levels >= ci.mipLevels && b->samples == samples && b->is3d == (ci.imageType == VK_IMAGE_TYPE_3D);
             if (shape && (f == b->fmt || (b->twin && f == fmt_twin(b->fmt)))) {
                 v->alias = b->serial;
                 static int n; if (n++ < 200) LOG("[vk] texture serial %llu (format %d) shares the image of serial %llu (format %d): the same storage", (unsigned long long)t->serial, f, (unsigned long long)b->serial, b->fmt);
@@ -211,6 +212,21 @@ static vtex *tex_get(const tex_t *t) {
             }
             static int n2; if (n2++ < 30) LOG("[YELLOW] [vk] texture serial %llu (format %d %ux%u x%u levels %u) is over the storage of serial %llu (format %d %ux%u x%u levels %u) but cannot share its image: it gets its own",
                                               (unsigned long long)t->serial, f, ci.extent.width, ci.extent.height, ci.arrayLayers, ci.mipLevels, (unsigned long long)b->serial, b->fmt, b->w, b->h, b->layers, b->levels);
+        }
+    }
+    // Resolution scaling (DM_VK_SCALE, e.g. 0.75; DM_VK_SCALE_SIZE, default 1920x1080): the game's full-size render targets get images that much smaller, and everything
+    // drawn into them and read from them follows (the pass, its viewports and scissors, copies; the translated shaders take the scales from the support buffer, as
+    // Ryujinx's resolution scaler: fragment coordinates, texel fetches and texture sizes). Only single-level 2D textures of exactly that size, not linear, not shader images
+    uint32_t gw = ci.extent.width, gh = ci.extent.height; float sc = 1.0f;
+    {
+        static float g_sc = -1; static uint32_t sw = 1920, sh = 1080;
+        if (g_sc < 0) { const char *e = getenv("DM_VK_SCALE"); g_sc = e ? (float)atof(e) : 1.0f; if (!(g_sc > 0.2f && g_sc < 1.0f)) g_sc = 1.0f;
+            const char *z = getenv("DM_VK_SCALE_SIZE"); if (z) sscanf(z, "%ux%u", &sw, &sh);
+            if (g_sc != 1.0f) LOG("[vk] resolution scale %.2f for %ux%u render targets (DM_VK_SCALE, DM_VK_SCALE_SIZE)", g_sc, sw, sh); }
+        if (g_sc != 1.0f && g_rt_hint && ci.imageType == VK_IMAGE_TYPE_2D && ci.arrayLayers == 1 && ci.mipLevels == 1 && samples == 1 && gw == sw && gh == sh && !v->storage && !v->mutable_fmt &&
+            !(t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) {
+            sc = g_sc; ci.extent.width = (uint32_t)(gw * sc + 0.5f); ci.extent.height = (uint32_t)(gh * sc + 0.5f);
+            static int n4; if (n4++ < 20) LOG("[vk] texture serial %llu (format %d %ux%u) scaled to %ux%u", (unsigned long long)t->serial, f, gw, gh, ci.extent.width, ci.extent.height);
         }
     }
     if (ci.extent.width >= 1280) { static int n3; if (n3++ < 80) LOG("[vk] large texture serial %llu: format %d %ux%u x%u levels %u, storage %p (memory %p, pool %p + %#llx)", (unsigned long long)t->serial, f, ci.extent.width, ci.extent.height, ci.arrayLayers, ci.mipLevels, key, (void *)t->mem, (void *)t->pool, (unsigned long long)t->off); }
@@ -242,6 +258,7 @@ static vtex *tex_get(const tex_t *t) {
     }
     v->gkey = key;
     if (key && !depth) gm_put(key, t->serial);
+    v->gw = gw; v->gh = gh; v->sc = sc;
     v->fmt = f; v->w = ci.extent.width; v->h = ci.extent.height; v->d = ci.extent.depth; v->layers = ci.arrayLayers; v->levels = ci.mipLevels; v->is3d = ci.imageType == VK_IMAGE_TYPE_3D; v->is1d = ci.imageType == VK_IMAGE_TYPE_1D; v->samples = samples;
     g_tex_made++; g_tex_bytes += mr.size; g_tex_live++; g_tex_live_bytes += mr.size; v->bytes = mr.size;
     if (g_tex_made == 1 || g_tex_made % 500 == 0) LOG("[vk] textures made: %llu, %.0f MB", (unsigned long long)g_tex_made, g_tex_bytes / 1048576.0);
@@ -378,6 +395,7 @@ static void clear_tex(const p_clear_tex *c) {
 }
 static void copy_b2t(const p_copy_b2t *c) {
     vtex *v = use(c->tex); if (!v) return;
+    if (v->sc != 1.0f) { static int w; if (!w++) LOG("[vk] a buffer copy into a scaled render target (serial %llu) was skipped", (unsigned long long)c->tex->serial); return; }
     tex_fill(v, c->tex); gpu_wrote(v);   // a copy into part of a texture keeps the rest: its guest content goes in first
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh); if (!bpb) return;
     uint32_t lv, nl, l0, nlay; view_range(v, &c->view, c->has_view, &lv, &nl, &l0, &nlay);
@@ -394,6 +412,23 @@ static void copy_b2t(const p_copy_b2t *c) {
     if (fmt_aspects(v->fmt) == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) { static int w; if (!w++) LOG("[vk] a buffer copy into a depth-stencil texture took its depth plane only (stage B)"); }
     vkCmdCopyBufferToImage_(g_cb, s->b, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bic); full_barrier();
 }
+// A copy from a scaled render target into a buffer (resolution scaling): the region is first scaled back into an image of the guest's size (kept per format and size)
+static struct { VkFormat f; uint32_t w, h; VkImage img; VkDeviceMemory m; } g_unsc[16]; static int g_nunsc;
+static VkImage unscaled_tmp(VkFormat f, uint32_t w, uint32_t h) {
+    for (int i = 0; i < g_nunsc; i++) if (g_unsc[i].f == f && g_unsc[i].w == w && g_unsc[i].h == h) return g_unsc[i].img;
+    if (g_nunsc == 16) return VK_NULL_HANDLE;
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, f, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage img; if (vkCreateImage_(VK.dev, &ci, NULL, &img)) return VK_NULL_HANDLE;
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements_(VK.dev, img, &mr);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)}; VkDeviceMemory m;
+    if (ai.memoryTypeIndex == ~0u || vkAllocateMemory_(VK.dev, &ai, NULL, &m)) { vkDestroyImage_(VK.dev, img, NULL); return VK_NULL_HANDLE; }
+    vkBindImageMemory_(VK.dev, img, m, 0);
+    VkImageMemoryBarrier ib = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img, {fmt_aspects(f), 0, 1, 0, 1}};
+    vkCmdPipelineBarrier_(g_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+    g_unsc[g_nunsc++] = (__typeof__(g_unsc[0])){f, w, h, img, m};
+    return img;
+}
 static void copy_t2b(const p_copy_t2t *c) {   // T2B reuses p_copy_t2t: src holds the destination buffer address, dst the texture
     const tex_t *t = c->dst; uint64_t dst = (uint64_t)(uintptr_t)c->src;
     vtex *v = use(t); if (!v) return;
@@ -405,26 +440,42 @@ static void copy_t2b(const p_copy_t2t *c) {   // T2B reuses p_copy_t2t: src hold
     size_t row = R.copy_stride ? (size_t)R.copy_stride : wb; int nz = r->depth > 0 ? r->depth : 1;
     if (nz > 1) { static int w; if (!w++) LOG("[vk] a texture → buffer copy of %d layers copied the first only (stage B)", nz); }
     {   // inside the image: a region past its level's extent or its layers is refused by Vulkan (and reads nothing on the Switch)
-        uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1;
+        uint32_t gw = v->sc != 1.0f ? v->gw : v->w, gh = v->sc != 1.0f ? v->gh : v->h;   // in the guest's texels (a scaled target is checked at its guest size)
+        uint32_t lw = gw >> lv ? gw >> lv : 1, lh = gh >> lv ? gh >> lv : 1;
         if (r->xoffset < 0 || r->yoffset < 0 || (uint32_t)(r->xoffset + r->width) > lw || (uint32_t)(r->yoffset + r->height) > lh || (!v->is3d && l0 + (uint32_t)r->zoffset >= v->layers)) {
             static int w2; if (w2++ < 5) LOG("[vk] a texture → buffer copy outside the texture (%d,%d %dx%d layer %d of a %ux%u level, %u layers) was skipped", r->xoffset, r->yoffset, r->width, r->height, r->zoffset, lw, lh, v->layers);
             return;
         }
     }
+    VkImage src_img = v->img; NVNcopyRegion rr = *r; uint32_t src_lv = lv, src_layer = v->is3d ? 0 : l0 + (uint32_t)r->zoffset;
+    if (v->sc != 1.0f) {   // scaled: blitted to the guest's size first
+        VkImage tmp = unscaled_tmp(v->fmt, (uint32_t)r->width, (uint32_t)r->height); if (!tmp) return;
+        VkImageAspectFlags as = fmt_aspects(v->fmt);
+        int x0 = (int)(r->xoffset * v->sc), y0 = (int)(r->yoffset * v->sc), x1 = (int)((r->xoffset + r->width) * v->sc + 0.5f), y1 = (int)((r->yoffset + r->height) * v->sc + 0.5f);
+        VkImageBlit bl = {{as, lv, src_layer, 1}, {{x0, y0, 0}, {x1 > x0 ? x1 : x0 + 1, y1 > y0 ? y1 : y0 + 1, 1}}, {as, 0, 0, 1}, {{0, 0, 0}, {r->width, r->height, 1}}};
+        vkCmdBlitImage_(g_cb, v->img, VK_IMAGE_LAYOUT_GENERAL, tmp, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, fmt_depth(v->fmt) || fmt_int(v->fmt) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR); full_barrier();
+        src_img = tmp; rr.xoffset = rr.yoffset = 0; src_lv = 0; src_layer = 0;
+    }
+    r = &rr;
     stage_t *s = stage_new(wb * rows); if (!s) return;
     s->rb_dst = (uint8_t *)(uintptr_t)dst; s->rb_row = row; s->rb_src_row = wb; s->rb_rows = rows; s->rb_n = wb; s->fwo = -1;
     if (row == wb && (s->orig = malloc(wb * rows))) memcpy(s->orig, s->rb_dst, wb * rows);   // packed: a later submission may get it forwarded on the GPU
-    VkBufferImageCopy bic = {0, 0, 0, {fmt_aspects(v->fmt) & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT), lv, v->is3d ? 0 : l0 + (uint32_t)r->zoffset, 1},
-                             {r->xoffset, r->yoffset, v->is3d ? r->zoffset : 0}, {(uint32_t)r->width, (uint32_t)r->height, 1}};
+    VkBufferImageCopy bic = {0, 0, 0, {fmt_aspects(v->fmt) & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT), src_lv, src_layer, 1},
+                             {r->xoffset, r->yoffset, v->is3d && src_img == v->img ? r->zoffset : 0}, {(uint32_t)r->width, (uint32_t)r->height, 1}};
     if (!bic.imageSubresource.aspectMask) bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
-    vkCmdCopyImageToBuffer_(g_cb, v->img, VK_IMAGE_LAYOUT_GENERAL, s->b, 1, &bic); full_barrier();
+    vkCmdCopyImageToBuffer_(g_cb, src_img, VK_IMAGE_LAYOUT_GENERAL, s->b, 1, &bic); full_barrier();
 }
 static void copy_t2t(const p_copy_t2t *c) {
     vtex *s = use(c->src), *d = use(c->dst); if (!s || !d) return;
     tex_fill(s, c->src); tex_fill(d, c->dst); gpu_wrote(d);
     uint32_t slv, snl, sl0, snlay, dlv, dnl, dl0, dnlay;
     view_range(s, &c->sv, c->has_sv, &slv, &snl, &sl0, &snlay); view_range(d, &c->dv, c->has_dv, &dlv, &dnl, &dl0, &dnlay);
-    const NVNcopyRegion *a = &c->sr, *b = &c->dr;
+    NVNcopyRegion as = c->sr, bs = c->dr; const NVNcopyRegion *a = &as, *b = &bs;
+    // scaled render targets (resolution scaling): their regions in image texels
+    #define SCR(v, r) do { if ((v)->sc != 1.0f) { (r).xoffset = (int)((r).xoffset * (v)->sc + 0.5f); (r).yoffset = (int)((r).yoffset * (v)->sc + 0.5f); \
+        (r).width = (int)((r).width * (v)->sc + 0.5f); (r).height = (int)((r).height * (v)->sc + 0.5f); if ((r).width < 1) (r).width = 1; if ((r).height < 1) (r).height = 1; } } while (0)
+    SCR(s, as); SCR(d, bs);
+    #undef SCR
     int nz = a->depth > 0 ? a->depth : 1;
     VkImageAspectFlags sa = fmt_aspects(s->fmt), da = fmt_aspects(d->fmt);
     int same = a->width == b->width && a->height == b->height && !(c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT));
