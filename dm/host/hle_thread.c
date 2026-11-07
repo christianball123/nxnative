@@ -671,7 +671,20 @@ static void thr_bt(thr_t *t) {
         // Threads not waiting in a system call (running guest code, possibly spinning on a condition): print the callee-saved registers x19–x28, plus 128 bytes of the memory pointed to by each of x19 / x20.
         // A thread spinning on a condition is told apart by its callee-saved registers (often the object it waits on) and the memory they point to
         if (t->wkind == 0) { char rl[400]; int q = snprintf(rl, sizeof rl, "[dm]   %#x registers pc=", t->handle); uint64_t pc = __darwin_arm_thread_state64_get_pc(st); module_t *pm = module_of((void *)pc);
+#ifdef __linux__
+            { void crash_where(uint64_t, char *, size_t); char wb[200];
+              if (!pm) crash_where(pc, wb, sizeof wb);
+              q += pm ? snprintf(rl + q, sizeof rl - q, "%s+%#llx", pm->name, pc - (uint64_t)pm->base) : snprintf(rl + q, sizeof rl - q, "%s", wb);
+              uint32_t ins[24]; vm_size_t gi = 0;   // the code around pc (8 words before, 16 from it), to read what the loop is
+              if (!vm_read_overwrite(mach_task_self(), pc - 32, sizeof ins, (vm_address_t)ins, &gi) && gi == sizeof ins) {
+                  char ib[300]; int b = 0; for (int k = 0; k < 24; k++) b += snprintf(ib + b, sizeof ib - b, k == 8 ? "[%08x] " : "%08x ", ins[k]);
+                  fprintf(stderr, "[dm]   %#x code at pc-32: %s\n", t->handle, ib); }
+              char lb[200]; uint64_t lr0 = __darwin_arm_thread_state64_get_lr(st); module_t *lm = module_of((void *)lr0);
+              if (lm) snprintf(lb, sizeof lb, "%s+%#llx", lm->name, lr0 - (uint64_t)lm->base); else crash_where(lr0, lb, sizeof lb);
+              fprintf(stderr, "[dm]   %#x lr=%s x0=%#llx x1=%#llx x2=%#llx x3=%#llx x8=%#llx\n", t->handle, lb, st.__x[0], st.__x[1], st.__x[2], st.__x[3], st.__x[8]); }
+#else
             q += pm ? snprintf(rl + q, sizeof rl - q, "%s+%#llx", pm->name, pc - (uint64_t)pm->base) : snprintf(rl + q, sizeof rl - q, "%#llx", pc);
+#endif
             for (int i = 19; i <= 28; i++) q += snprintf(rl + q, sizeof rl - q, " x%d=%#llx", i, st.__x[i]);
             fprintf(stderr, "%s\n", rl);
             for (int i = 19; i <= 20; i++) { uint8_t raw[128]; vm_size_t g = 0; uint64_t a = st.__x[i];
@@ -689,6 +702,9 @@ static void thr_bt(thr_t *t) {
         for (int k = 0; k < 64 && fp && nf < 20 && p < (int)sizeof line - 40; k++) {
             module_t *m = module_of((void *)lr);
             if (m) { p += snprintf(line + p, sizeof line - p, " %s+%#llx", m->name, lr - (uint64_t)m->base); nf++; }
+#ifdef __linux__
+            else if (lr) { void crash_where(uint64_t, char *, size_t); char wb[200]; crash_where(lr, wb, sizeof wb); p += snprintf(line + p, sizeof line - p, " {%s}", wb); nf++; }
+#endif
             uint64_t fr[2]; vm_size_t g2 = 0;
             if (vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &g2) || g2 != 16 || fr[0] <= fp) break;
             fp = fr[0]; lr = fr[1];

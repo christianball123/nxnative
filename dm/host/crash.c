@@ -135,6 +135,19 @@ static const hsym *hsym_find(uint64_t a) {
     const hsym *h = &g_hsym[lo - 1];
     return r - h->a < (h->sz ? h->sz : 0x10000) ? h : NULL;
 }
+// A host address in words (hang dumps): its function from the symbol table or dladdr, otherwise the /proc/self/maps line it falls in (a JIT region, a driver, an anonymous mapping)
+void crash_where(uint64_t a, char *buf, size_t n) {
+    const hsym *h = hsym_find(a); if (h) { snprintf(buf, n, "%s+%#llx", h->n, (unsigned long long)(a - g_exe_base - h->a)); return; }
+    Dl_info di; if (dladdr((void *)a, &di) && di.dli_fname) { const char *b = strrchr(di.dli_fname, '/'); b = b ? b + 1 : di.dli_fname;
+        if (di.dli_sname) snprintf(buf, n, "%s!%s+%#lx", b, di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr)); else snprintf(buf, n, "%s+%#lx", b, (unsigned long)(a - (uint64_t)di.dli_fbase)); return; }
+    snprintf(buf, n, "%#llx (no mapping)", (unsigned long long)a);
+    FILE *f = fopen("/proc/self/maps", "r"); if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof line, f)) { unsigned long lo, hi, off; char perm[8] = "", path[300] = "";
+        if (sscanf(line, "%lx-%lx %7s %lx %*s %*s %299[^\n]", &lo, &hi, perm, &off, path) < 4) continue;
+        if (a >= lo && a < hi) { snprintf(buf, n, "%#llx in [%lx-%lx %s %s] +%#lx", (unsigned long long)a, lo, hi, perm, *path ? path : "anonymous", (unsigned long)(a - lo + off)); break; } }
+    fclose(f);
+}
 #endif
 void crash_off(const char *tag, uint64_t a) {   // Also used by diag.c
 #define off crash_off
