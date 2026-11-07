@@ -151,8 +151,9 @@ def main():
         tmp = nro_dir.with_name(nro_dir.name + '.partial'); shutil.rmtree(tmp, ignore_errors=True)
         r = subprocess.run([sys.executable, REPO / 'dm/tools/nro_collect.py', romfs, tmp, '--missing-ok'], capture_output=True, text=True, env=env)
         sys.stdout.write(r.stdout[-2000:])
-        if r.returncode: sys.stderr.write(r.stderr[-2000:]); die('nro_collect.py failed')
-        if (tmp / 'nro.tsv').is_file(): shutil.rmtree(nro_dir, ignore_errors=True); tmp.rename(nro_dir)
+        if r.returncode and 'no NRR file with hashes' in (r.stderr + r.stdout): nrrs = False; r = None; say('no NROs registered (the game loads none at run time)')   # Ocarina of Time
+        elif r.returncode: sys.stderr.write(r.stderr[-2000:]); die('nro_collect.py failed')
+        if r is not None and (tmp / 'nro.tsv').is_file(): shutil.rmtree(nro_dir, ignore_errors=True); tmp.rename(nro_dir)
         else: nrrs = False; shutil.rmtree(tmp, ignore_errors=True)
     host_built = False
     def build_host():
