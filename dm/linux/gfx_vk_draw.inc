@@ -575,6 +575,8 @@ static void clears_into_pass(VkRenderingAttachmentInfo *ca, VkRenderingAttachmen
     g_npcl = 0;
     if (img) full_barrier();
 }
+static uint64_t g_fb_split;
+static int fb_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_FEEDBACK_SPLIT"); on = !(e && *e == '0'); } return on; }
 static void clear_color(const p_clear_color *c) {
     if (!R.has_rt || c->index < 0 || c->index >= R.rt.n || !R.rt.color[c->index]) return;
     if (P.open) { vtex *pv = tex_get(R.rt.color[c->index]); if (!pv || !(pv->bad & 2)) pass_end(); }   // its first use records commands outside a pass
@@ -1012,6 +1014,14 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                     // a target this pass cleared, also read by its shaders: a tile-based GPU has the clear only in its tiles, the texture reads memory. The pass ends (its
                     // clear stored) and begins again loading it, so the shaders read the cleared target as with an image clear (Mario Tennis Fever's picture went black)
                     if (v && P.open) for (int c = 0; c < P.nclr; c++) if (P.clr[c] == v) { pass_end(); g_clear_split++; break; }
+                    // a target this pass has drawn into, read by this draw's shaders (a particle reading the depth, a target read back): what the GPU wrote may still
+                    // sit in its caches (or compressed, or in a tile), and the texture reads memory. The pass ends (written out) and begins again. On the Thor's GPU,
+                    // passes rendered straight to memory (TU_DEBUG=sysmem, and render target clears in passes, which change the driver's choice) read garbage there
+                    // and Mario Tennis Fever's picture went black. NVN orders such reads with a texture barrier, which the replay records as nothing
+                    if (v && P.open && g_drawn > P.draws0 && fb_on()) {
+                        int hit = P.dv == v; for (uint32_t c = 0; c < P.ncol && c < 8 && !hit; c++) hit = P.cv[c] == v;
+                        if (hit) { pass_end(); g_fb_split++; }
+                    }
                     if (!v) why = 1;
                     else if (storage && !v->storage) why = 2;
                     else { iv = tex_view(v, &r->t, &r->v, r->has_v, b->image, storage); if (storage && iv) gpu_wrote(v); if (!iv) why = 3; }
@@ -1521,6 +1531,7 @@ static void draw_summary(char *out, size_t n) {
     if (g_storage_unsup && o < (int)n) o += snprintf(out + o, n - o, "; shader images in a format that cannot be written %llu", (unsigned long long)g_storage_unsup);
     if (g_tex_unreg && o < (int)n) o += snprintf(out + o, n - o, "; bound texture IDs not registered %llu", (unsigned long long)g_tex_unreg);
     if (g_ring_forgot && o < (int)n) o += snprintf(out + o, n - o, "; copies made again after the command stream changed their bytes %llu", (unsigned long long)g_ring_forgot);
+    if (g_fb_split && o < (int)n) o += snprintf(out + o, n - o, "; passes ended for a draw reading its own target %llu", (unsigned long long)g_fb_split);
     if ((g_clear_load || g_clear_att || g_clear_img) && o < (int)n) o += snprintf(out + o, n - o, "; render target clears: as a pass's load %llu, inside a pass %llu, as image clears %llu (%llu not attachments of the next pass; passes split for a cleared target read as a texture %llu", (unsigned long long)g_clear_load, (unsigned long long)g_clear_att, (unsigned long long)g_clear_img, (unsigned long long)g_clear_untaken, (unsigned long long)g_clear_split);
     for (int r = 0; r < 4 && o < (int)n; r++) { int b = -1; for (int i = 0; i < 128; i++) if (g_clear_why[i] && (b < 0 || g_clear_why[i] > g_clear_why[b])) b = i; if (b < 0) break;
         o += snprintf(out + o, n - o, ", %llu before op %d", (unsigned long long)g_clear_why[b], b); g_clear_why[b] = 0; }
