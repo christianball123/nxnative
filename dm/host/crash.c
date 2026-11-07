@@ -96,6 +96,45 @@ static void *watchdog_main(void *arg) {
     }
     return NULL;
 }
+#ifdef __linux__
+// The host's own functions by name in crash reports (Linux): the ELF symbol table of /proc/self/exe, read once at crash_install (a signal handler may not
+// allocate), searched by crash_off for addresses dladdr cannot name (static functions are not in the dynamic symbol table)
+// (the ELF structures by hand: dm.h has its own Elf64 types)
+typedef struct { uint8_t ident[16]; uint16_t type, machine; uint32_t version; uint64_t entry, phoff, shoff; uint32_t flags; uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx; } hs_ehdr;
+typedef struct { uint32_t name, type; uint64_t flags, addr, offset, size; uint32_t link, info; uint64_t addralign, entsize; } hs_shdr;
+typedef struct { uint32_t name; uint8_t info, other; uint16_t shndx; uint64_t value, size; } hs_sym;
+typedef struct { uint64_t a, sz; const char *n; } hsym;
+static hsym *g_hsym; static size_t g_nhsym; static uint64_t g_exe_base;
+static int hsym_cmp(const void *x, const void *y) { uint64_t a = ((const hsym *)x)->a, b = ((const hsym *)y)->a; return a < b ? -1 : a > b; }
+static void hsym_load(void) {
+    Dl_info di; if (!dladdr((void *)hsym_load, &di)) return;
+    g_exe_base = (uint64_t)di.dli_fbase;
+    int fd = open("/proc/self/exe", O_RDONLY); if (fd < 0) return;
+    off_t len = lseek(fd, 0, SEEK_END); if (len <= 0) { close(fd); return; }
+    uint8_t *f = mmap(NULL, (size_t)len, PROT_READ, MAP_PRIVATE, fd, 0); close(fd);
+    if (f == MAP_FAILED) return;
+    const hs_ehdr *eh = (const hs_ehdr *)f;
+    if (memcmp(eh->ident, "\177ELF", 4) || eh->shoff + (uint64_t)eh->shnum * sizeof(hs_shdr) > (uint64_t)len) return;
+    const hs_shdr *sh = (const hs_shdr *)(f + eh->shoff);
+    for (int i = 0; i < eh->shnum; i++) {
+        if (sh[i].type != 2 || sh[i].link >= eh->shnum) continue;   // SHT_SYMTAB
+        const hs_sym *sy = (const hs_sym *)(f + sh[i].offset); size_t n = sh[i].size / sizeof *sy;
+        const char *str = (const char *)(f + sh[sh[i].link].offset);
+        g_hsym = malloc(n * sizeof *g_hsym); if (!g_hsym) return;
+        for (size_t k = 0; k < n; k++) if ((sy[k].info & 15) == 2 && sy[k].value) g_hsym[g_nhsym++] = (hsym){sy[k].value, sy[k].size, str + sy[k].name};   // STT_FUNC
+        qsort(g_hsym, g_nhsym, sizeof *g_hsym, hsym_cmp);
+        return;   // the file stays mapped: the names point into it
+    }
+}
+static const hsym *hsym_find(uint64_t a) {
+    if (!g_nhsym || a < g_exe_base) return NULL;
+    uint64_t r = a - g_exe_base; size_t lo = 0, hi = g_nhsym;
+    while (lo < hi) { size_t m = (lo + hi) / 2; if (g_hsym[m].a <= r) lo = m + 1; else hi = m; }
+    if (!lo) return NULL;
+    const hsym *h = &g_hsym[lo - 1];
+    return r - h->a < (h->sz ? h->sz : 0x10000) ? h : NULL;
+}
+#endif
 void crash_off(const char *tag, uint64_t a) {   // Also used by diag.c
 #define off crash_off
 
@@ -103,6 +142,9 @@ void crash_off(const char *tag, uint64_t a) {   // Also used by diag.c
     Dl_info di;
     if (m) fprintf(stderr, " %s%s%s+%#llx", tag, *tag ? "=" : "", m->name, a - (uint64_t)m->base);
     else if (dladdr((void *)a, &di) && di.dli_sname) fprintf(stderr, " %s%s%s+%#lx", tag, *tag ? "=" : "", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr));
+#ifdef __linux__
+    else if (hsym_find(a)) { const hsym *h = hsym_find(a); fprintf(stderr, " %s%s%s+%#llx", tag, *tag ? "=" : "", h->n, (unsigned long long)(a - g_exe_base - h->a)); }
+#endif
     else fprintf(stderr, " %s%s%#llx", tag, *tag ? "=" : "", a);
 }
 // Frame pointer backtrace: x29 chain [fp]=previous frame's fp, [fp+8]=return address; only 8-byte aligned, monotonically increasing frames are walked.
@@ -223,6 +265,9 @@ void crash_thread_init(void) {
     pthread_setspecific(g_altstack_key, ss.ss_sp);
 }
 void crash_install(void) {
+#ifdef __linux__
+    hsym_load();
+#endif
     crash_thread_init();
     struct sigaction sa = {.sa_sigaction = on_crash, .sa_flags = SA_SIGINFO | SA_ONSTACK};
     sigaction(SIGALRM, &sa, 0);
