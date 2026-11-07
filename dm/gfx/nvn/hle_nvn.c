@@ -1431,6 +1431,29 @@ static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // Accumulated display-link wait 
 static uint64_t g_fs_start, g_fs_wait;   // frame step (fstep_tick): when the first acquire after a present returned (the frame's start, 0 = none yet), and its pacing wait
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // Host process start point (main.c; same base as the UIMSG timestamps)
+// The fence an acquired swapchain texture's sync gets. Here (Metal, and Linux with DM_ACQUIRE_SYNC=all): everything submitted so far. On Linux by default: what was
+// submitted when that texture was last presented, the frame drawn into it. The Vulkan replay orders the GPU's work itself (each submission starts after the one before), so
+// the sync only tells the game when the texture's last frame is done, as on the Switch, where it means the display has let go of it. Waiting for everything made the game
+// wait for the GPU to finish the frame just submitted before starting the next: CPU and GPU took turns (Mario Tennis Fever on the AYN Thor)
+static struct { const void *w; uint64_t f[4]; } g_acqf[8];
+static int acq_per_tex(void) {
+#ifdef __linux__
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_ACQUIRE_SYNC"); on = !(e && !strcmp(e, "all")); } return on;
+#else
+    return 0;
+#endif
+}
+static void acq_note(const win_t *o, int idx) {
+    if (!acq_per_tex() || idx < 0 || idx >= 4) return;
+    int k = 0; while (k < 8 && g_acqf[k].w && g_acqf[k].w != o) k++;
+    if (k == 8) k = (int)((uintptr_t)o >> 4 & 7);
+    if (g_acqf[k].w != o) { memset(&g_acqf[k], 0, sizeof g_acqf[k]); g_acqf[k].w = o; }
+    g_acqf[k].f[idx] = mtl_last_fence();
+}
+static uint64_t acq_fence(const win_t *o, int idx) {
+    if (acq_per_tex() && idx >= 0 && idx < 4) for (int k = 0; k < 8; k++) if (g_acqf[k].w == o) return g_acqf[k].f[idx];
+    return mtl_last_fence();
+}
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     win_t *o = (win_t *)w;
     *idx = o->ntex ? o->next++ % o->ntex : 0;
@@ -1459,7 +1482,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
-    if (s) { ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed (fenced 2: an acquire sync, for the wait ledger)
+    if (s) { ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = acq_fence(o, *idx); }   // The swapchain texture becomes available once the commits before this point have completed (fenced 2: an acquire sync, for the wait ledger)
     if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
@@ -2005,6 +2028,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (idx >= 0 && idx < o->ntex && idx < 4) {   // enqueue only, return immediately
         const tex_t *t = CTX(o->tex[idx]); int lc[4]; const int *crop = present_crop(o->crop, (int)t->d.width, (int)t->d.height, lc);
         nvn_cap_present(t, crop);   // DM_NVN_CAPTURE (nvn_capture.inc)
+        acq_note(o, idx);
         o->ticket[idx] = mtl_present(t, present_period(o) / 1e9, crop);
     }
     gfx_leave();
