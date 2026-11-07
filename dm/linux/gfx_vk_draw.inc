@@ -498,7 +498,7 @@ static uint64_t g_pass_fs;
 // memory, and a clear between draws no longer splits the pass). Outside a pass a clear waits here until the next pass begins: one of its attachments takes it as its load
 // operation. Anything else that ends a pass (copies, dispatches, the submission's end) does the waiting clears first, as image clears
 typedef struct { vtex *v; uint32_t lv, l0, nlay; VkImageAspectFlags asp; float rgba[4]; float depth; uint32_t stencil; int done; } pclear;
-static pclear g_pcl[24]; static int g_npcl; static uint64_t g_clear_load, g_clear_att, g_clear_img;
+static pclear g_pcl[24]; static int g_npcl; static uint64_t g_clear_load, g_clear_att, g_clear_img, g_clear_why[128], g_clear_untaken; static uint32_t g_cur_op;   // why: the op that made waiting clears image clears
 static void pcl_image(const pclear *c) {
     VkImageSubresourceRange rr = {c->asp, c->lv, 1, c->l0, c->nlay};
     if (c->asp & VK_IMAGE_ASPECT_COLOR_BIT) {
@@ -510,6 +510,7 @@ static void pcl_image(const pclear *c) {
 }
 static void clears_flush(void) {
     if (!g_npcl) return;
+    g_clear_why[g_cur_op & 127] += g_npcl;
     int any = 0;
     for (int i = 0; i < g_npcl; i++) if (!g_pcl[i].done && g_pcl[i].v->img) { pcl_image(&g_pcl[i]); any = 1; }
     g_npcl = 0;
@@ -562,7 +563,7 @@ static void clears_into_pass(VkRenderingAttachmentInfo *ca, VkRenderingAttachmen
     int img = 0;
     for (int i = 0; i < g_npcl; i++) {
         pclear *c = &g_pcl[i];
-        if (!take[i]) { if (c->v->img) { pcl_image(c); img = 1; } continue; }
+        if (!take[i]) { if (c->v->img) { pcl_image(c); img = 1; g_clear_untaken++; } continue; }
         if (take[i] == 100) {
             if (c->asp & VK_IMAGE_ASPECT_DEPTH_BIT) { da->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; da->clearValue.depthStencil.depth = c->depth; }
             if (c->asp & VK_IMAGE_ASPECT_STENCIL_BIT) { sa->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; sa->clearValue.depthStencil.stencil = c->stencil; }
@@ -1515,7 +1516,10 @@ static void draw_summary(char *out, size_t n) {
     if (g_storage_unsup && o < (int)n) o += snprintf(out + o, n - o, "; shader images in a format that cannot be written %llu", (unsigned long long)g_storage_unsup);
     if (g_tex_unreg && o < (int)n) o += snprintf(out + o, n - o, "; bound texture IDs not registered %llu", (unsigned long long)g_tex_unreg);
     if (g_ring_forgot && o < (int)n) o += snprintf(out + o, n - o, "; copies made again after the command stream changed their bytes %llu", (unsigned long long)g_ring_forgot);
-    if ((g_clear_load || g_clear_att || g_clear_img) && o < (int)n) o += snprintf(out + o, n - o, "; render target clears: as a pass's load %llu, inside a pass %llu, as image clears %llu", (unsigned long long)g_clear_load, (unsigned long long)g_clear_att, (unsigned long long)g_clear_img);
+    if ((g_clear_load || g_clear_att || g_clear_img) && o < (int)n) o += snprintf(out + o, n - o, "; render target clears: as a pass's load %llu, inside a pass %llu, as image clears %llu (%llu not attachments of the next pass", (unsigned long long)g_clear_load, (unsigned long long)g_clear_att, (unsigned long long)g_clear_img, (unsigned long long)g_clear_untaken);
+    for (int r = 0; r < 4 && o < (int)n; r++) { int b = -1; for (int i = 0; i < 128; i++) if (g_clear_why[i] && (b < 0 || g_clear_why[i] > g_clear_why[b])) b = i; if (b < 0) break;
+        o += snprintf(out + o, n - o, ", %llu before op %d", (unsigned long long)g_clear_why[b], b); g_clear_why[b] = 0; }
+    if (o < (int)n) o += snprintf(out + o, n - o, ")");
     if ((g_tbuf_n || g_tbuf_miss) && o < (int)n) o += snprintf(out + o, n - o, "; texture buffers bound %llu, unusable %llu", (unsigned long long)g_tbuf_n, (unsigned long long)g_tbuf_miss);
     if (g_tex_unres && o < (int)n) o += snprintf(out + o, n - o, "; texture handles not decoded %llu", (unsigned long long)g_tex_unres);
     if (g_unsup_sbuf_ubo && o < (int)n) snprintf(out + o, n - o, "; storage buffers addressed through uniforms (not bound) %llu", (unsigned long long)g_unsup_sbuf_ubo);

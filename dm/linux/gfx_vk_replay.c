@@ -438,6 +438,7 @@ static void mtl_exec_body(const uint8_t *p) {
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         const uint8_t *a = p + 8;
+        g_cur_op = h.op;
         switch (h.op) {
         case OP_END: return;
         case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
@@ -449,7 +450,7 @@ static void mtl_exec_body(const uint8_t *p) {
         case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); pend_hazard(s_, n); pend_hazard(d, n); memmove((void *)(uintptr_t)d, (const void *)(uintptr_t)s_, n); ring_forget(d, n); break; }
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); pend_hazard(d, n); memcpy((void *)(uintptr_t)d, a + 16, n); ring_forget(d, n); break; }
         case OP_COPY_STRIDE: { const p_copy_stride *cs = (const p_copy_stride *)a; if (cs->image) R.copy_img_stride = cs->stride; else R.copy_stride = cs->stride; break; }
-        case OP_SET_RT: if (VK.ok) pass_end(); R.rt = *(const p_set_rt *)a; R.has_rt = 1; break;
+        case OP_SET_RT: if (VK.ok && P.open) pass_end(); R.rt = *(const p_set_rt *)a; R.has_rt = 1; break;   // waiting clears stay waiting: the next pass takes them, or does them first
         case OP_CLEAR_COLOR: if (VK.ok) clear_color((const p_clear_color *)a); break;   // into the render pass when it can (gfx_vk_draw.inc)
         case OP_CLEAR_DS: if (VK.ok) clear_ds((const p_clear_ds *)a); break;
         case OP_CLEAR_TEX: if (VK.ok) { pass_end(); clear_tex((const p_clear_tex *)a); } break;
