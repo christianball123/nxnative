@@ -101,17 +101,32 @@ static int swapchain_make(void) {
     if (W.want_srgb) for (uint32_t i = 0; i < n; i++) if (f[i].format == VK_FORMAT_B8G8R8A8_SRGB || f[i].format == VK_FORMAT_R8G8B8A8_SRGB) { pick = f[i]; break; }
     W.srgb = pick.format == VK_FORMAT_B8G8R8A8_SRGB || pick.format == VK_FORMAT_R8G8B8A8_SRGB;
     uint32_t count = cap.minImageCount + 1; if (cap.maxImageCount && count > cap.maxImageCount) count = cap.maxImageCount; if (count > SWAP_MAX) count = SWAP_MAX;
+    // The present mode: FIFO waits for the screen's next refresh, so a frame that takes 20 ms is shown (and the game goes on) only at 33 ms: the game ran at 30 fps whenever it
+    // could not make 60. MAILBOX (the newest frame replaces a waiting one, no tearing) or IMMEDIATE when the driver has them; DM_VK_PRESENT=fifo / mailbox / immediate / relaxed
+    VkPresentModeKHR pm[16]; uint32_t npm = 16; if (vkGetPhysicalDeviceSurfacePresentModesKHR_(VK.phys, W.surf, &npm, pm) < 0) npm = 0;
+    int has[4] = {0};   // immediate, mailbox, fifo, fifo relaxed (VkPresentModeKHR 0..3)
+    for (uint32_t i = 0; i < npm; i++) if ((unsigned)pm[i] < 4) has[pm[i]] = 1;
+    const char *pe = getenv("DM_VK_PRESENT");
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    if (pe && !strcmp(pe, "fifo")) mode = VK_PRESENT_MODE_FIFO_KHR;
+    else if (pe && !strcmp(pe, "immediate") && has[0]) mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    else if (pe && !strcmp(pe, "relaxed") && has[3]) mode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    else if (has[1]) mode = VK_PRESENT_MODE_MAILBOX_KHR;
+    else if (has[0]) mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    else if (has[3]) mode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    static const char *const k_pm[4] = {"IMMEDIATE (no waiting for the screen, may tear)", "MAILBOX (no waiting for the screen)", "FIFO (vsync)", "FIFO relaxed (late frames shown at once)"};
+    if (mode != VK_PRESENT_MODE_FIFO_KHR && count < 3 && (!cap.maxImageCount || cap.maxImageCount >= 3)) count = 3;
     VkSwapchainKHR old = W.sc;
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, NULL, 0, W.surf, count, pick.format, pick.colorSpace, e, 1,
                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
-                                   cap.currentTransform, VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_PRESENT_MODE_FIFO_KHR, VK_TRUE, old};
+                                   cap.currentTransform, VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, mode, VK_TRUE, old};
     if (!(cap.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)) ci.compositeAlpha = (VkCompositeAlphaFlagBitsKHR)(cap.supportedCompositeAlpha & -cap.supportedCompositeAlpha);
     VkResult r = vkCreateSwapchainKHR_(VK.dev, &ci, NULL, &W.sc);
     if (old) { vkDeviceWaitIdle_(VK.dev); vkDestroySwapchainKHR_(VK.dev, old, NULL); }
     if (r) { LOG("[RED] [vk] vkCreateSwapchainKHR %dx%d failed (%d)", e.width, e.height, r); W.sc = VK_NULL_HANDLE; return 0; }
     W.fmt = pick.format; W.ext = e; W.nimg = SWAP_MAX; vkGetSwapchainImagesKHR_(VK.dev, W.sc, &W.nimg, W.img);
-    LOG("[vk] swapchain %ux%u, %u images, format %d%s, FIFO (vsync); window alpha modes %#x, using %#x (1 = opaque)", e.width, e.height, W.nimg, pick.format, W.srgb ? " (sRGB, as the game's image)" : "",
-        cap.supportedCompositeAlpha, ci.compositeAlpha);
+    LOG("[vk] swapchain %ux%u, %u images, format %d%s, present mode %s (offered: %s%s%s%s); window alpha modes %#x, using %#x (1 = opaque)", e.width, e.height, W.nimg, pick.format, W.srgb ? " (sRGB, as the game's image)" : "",
+        k_pm[mode], has[0] ? "immediate " : "", has[1] ? "mailbox " : "", has[2] ? "fifo " : "", has[3] ? "relaxed" : "", cap.supportedCompositeAlpha, ci.compositeAlpha);
     { static int once; if (!once++) { const char *vd = getenv("SDL_VIDEODRIVER"), *wd = getenv("WAYLAND_DISPLAY"), *xd = getenv("DISPLAY"); LOG("[vk] window system: SDL_VIDEODRIVER=%s WAYLAND_DISPLAY=%s DISPLAY=%s", vd ? vd : "(unset)", wd ? wd : "(unset)", xd ? xd : "(unset)"); } }
     return 1;
 }
