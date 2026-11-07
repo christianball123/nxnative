@@ -287,7 +287,7 @@ typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t ad
 static post_op *g_post; static int g_npost, g_postcap;
 static struct { p_set_rt rt; int has_rt; int64_t copy_stride, copy_img_stride; } R;
 // Staging buffers of this submission (texture uploads and readbacks), freed at commit; readbacks copy into guest memory after the GPU finishes
-typedef struct { VkBuffer b; VkDeviceMemory m; void *p; uint64_t n; uint8_t *rb_dst; size_t rb_row, rb_src_row, rb_rows, rb_n; int dump_fmt; uint32_t dw, dh; char dump_name[160]; } stage_t;
+typedef struct { VkBuffer b; VkDeviceMemory m; void *p; uint64_t n; uint8_t *rb_dst; size_t rb_row, rb_src_row, rb_rows, rb_n; int dump_fmt, lin_rb; uint32_t dw, dh; char dump_name[160]; } stage_t;
 static void dump_write(const stage_t *s);   // gfx_vk_draw.inc: a frame dump's image (DM debug: L3 + R3 or F12)
 static stage_t *g_stage; static int g_nstage, g_stagecap;
 
@@ -529,7 +529,7 @@ typedef struct {
     int idx, queued;   // queued: handed over, its completion not started (the completion thread's mark)
     int dirty;   // completed, its Vulkan objects not reset yet
     int failed;  // vkQueueSubmit refused it: no fence to wait for
-    int cpu_out; // it writes guest memory when it completes (read-backs, storage write-backs): a sync covering it waits for the GPU
+    int cpu_out; // it writes guest memory when it completes (read-backs, storage write-backs): a sync covering it waits for the GPU (2: only linear textures' read-backs)
 } subslot;
 static subslot g_sl[NSUB - 1] = {{.dp = g_dp_store[1], .pm = g_pm_store[1], .ring_base = RING_PART, .idx = 0}, {.dp = g_dp_store[2], .pm = g_pm_store[2], .ring_base = 2 * RING_PART, .idx = 1}};
 static pthread_mutex_t g_cm_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cm_done, g_cm_work; static int g_cm_started, g_async = -1, g_inflight = 2;
@@ -642,7 +642,8 @@ static void slot_handover(subslot *P, uint64_t id, int failed) {
     SWP(g_pq, P->pq); SWP(g_npq, P->npq); SWP(g_pm, P->pm); SWP(g_npm, P->npm);
     SWP(RG.base, P->ring_base);   // the GPU reads its ring part until it completes: the recording goes on in the completed slot's part
     P->id = id; P->dirty = 1; P->failed = failed;
-    P->cpu_out = P->nwb > 0 || P->nlw > 0; for (int i = 0; i < P->nstage && !P->cpu_out; i++) if (P->stage[i].rb_dst) P->cpu_out = 1;
+    P->cpu_out = P->nwb > 0; for (int i = 0; i < P->nstage && !P->cpu_out; i++) if (P->stage[i].rb_dst && !P->stage[i].lin_rb) P->cpu_out = 1;
+    if (!P->cpu_out && P->nlw) P->cpu_out = 2;
     // linear textures it reads back: written again by a later submission, they are read back with that one too
     if (P->nlw > P->clws) { P->clws = P->clw; P->lws = realloc(P->lws, P->clws * sizeof *P->lws); }
     for (int i = 0; i < P->nlw; i++) { P->lws[i] = P->lw[i]->serial; P->lw[i]->wrote = 0; }
@@ -759,12 +760,15 @@ uint64_t mtl_last_fence(void) { if (g_deferred) flush_from(FL_FENCE); return ato
 // (events, counters) is written now, and again when the GPU is done. The game waited for each frame's sync, so the CPU and GPU took turns (Mario Tennis Fever blocked
 // about 600 ms a second). DM_VK_EARLY_SYNC=0 waits for the GPU
 static int early_done(uint64_t fence) {
-    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_EARLY_SYNC"); on = !(e && *e == '0'); if (on) LOG("[vk] syncs: done once their work is handed to the GPU, unless it reads results back (DM_VK_EARLY_SYNC=0 waits for the GPU)"); }
+    // DM_VK_EARLY_SYNC: 0 waits for the GPU, 1 (default) early unless results are read back, 2 early also past linear textures' read-backs (the game then may read
+    // a linear texture's content of a frame before)
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_EARLY_SYNC"); on = e && *e >= '0' && *e <= '2' ? *e - '0' : 1;
+        if (on) LOG("[vk] syncs: done once their work is handed to the GPU, unless it reads results back%s (DM_VK_EARLY_SYNC=0 waits for the GPU, 2 also past linear textures)", on == 2 ? " (not counting linear textures)" : ""); }
     if (!on || fence > atomic_load(&g_fence)) return 0;
     pthread_once(&g_cm_once, cm_init);
     pthread_mutex_lock(&g_cm_mu);
     int ok = 1;
-    for (int i = 0; i < NSUB - 1; i++) if (atomic_load(&g_pr[i].busy) && g_sl[i].id <= fence && g_sl[i].cpu_out) ok = 0;
+    for (int i = 0; i < NSUB - 1; i++) if (atomic_load(&g_pr[i].busy) && g_sl[i].id <= fence && (g_sl[i].cpu_out == 1 || (g_sl[i].cpu_out == 2 && on < 2))) ok = 0;
     if (ok) {
         uint64_t now = gpu_ticks();
         for (int i = 0; i < NSUB - 1; i++) {

@@ -1520,7 +1520,7 @@ static void linear_readbacks(void) {
     for (int i = 0; i < g_nlw; i++) {
         vtex *v = g_lw[i]; if (!v->img || !v->gmem || !v->rowbytes) continue;
         stage_t *st = stage_new((uint64_t)v->rowbytes * v->rows); if (!st) continue;
-        st->rb_dst = v->gmem; st->rb_row = v->stride; st->rb_src_row = v->rowbytes; st->rb_rows = v->rows; st->rb_n = v->rowbytes;
+        st->rb_dst = v->gmem; st->lin_rb = 1; st->rb_row = v->stride; st->rb_src_row = v->rowbytes; st->rb_rows = v->rows; st->rb_n = v->rowbytes;
         VkBufferImageCopy bic = {0, 0, 0, {fmt_aspects(v->fmt) & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT), 0, 0, 1}, {0, 0, 0}, {v->w, v->h, 1}};
         if (!bic.imageSubresource.aspectMask) bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
         vkCmdCopyImageToBuffer_(g_cb, v->img, VK_IMAGE_LAYOUT_GENERAL, st->b, 1, &bic);
