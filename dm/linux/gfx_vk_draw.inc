@@ -1,3 +1,6 @@
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <sched.h>
 // Stage C of the Vulkan graphics layer (dm/linux/GRAPHICS.md): draws and compute dispatches. Included by gfx_vk_replay.c (it uses the replay's command buffer, textures and barriers).
 //
 // First version, built for correctness over speed:
@@ -910,6 +913,7 @@ static VkPipelineCache g_pcache;
 // 100 % CPU for 25 s and more and the game frozen behind it. The shaders of the build under way are kept for the hang dump (crash.c's wait dump), a build over 1 s is logged with its
 // time, and DM_VK_SKIP_SHADERS=<key>,<key>,... (16-digit hex keys as the log prints them) leaves out every pipeline with one of those shaders: its draws or dispatches are skipped
 static _Atomic uint64_t g_pb_key[3], g_pb_t0;
+static uint64_t *g_pb_list; static int *g_pb_n;   // pb_skip's list, for pb_compute to add to
 static void pb_dump(void) {
     uint64_t t0 = atomic_load(&g_pb_t0); if (!t0) { fprintf(stderr, "[dm] [vk] no pipeline being built\n"); return; }
     fprintf(stderr, "[dm] [vk] pipeline being built for %.1f s: shaders %016llx %016llx %016llx (DM_VK_SKIP_SHADERS=<key> leaves it out)\n", (mono_ns() - t0) / 1e9,
@@ -919,9 +923,50 @@ static int pb_skip(uint64_t key) {
     static uint64_t list[64]; static int n = -1;
     if (n < 0) { n = 0; const char *e = getenv("DM_VK_SKIP_SHADERS");
         for (const char *c = e; c && *c && n < 64; ) { char *end; uint64_t v = strtoull(c, &end, 16); if (end == c) break; list[n++] = v; c = *end ? end + 1 : end; }
-        if (n) LOG("[vk] DM_VK_SKIP_SHADERS: %d shader(s) left out", n); }
+        int ne = n;
+        char path[512]; const char *home = getenv("HOME");   // and the shaders a build timed out on before (pb_compute), kept per game
+        if (home) { snprintf(path, sizeof path, "%s/.local/share/nxnative/%s/vk_skip_shaders.txt", home, DM_GAME_ID); FILE *f = fopen(path, "r");
+            if (f) { char l[64]; while (n < 64 && fgets(l, sizeof l, f)) { char *end; uint64_t v = strtoull(l, &end, 16); if (end != l) list[n++] = v; } fclose(f); } }
+        if (n) LOG("[vk] %d shader(s) left out: %d from DM_VK_SKIP_SHADERS, %d whose pipeline the driver hung on before (~/.local/share/nxnative/%s/vk_skip_shaders.txt)", n, ne, n - ne, DM_GAME_ID);
+        g_pb_list = list; g_pb_n = &n; }
     for (int i = 0; key && i < n; i++) if (list[i] == key) return 1;
     return 0;
+}
+// A compute pipeline is built on a thread of its own, and given DM_VK_PIPE_TIMEOUT seconds (default 5; 0: no limit). Turnip's compiler never returned from two of Ocarina of Time's
+// title-screen compute shaders (e6be82d835fbe4d3, 9442573ee4ace011), freezing the game behind it. On a timeout the pipeline is left out (its dispatches skipped), the shader goes on the
+// game's skip list for the next runs and its SPIR-V is written beside it (hang_<key>.spv) to look into. The driver's thread cannot be stopped: it keeps spinning, at the lowest priority
+typedef struct { VkComputePipelineCreateInfo ci; VkPipeline p; VkResult r; _Atomic int done, abandoned, tid; } pb_job;
+static void *pb_thread(void *a) {
+    pb_job *j = a; atomic_store(&j->tid, (int)syscall(SYS_gettid));
+    j->r = vkCreateComputePipelines_(VK.dev, g_pcache, 1, &j->ci, NULL, &j->p);
+    atomic_store(&j->done, 1);
+    if (atomic_load(&j->abandoned)) { if (j->p) vkDestroyPipeline_(VK.dev, j->p, NULL); }   // came back after all: too late, the job is its own
+    return NULL;
+}
+static VkResult pb_compute(const VkComputePipelineCreateInfo *ci, VkPipeline *out, const vks_shader *cs) {
+    static double limit = -1; if (limit < 0) { const char *e = getenv("DM_VK_PIPE_TIMEOUT"); limit = e && *e ? atof(e) : 5; }
+    if (limit <= 0) return vkCreateComputePipelines_(VK.dev, g_pcache, 1, ci, NULL, out);
+    pb_job *j = calloc(1, sizeof *j); j->ci = *ci;
+    pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED); pthread_attr_setstacksize(&at, 8u << 20);
+    if (pthread_create(&th, &at, pb_thread, j)) { pthread_attr_destroy(&at); free(j); return vkCreateComputePipelines_(VK.dev, g_pcache, 1, ci, NULL, out); }
+    pthread_attr_destroy(&at);
+    uint64_t t0 = mono_ns(), lim = (uint64_t)(limit * 1e9);
+    for (unsigned spin = 0; !atomic_load(&j->done); spin++) {
+        if (mono_ns() - t0 > lim) {
+            atomic_store(&j->abandoned, 1);
+            if (atomic_load(&j->done)) break;   // finished in between
+            LOG("[RED] [vk] the driver did not finish compute shader %016llx's pipeline in %.0f s: left out (its dispatches are skipped), and from now on for this game", (unsigned long long)cs->key, limit);
+            char dir[512], path[600]; const char *home = getenv("HOME");
+            if (home) { snprintf(dir, sizeof dir, "%s/.local/share/nxnative/%s", home, DM_GAME_ID);
+                snprintf(path, sizeof path, "%s/vk_skip_shaders.txt", dir); FILE *f = fopen(path, "a"); if (f) { fprintf(f, "%016llx\n", (unsigned long long)cs->key); fclose(f); }
+                snprintf(path, sizeof path, "%s/hang_%016llx.spv", dir, (unsigned long long)cs->key); f = fopen(path, "wb"); if (f) { fwrite(cs->spv, 4, cs->nspv, f); fclose(f); LOG("[vk] its SPIR-V: %s", path); } }
+            if (g_pb_list && g_pb_n && *g_pb_n < 64) g_pb_list[(*g_pb_n)++] = cs->key;
+            { int tid = atomic_load(&j->tid); if (tid) setpriority(PRIO_PROCESS, (id_t)tid, 19); }   // the driver thread spins on: the lowest priority, so the game's own threads come first
+            *out = VK_NULL_HANDLE; return VK_ERROR_UNKNOWN;
+        }
+        if (spin < 200) sched_yield(); else { struct timespec t = {0, 200000}; nanosleep(&t, NULL); }
+    }
+    *out = j->p; VkResult r = j->r; free(j); return r;
 }
 static int pb_begin(uint64_t a, uint64_t b, uint64_t c) {   // 0: one of them is left out
     static int hooked; if (!hooked) { void crash_set_wait_dump(void (*)(void)); crash_set_wait_dump(pb_dump); hooked = 1; }
@@ -1540,7 +1585,7 @@ static void dispatch_op(const p_dispatch *d) {
         if (!g_pcache) { VkPipelineCacheCreateInfo pc = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, 0, NULL}; vkCreatePipelineCache_(VK.dev, &pc, NULL, &g_pcache); }
         VkPipeline p = VK_NULL_HANDLE;
         if (!pb_begin(pr->st[VKS_CS]->key, 0, 0)) p = VK_NULL_HANDLE;
-        else if (pb_end_r(vkCreateComputePipelines_(VK.dev, g_pcache, 1, &ci, NULL, &p))) { static int n; if (n++ < 10) LOG("[RED] [vk] a compute pipeline was refused: shader %016llx", (unsigned long long)pr->st[VKS_CS]->key); }
+        else if (pb_end_r(pb_compute(&ci, &p, pr->st[VKS_CS]))) { static int n; if (n++ < 10) LOG("[RED] [vk] a compute pipeline was refused: shader %016llx", (unsigned long long)pr->st[VKS_CS]->key); }
         g_cp[i].serial = pr->serial; g_cp[i].p = p; if (p) g_pipes++;
     }
     if (!g_cp[i].p) return;
