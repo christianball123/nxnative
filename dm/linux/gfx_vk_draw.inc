@@ -12,10 +12,11 @@
 // Not yet: transform feedback, tessellation and geometry stages, conditional rendering, alpha test, logic ops, quads, texture buffers, bindless handles in uniform buffers
 // (those draws are skipped or drawn without them; the summary line counts them).
 
-// ---------------------------------------------------------------- the upload ring: one host-visible buffer in two halves, one per submission slot: a submission fills its half
-// from the start while the GPU reads the other one's
+// ---------------------------------------------------------------- the upload ring: one host-visible buffer in three parts, one per submission slot: a submission fills its part
+// from the start while the GPU reads the others'
 #define RING_SIZE (192ull << 20)
 #define RING_ALIGN 256
+#define RING_PART ((RING_SIZE / 3) & ~(uint64_t)(RING_ALIGN - 1))   // one submission slot's part
 static struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; uint64_t used, base; int full_warned; } RG;   // base: the start of the recording slot's half
 typedef struct { uint64_t addr, size, off; } ring_hit;
 #define RH_CAP 8192
@@ -39,7 +40,7 @@ static int ring_init(void) {
 static uint64_t ring_alloc(uint64_t n) {
     uint64_t off = (RG.used + RING_ALIGN - 1) & ~(uint64_t)(RING_ALIGN - 1);
     uint64_t n16 = (n + 15) & ~15ull;   // reserved in whole 16-byte rows: a binding's range may round up past the copied bytes
-    if (off + n16 > RG.base + RING_SIZE / 2) { g_ring_full++; if (!RG.full_warned++) LOG("[RED] [vk] the upload ring is full within one submission: draws past it are skipped"); return ~0ull; }
+    if (off + n16 > RG.base + RING_PART) { g_ring_full++; if (!RG.full_warned++) LOG("[RED] [vk] the upload ring is full within one submission: draws past it are skipped"); return ~0ull; }
     RG.used = off + n16; g_ring_bytes += n; return off;
 }
 // The guest's bytes [addr, addr + size) in the ring (the same range again in this submission: the same copy)
@@ -388,7 +389,7 @@ static uint64_t support_buffer(void) {
 
 // ---------------------------------------------------------------- descriptor pools, one chain per submission
 #define DP_MAX 64
-static VkDescriptorPool g_dp_store[2][DP_MAX], *g_dp = g_dp_store[0]; static int g_ndp, g_dp_cur;   // the recording slot's pools (the slot in flight has the other array)
+static VkDescriptorPool g_dp_store[3][DP_MAX], *g_dp = g_dp_store[0]; static int g_ndp, g_dp_cur;   // the recording slot's pools (the slot in flight has the other array)
 static VkDescriptorSet desc_alloc(VkDescriptorSetLayout l) {
     for (;;) {
         if (g_dp_cur >= g_ndp) {
@@ -621,7 +622,7 @@ static uint32_t g_gs_vps = 4;   // viewports a passthrough geometry shader's dra
 typedef struct { uint64_t key, fs; uint32_t w, h, ncol, depth, compute; double ms; uint64_t n, draws; } pkind;
 static pkind g_pk[512]; static int g_npk;
 typedef struct { uint32_t q0; uint64_t key, fs; uint32_t w, h, ncol, depth, compute; uint64_t draws; } pmark;
-static pmark g_pm_store[2][PQ_CAP / 2], *g_pm = g_pm_store[0]; static int g_npm; static pthread_mutex_t g_prof_mu = PTHREAD_MUTEX_INITIALIZER; static double g_prof_total_ms; static uint64_t g_prof_subs;
+static pmark g_pm_store[3][PQ_CAP / 2], *g_pm = g_pm_store[0]; static int g_npm; static pthread_mutex_t g_prof_mu = PTHREAD_MUTEX_INITIALIZER; static double g_prof_total_ms; static uint64_t g_prof_subs;
 static uint32_t g_pm_cur = ~0u;
 static int prof_on(void) {
     if (g_prof < 0) { const char *e = getenv("DM_VK_PROFILE"); g_prof = !(e && *e == '0') && VK.limits.timestampPeriod > 0; }

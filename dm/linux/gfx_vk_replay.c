@@ -268,16 +268,20 @@ void mtl_tex_release(tex_t *t) {
 static VkCommandPool g_pool; static VkCommandBuffer g_cb; static VkFence g_fence_vk; static int g_cb_open, g_cb_ops;
 static _Atomic uint64_t g_fence;   // submissions handed to the GPU (mtl_last_fence)
 static _Atomic uint64_t g_done;    // submissions completed: their read-backs, write-backs, events and counters are in guest memory
-// Guest bytes the submission in flight writes when it completes (read-backs, storage buffer write-backs, events and counters). The replay reads and writes guest memory
-// on the CPU as it records (ring copies, uploads, indirect arguments, buffer copies and updates): where that touches these bytes, the submission in flight is waited for
-// first, so the CPU work sees (and comes after) what the GPU wrote, in submission order. Built and read by the recording thread only
+// Guest bytes each submission in flight writes when it completes (read-backs, storage buffer write-backs, events and counters). The replay reads and writes guest memory
+// on the CPU as it records (ring copies, uploads, indirect arguments, buffer copies and updates): where that touches these bytes, that submission is waited for first,
+// so the CPU work sees (and comes after) what the GPU wrote, in submission order. Built and read by the recording thread only (busy: set by it, cleared at completion)
+#define NSUB 3   // submission slots: the one being recorded and up to two in flight
 typedef struct { uint64_t lo, hi; } grange;
-static grange *g_pr; static int g_npr, g_cpr; static uint64_t g_pr_lo, g_pr_hi, g_hazard_waits;
-static _Atomic int g_pend_busy;   // a submission is in flight (its completion has not run yet)
-static void pend_wait(void);
+static struct { grange *r; int n, cap; uint64_t lo, hi; _Atomic int busy; } g_pr[NSUB - 1];
+static uint64_t g_hazard_waits;
+static void pend_wait(void); static void pend_wait_slot(int i);
 static inline void pend_hazard(uint64_t addr, uint64_t n) {
-    if (!atomic_load_explicit(&g_pend_busy, memory_order_acquire) || !addr || !n || addr >= g_pr_hi || addr + n <= g_pr_lo) return;
-    for (int i = 0; i < g_npr; i++) if (addr < g_pr[i].hi && g_pr[i].lo < addr + n) { g_hazard_waits++; pend_wait(); return; }
+    if (!addr || !n) return;
+    for (int s = 0; s < NSUB - 1; s++) {
+        if (!atomic_load_explicit(&g_pr[s].busy, memory_order_acquire) || addr >= g_pr[s].hi || addr + n <= g_pr[s].lo) continue;
+        for (int i = 0; i < g_pr[s].n; i++) if (addr < g_pr[s].r[i].hi && g_pr[s].r[i].lo < addr + n) { g_hazard_waits++; pend_wait_slot(s); break; }
+    }
 }
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; } post_op;   // 1 event, 2 counter
 static post_op *g_post; static int g_npost, g_postcap;
@@ -495,10 +499,12 @@ void mtl_sub_begin(void) {
     // the window comes up with the first submission, so the game's textures have a device from the start
     if (vkw_wanted() && !VK.ok) { vkw_init(); const char *e = getenv("DM_VK_DRAW"); g_draw_on = !(e && *e == '0'); if (VK.ok) LOG("[vk] draws: %s", g_draw_on ? "on (stage C)" : "off (DM_VK_DRAW=0)"); }
 }
-// ---------------------------------------------------------------- submissions in flight: two slots. The submitting thread records one while the GPU runs the other; at a commit
-// the recorded one is handed to the GPU, the one before is waited for (usually long done: it ran while this one was recorded), and the two swap. A completion thread waits
-// for each submission's fence and lands what the game sees of it (read-backs, storage buffer write-backs, events, counters) as soon as the GPU is done, so a game polling
-// an event never waits for its next submission. Vulkan objects (staging buffers, buffer views, descriptor pools, the command buffer) are reset on the submitting thread
+// ---------------------------------------------------------------- submissions in flight: three slots. The submitting thread records one while the GPU runs the others (up to
+// two, DM_VK_INFLIGHT=1 keeps one); at a commit the recorded one is handed to the GPU and swaps with a completed slot, waiting for the oldest when none is. With one in
+// flight the GPU went idle whenever the game did its own work between submissions (about a third of each frame): a second one keeps it fed. A completion thread waits
+// for each submission's fence in order and lands what the game sees of it (read-backs, storage buffer write-backs, events, counters) as soon as the GPU is done, so a
+// game polling an event never waits for its next submission. Vulkan objects (staging buffers, buffer views, descriptor pools, the command buffer) are reset on the
+// submitting thread
 typedef struct {
     uint64_t id; VkCommandBuffer cb; VkFence fence;
     stage_t *stage; int nstage, stagecap;
@@ -508,23 +514,31 @@ typedef struct {
     VkBufferView *tbv; int ntbv, ctbv;
     VkDescriptorPool *dp; int ndp;
     VkQueryPool pq; uint32_t npq; pmark *pm; int npm;
+    uint64_t ring_base, t_handed;
+    int idx, queued;   // queued: handed over, its completion not started (the completion thread's mark)
     int dirty;   // completed, its Vulkan objects not reset yet
     int failed;  // vkQueueSubmit refused it: no fence to wait for
 } subslot;
-static subslot g_pend = {.dp = g_dp_store[1], .pm = g_pm_store[1]};
-static pthread_mutex_t g_cm_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cm_done, g_cm_work; static int g_cm_go, g_cm_started, g_async = -1;
-static uint64_t g_t_gpu, g_t_land, g_t_wake, g_t_post, g_n_post, g_t_handed;   // the completion thread's waits for the GPU (how long submissions ran after their hand-over)
+static subslot g_sl[NSUB - 1] = {{.dp = g_dp_store[1], .pm = g_pm_store[1], .ring_base = RING_PART, .idx = 0}, {.dp = g_dp_store[2], .pm = g_pm_store[2], .ring_base = 2 * RING_PART, .idx = 1}};
+static pthread_mutex_t g_cm_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cm_done, g_cm_work; static int g_cm_started, g_async = -1, g_inflight = 2;
+static uint64_t g_t_gpu, g_t_land, g_t_wake, g_t_post, g_n_post;   // the completion thread's waits for the GPU (how long submissions ran after their hand-over)
 static void cm_init(void) {
     pthread_condattr_t ca; pthread_condattr_init(&ca); pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
     pthread_cond_init(&g_cm_done, &ca); pthread_cond_init(&g_cm_work, NULL); pthread_condattr_destroy(&ca);
 }
 static pthread_once_t g_cm_once = PTHREAD_ONCE_INIT;
-static void pend_wait(void) {   // the submission in flight has completed when this returns
-    if (!atomic_load(&g_pend_busy)) return;
+static int any_busy(void) { for (int i = 0; i < NSUB - 1; i++) if (atomic_load(&g_pr[i].busy)) return 1; return 0; }
+static void pend_wait_slot(int i) {   // that submission has completed when this returns (and every one before it: they complete in order)
+    if (!atomic_load(&g_pr[i].busy)) return;
     pthread_once(&g_cm_once, cm_init);
-    pthread_mutex_lock(&g_cm_mu); while (atomic_load(&g_pend_busy)) pthread_cond_wait(&g_cm_done, &g_cm_mu); pthread_mutex_unlock(&g_cm_mu);
+    pthread_mutex_lock(&g_cm_mu); while (atomic_load(&g_pr[i].busy)) pthread_cond_wait(&g_cm_done, &g_cm_mu); pthread_mutex_unlock(&g_cm_mu);
 }
-static void sub_wait_all(void) { pend_wait(); }   // one submission at most is in flight
+static void pend_wait(void) {   // every submission in flight has completed when this returns
+    if (!any_busy()) return;
+    pthread_once(&g_cm_once, cm_init);
+    pthread_mutex_lock(&g_cm_mu); while (any_busy()) pthread_cond_wait(&g_cm_done, &g_cm_mu); pthread_mutex_unlock(&g_cm_mu);
+}
+static void sub_wait_all(void) { pend_wait(); }
 // What the game sees of a completed submission, on the completion thread (guest pages the dirty tracking protects are opened first)
 static void slot_land(subslot *s) {
     if (s->cb && !s->failed) {
@@ -558,10 +572,18 @@ static void slot_land(subslot *s) {
 static void *cm_thread(void *u) {
     (void)u;
     for (;;) {
-        pthread_mutex_lock(&g_cm_mu); while (!g_cm_go) pthread_cond_wait(&g_cm_work, &g_cm_mu); g_cm_go = 0; pthread_mutex_unlock(&g_cm_mu);
-        g_t_wake += mono_ns() - g_t_handed;
-        slot_land(&g_pend);
-        pthread_mutex_lock(&g_cm_mu); atomic_store(&g_done, g_pend.id); atomic_store(&g_pend_busy, 0); pthread_cond_broadcast(&g_cm_done); pthread_mutex_unlock(&g_cm_mu);
+        subslot *s = NULL;
+        pthread_mutex_lock(&g_cm_mu);
+        for (;;) {   // the oldest submission handed over and not landed yet
+            for (int i = 0; i < NSUB - 1; i++) if (g_sl[i].queued && (!s || g_sl[i].id < s->id)) s = &g_sl[i];
+            if (s) break;
+            pthread_cond_wait(&g_cm_work, &g_cm_mu);
+        }
+        s->queued = 0;
+        pthread_mutex_unlock(&g_cm_mu);
+        g_t_wake += mono_ns() - s->t_handed;
+        slot_land(s);
+        pthread_mutex_lock(&g_cm_mu); atomic_store(&g_done, s->id); atomic_store(&g_pr[s->idx].busy, 0); pthread_cond_broadcast(&g_cm_done); pthread_mutex_unlock(&g_cm_mu);
     }
     return NULL;
 }
@@ -583,10 +605,20 @@ static void slot_clean(subslot *s) {
     for (int i = 0; i < s->nwb; i++) free(s->wb[i].orig);
     s->npost = 0; s->nwb = 0; s->npq = 0; s->npm = 0;
 }
+// A slot for the recorded submission to swap with: one not in flight, with fewer than g_inflight in flight (else the oldest is waited for)
+static subslot *slot_free(void) {
+    for (;;) {
+        int nb = 0; subslot *fr = NULL, *old = NULL;
+        for (int i = 0; i < NSUB - 1; i++) {
+            if (atomic_load(&g_pr[i].busy)) { nb++; if (!old || g_sl[i].id < old->id) old = &g_sl[i]; } else if (!fr) fr = &g_sl[i];
+        }
+        if (fr && nb < g_inflight) return fr;
+        pend_wait_slot(old->idx);
+    }
+}
 #define SWP(a, b) do { __typeof__(a) t_ = (a); (a) = (b); (b) = t_; } while (0)
-// The recorded submission (submitted already) becomes the one in flight; the completed slot becomes the recording one
-static void slot_handover(uint64_t id, int failed) {
-    subslot *P = &g_pend;
+// The recorded submission (submitted already) goes into slot P, in flight; P's completed (and cleaned) things become the recording ones
+static void slot_handover(subslot *P, uint64_t id, int failed) {
     SWP(g_cb, P->cb); SWP(g_fence_vk, P->fence);
     SWP(g_stage, P->stage); SWP(g_nstage, P->nstage); SWP(g_stagecap, P->stagecap);
     SWP(g_post, P->post); SWP(g_npost, P->npost); SWP(g_postcap, P->postcap);
@@ -595,26 +627,32 @@ static void slot_handover(uint64_t id, int failed) {
     SWP(g_tbv, P->tbv); SWP(g_ntbv, P->ntbv); SWP(g_ctbv, P->ctbv);
     SWP(g_dp, P->dp); SWP(g_ndp, P->ndp);
     SWP(g_pq, P->pq); SWP(g_npq, P->npq); SWP(g_pm, P->pm); SWP(g_npm, P->npm);
+    SWP(RG.base, P->ring_base);   // the GPU reads its ring part until it completes: the recording goes on in the completed slot's part
     P->id = id; P->dirty = 1; P->failed = failed;
     // linear textures it reads back: written again by a later submission, they are read back with that one too
     if (P->nlw > P->clws) { P->clws = P->clw; P->lws = realloc(P->lws, P->clws * sizeof *P->lws); }
     for (int i = 0; i < P->nlw; i++) { P->lws[i] = P->lw[i]->serial; P->lw[i]->wrote = 0; }
     // the guest bytes it writes when it completes
-    g_npr = 0; g_pr_lo = ~0ull; g_pr_hi = 0;
-    #define PR(a, n) do { uint64_t a_ = (a), n_ = (n); if (!a_ || !n_) break; if (g_npr == g_cpr) { g_cpr = g_cpr ? 2 * g_cpr : 64; g_pr = realloc(g_pr, g_cpr * sizeof *g_pr); } \
-        g_pr[g_npr++] = (grange){a_, a_ + n_}; if (a_ < g_pr_lo) g_pr_lo = a_; if (a_ + n_ > g_pr_hi) g_pr_hi = a_ + n_; } while (0)
+    __typeof__(g_pr[0]) *R = &g_pr[P->idx];
+    R->n = 0; R->lo = ~0ull; R->hi = 0;
+    #define PR(A, N) do { uint64_t a_ = (A), n_ = (N); if (!a_ || !n_) break; if (R->n == R->cap) { R->cap = R->cap ? 2 * R->cap : 64; R->r = realloc(R->r, R->cap * sizeof *R->r); } \
+        R->r[R->n++] = (grange){a_, a_ + n_}; if (a_ < R->lo) R->lo = a_; if (a_ + n_ > R->hi) R->hi = a_ + n_; } while (0)
     for (int i = 0; i < P->nstage; i++) if (P->stage[i].rb_dst) PR((uint64_t)(uintptr_t)P->stage[i].rb_dst, (P->stage[i].rb_rows - 1) * P->stage[i].rb_row + P->stage[i].rb_n);
     for (int i = 0; i < P->nwb; i++) PR(P->wb[i].addr, P->wb[i].size);
     for (int i = 0; i < P->npost; i++) { if (P->post[i].kind == 1) PR((uint64_t)(uintptr_t)P->post[i].val, 4); else PR(P->post[i].addr, 16); }
     #undef PR
-    RG.base = RG.base ? 0 : RING_SIZE / 2;
     rec_reset();
     if (!g_cm_started) { pthread_once(&g_cm_once, cm_init); pthread_t th; pthread_create(&th, NULL, cm_thread, NULL); pthread_detach(th); g_cm_started = 1; }
-    g_t_handed = mono_ns();
-    pthread_mutex_lock(&g_cm_mu); atomic_store(&g_pend_busy, 1); g_cm_go = 1; pthread_cond_signal(&g_cm_work); pthread_mutex_unlock(&g_cm_mu);
+    P->t_handed = mono_ns();
+    pthread_mutex_lock(&g_cm_mu); atomic_store(&R->busy, 1); P->queued = 1; pthread_cond_signal(&g_cm_work); pthread_mutex_unlock(&g_cm_mu);
 }
 uint64_t mtl_sub_commit(void) {
-    if (g_async < 0) { const char *e = getenv("DM_VK_ASYNC"); g_async = !(e && *e == '0'); LOG("[vk] submissions: %s", g_async ? "recorded while the one before runs on the GPU (DM_VK_ASYNC=0 waits for each)" : "each waited for (DM_VK_ASYNC=0)"); }
+    if (g_async < 0) {
+        const char *e = getenv("DM_VK_ASYNC"); g_async = !(e && *e == '0');
+        const char *n = getenv("DM_VK_INFLIGHT"); if (n && (*n == '1' || *n == '2')) g_inflight = *n - '0';
+        if (g_async) LOG("[vk] submissions: recorded while up to %d before run on the GPU (DM_VK_INFLIGHT=1 or 2; DM_VK_ASYNC=0 waits for each)", g_inflight);
+        else LOG("[vk] submissions: each waited for (DM_VK_ASYNC=0)");
+    }
     uint64_t f;
     if (g_cb_open) {
         uint64_t t0 = mono_ns();
@@ -628,17 +666,17 @@ uint64_t mtl_sub_commit(void) {
         pthread_mutex_unlock(&VK.qmu);
         if (r) LOG("[RED] [vk] submission failed (%d)", r);
         uint64_t t1 = mono_ns(); g_t_submit += t1 - t0;
-        pend_wait();   // the one before (it ran while this one was recorded): its slot is reused next
+        subslot *P = slot_free();   // usually completed long ago: it ran while this one was recorded
         uint64_t t2 = mono_ns(); g_t_wait += t2 - t1;
-        slot_clean(&g_pend);
+        slot_clean(P);
         f = atomic_load(&g_fence) + 1;
-        slot_handover(f, r != VK_SUCCESS);
+        slot_handover(P, f, r != VK_SUCCESS);
         atomic_store(&g_fence, f);
         if (!g_async) pend_wait();
         g_t_done += mono_ns() - t2; g_t_n++;
     } else {
         // nothing for the GPU: its events and counters land after the submissions before it, now
-        pend_wait(); slot_clean(&g_pend);
+        pend_wait();
         f = atomic_load(&g_fence) + 1;
         uint64_t now = gpu_ticks();
         for (int i = 0; i < g_npost; i++) {
