@@ -102,7 +102,7 @@ static int swapchain_make(void) {
     W.srgb = pick.format == VK_FORMAT_B8G8R8A8_SRGB || pick.format == VK_FORMAT_R8G8B8A8_SRGB;
     uint32_t count = cap.minImageCount + 1; if (cap.maxImageCount && count > cap.maxImageCount) count = cap.maxImageCount; if (count > SWAP_MAX) count = SWAP_MAX;
     // The present mode: FIFO waits for the screen's next refresh, so a frame that takes 20 ms is shown (and the game goes on) only at 33 ms: the game ran at 30 fps whenever it
-    // could not make 60. MAILBOX (the newest frame replaces a waiting one, no tearing) or IMMEDIATE when the driver has them; DM_VK_PRESENT=fifo / mailbox / immediate / relaxed
+    // could not make 60. DM_VK_PRESENT=mailbox (the newest frame replaces a waiting one, no tearing) / immediate / relaxed, when the driver has them
     VkPresentModeKHR pm[16]; uint32_t npm = 16; if (vkGetPhysicalDeviceSurfacePresentModesKHR_(VK.phys, W.surf, &npm, pm) < 0) npm = 0;
     int has[4] = {0};   // immediate, mailbox, fifo, fifo relaxed (VkPresentModeKHR 0..3)
     for (uint32_t i = 0; i < npm; i++) if ((unsigned)pm[i] < 4) has[pm[i]] = 1;
@@ -111,9 +111,8 @@ static int swapchain_make(void) {
     if (pe && !strcmp(pe, "fifo")) mode = VK_PRESENT_MODE_FIFO_KHR;
     else if (pe && !strcmp(pe, "immediate") && has[0]) mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
     else if (pe && !strcmp(pe, "relaxed") && has[3]) mode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
-    else if (has[1]) mode = VK_PRESENT_MODE_MAILBOX_KHR;
-    else if (has[0]) mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-    else if (has[3]) mode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    else if (pe && !strcmp(pe, "mailbox") && has[1]) mode = VK_PRESENT_MODE_MAILBOX_KHR;
+    // FIFO stays the default: MAILBOX under gamescope on the Thor made Mario Tennis Fever slower (about 21 fps against 28: frames of 35-45 ms instead of 22)
     static const char *const k_pm[4] = {"IMMEDIATE (no waiting for the screen, may tear)", "MAILBOX (no waiting for the screen)", "FIFO (vsync)", "FIFO relaxed (late frames shown at once)"};
     if (mode != VK_PRESENT_MODE_FIFO_KHR && count < 3 && (!cap.maxImageCount || cap.maxImageCount >= 3)) count = 3;
     VkSwapchainKHR old = W.sc;
