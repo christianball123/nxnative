@@ -964,8 +964,24 @@ static int pb_async(const VkComputePipelineCreateInfo *ci, const vks_shader *cs,
     LOG("[vk] compute shader %016llx (%zu KB of SPIR-V) goes to the background builder (%d waiting); its dispatches are skipped until it is built", (unsigned long long)cs->key, bytes >> 10, n);
     return 1;
 }
+// The movie enhancement networks (nn::ndve: Ocarina of Time's title and opening movies run eleven, 2,217 tensor-core products a frame): Turnip took 40-50 s and over 5 GB to build
+// the largest, and once built they took 1.7 s of GPU a frame on the AYN Thor (1.7 fps, the system swapping), against 19 ms on an M4. Left out by default, with their builds: the movie's
+// enhanced picture is then missing, the game runs. DM_MOVIE_NET=1 runs them
+#ifndef DM_GAME_MOVIE_NET_KEYS
+#define DM_GAME_MOVIE_NET_KEYS ""
+#endif
+static int movie_net(uint64_t key) {
+    static uint64_t k[256]; static int n = -1, on;
+    if (n < 0) { n = 0; const char *e = getenv("DM_MOVIE_NET"); on = e && *e == '1';
+        for (const char *c = DM_GAME_MOVIE_NET_KEYS; *c && n < 256; ) { char *end; uint64_t v = strtoull(c, &end, 16); if (end == c) break; k[n++] = v; c = *end ? end + 1 : end; }
+        if (n) LOG("[vk] movie enhancement networks: %d shaders, %s", n, on ? "run (DM_MOVIE_NET=1)" : "left out (DM_MOVIE_NET=1 runs them)"); }
+    if (on) return 0;
+    for (int i = 0; key && i < n; i++) if (k[i] == key) return 1;
+    return 0;
+}
 static int pb_begin(uint64_t a, uint64_t b, uint64_t c) {   // 0: one of them is left out
     static int hooked; if (!hooked) { void crash_set_wait_dump(void (*)(void)); crash_set_wait_dump(pb_dump); hooked = 1; }
+    if (movie_net(a)) { static int n; if (n++ < 20) LOG("[vk] movie enhancement network %016llx left out", (unsigned long long)a); return 0; }
     if (pb_skip(a) || pb_skip(b) || pb_skip(c)) { static int n; if (n++ < 20) LOG("[vk] pipeline left out (DM_VK_SKIP_SHADERS): shaders %016llx %016llx %016llx", (unsigned long long)a, (unsigned long long)b, (unsigned long long)c); return 0; }
     atomic_store(&g_pb_key[0], a); atomic_store(&g_pb_key[1], b); atomic_store(&g_pb_key[2], c); atomic_store(&g_pb_t0, mono_ns());
     return 1;
