@@ -11,6 +11,9 @@
 #           vertex inputs × {u8 location, u8 component type (0 float 1 uint 2 int)}, the c1 bytes, padded to 4 bytes, then the SPIR-V words
 # The descriptor types and image shapes come from the SPIR-V itself; what each binding means (which uniform slot, which texture handle) from the translator's reflection.
 # All bindings are in set 0 (dmsh_xlate Program.cs); binding 0 is the translator's support buffer.
+from concurrent.futures import ProcessPoolExecutor
+import shutil
+import subprocess
 import json, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import spv_passthrough
@@ -173,17 +176,55 @@ def entry(spv_path, res_path, job_path=None):
     out += b'\0' * (-len(out) % 4)
     return bytes(out + data)
 
+# Shaders with the tensor-core emulation (the translator's dmsh_hmma16816_f16 helper, Ocarina of Time's upscaler) pass dozens of function variables to it by pointer, so thousands of
+# them stay in memory form: Turnip's nir_opt_copy_prop_vars took up to 6 GB and minutes on one (Mesa 25.2, drm-shim). spirv-opt inlines the helper and turns the variables into
+# SSA values first (0.8-1.5 GB, a third of the time). The results are kept in <spv dir>/../spv_opt (redone when the translator's file is newer). DM_SPV_OPT=0 skips this
+OPT_PASSES = ['--target-env=vulkan1.3', '--merge-return', '--inline-entry-points-exhaustive', '--eliminate-dead-functions', '--eliminate-local-single-block',
+              '--eliminate-local-single-store', '--ssa-rewrite', '--eliminate-dead-code-aggressive', '--merge-blocks', '--simplify-instructions', '--eliminate-dead-code-aggressive']
+
+def _opt_one(args):
+    src, dst = args
+    tmp = str(dst) + '.tmp'
+    r = subprocess.run(['spirv-opt', *OPT_PASSES, str(src), '-o', tmp], capture_output=True, text=True)
+    if r.returncode or not os.path.exists(tmp): return src.stem, (r.stderr or 'spirv-opt failed').strip().splitlines()[-1:]
+    v = subprocess.run(['spirv-val', '--target-env', 'vulkan1.3', tmp], capture_output=True, text=True) if shutil.which('spirv-val') else None
+    if v is not None and v.returncode: os.remove(tmp); return src.stem, ['the result does not validate: kept the original']
+    os.replace(tmp, dst); return src.stem, None
+
+def optimize_heavy(src, keys):
+    if os.environ.get('DM_SPV_OPT') == '0': return {}
+    heavy = [k for k in keys if k == k[:16] and b'dmsh_hmma' in (src / f'{k}.spv').read_bytes()]
+    if not heavy: return {}
+    if not shutil.which('spirv-opt'):
+        print(f'[YELLOW] {len(heavy)} shaders with tensor-core emulation are packed as translated: install spirv-opt (sudo dnf install -y spirv-tools) and pack again, '
+              'or the driver may take minutes and gigabytes on them', flush=True)
+        return {}
+    out = src.parent / 'spv_opt'; out.mkdir(exist_ok=True)
+    todo = [(src / f'{k}.spv', out / f'{k}.spv') for k in heavy if not (out / f'{k}.spv').exists() or (out / f'{k}.spv').stat().st_mtime < (src / f'{k}.spv').stat().st_mtime]
+    if todo:
+        jobs = max(1, min(int(os.environ.get('J') or os.cpu_count() or 2), 3))
+        print(f'optimizing {len(todo)} of {len(heavy)} shaders with tensor-core emulation (spirv-opt, {jobs} at a time; can take a while on the Thor)', flush=True)
+        done = 0
+        with ProcessPoolExecutor(jobs) as ex:
+            for k, err in ex.map(_opt_one, todo):
+                done += 1
+                if err: print(f'[YELLOW] {k}: {err[0] if err else ""}', flush=True)
+                if done % 10 == 0 or done == len(todo): print(f'  {done}/{len(todo)}', flush=True)
+    return {k: out / f'{k}.spv' for k in heavy if (out / f'{k}.spv').exists()}
+
 def main():
     if len(sys.argv) != 3: sys.exit('usage: spv_pack.py <spv dir> <out file>')
     src, dst = Path(sys.argv[1]), Path(sys.argv[2])
     keys = sorted(p.name[:-4] for p in os.scandir(src) if p.name.endswith('.spv') and len(p.name) >= 20)
     # <key>_g0 .. _g4 are the Mac's geometry lowering (geometry shaders made compute kernels): not packed
+    opt = optimize_heavy(src, keys)
+    if opt: print(f'{len(opt)} shaders packed in their optimized form', flush=True)
     blobs, bad = [], 0
     for k in keys:
         try: key = int(k[:16], 16)
         except ValueError: continue
         if k != k[:16]: continue
-        try: blobs.append((key, entry(src / f'{k}.spv', src / f'{k}.res.json', src / f'{k}.json')))
+        try: blobs.append((key, entry(opt.get(k, src / f'{k}.spv'), src / f'{k}.res.json', src / f'{k}.json')))
         except Exception as e:
             bad += 1
             if bad <= 10: print(f'[RED] {k}: {e}')
