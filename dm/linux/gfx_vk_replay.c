@@ -115,20 +115,35 @@ static VkFormat tex_view_fmt2(const vtex *v, const tex_t *t, const view_t *vw, i
     return f && f == fmt_twin(v->fmt) ? f : v->fmt;
 }
 static VkFormat tex_view_fmt(const vtex *v, const tex_t *t) { return tex_view_fmt2(v, t, NULL, 0); }
-// Guest storage → the texture whose image holds it (aliases find their image here); entries are checked against the texture when read
+// Guest storage → the textures whose images hold it (aliases find their image here); entries are checked against the texture when read. Several live textures may start
+// at the same storage (a game's transient render target memory: a 960x540 R11G11B10 target and the 1920x1080 RGBA8 picture at one address), so each keeps its own
+// entry: with one entry per address, the newest texture there hid the others, and an sRGB view of the picture made after it got an image of its own, never drawn:
+// Mario Tennis Fever's picture went black (now and then: it depends on the order the game makes its textures)
 #define GM_CAP (1u << 15)
 static struct { const void *m; uint64_t serial; } g_gm[GM_CAP];
 static uint32_t gm_hash(const void *m) { return (uint32_t)((uint64_t)(uintptr_t)m * 0x9E3779B97F4A7C15ull >> 49) & (GM_CAP - 1); }
+static int gm_dead(uint32_t i) { vtex *b = tex_slot(g_gm[i].serial, 0); return !b || !b->img || b->gkey != g_gm[i].m; }
 static void gm_put(const void *m, uint64_t serial) {
-    uint32_t i = gm_hash(m);
-    for (uint32_t k = 0; k < 64; k++, i = (i + 1) & (GM_CAP - 1))
-        if (!g_gm[i].m || g_gm[i].m == m || !tex_slot(g_gm[i].serial, 0) || !tex_slot(g_gm[i].serial, 0)->img) { g_gm[i].m = m; g_gm[i].serial = serial; return; }
+    uint32_t i = gm_hash(m), free_i = ~0u;
+    for (uint32_t k = 0; k < 128; k++, i = (i + 1) & (GM_CAP - 1)) {
+        if (g_gm[i].m == m && g_gm[i].serial == serial) return;
+        if (free_i == ~0u && (!g_gm[i].m || gm_dead(i))) free_i = i;
+        if (!g_gm[i].m) break;
+    }
+    if (free_i != ~0u) { g_gm[free_i].m = m; g_gm[free_i].serial = serial; }
+    else { static int n; if (n++ < 5) LOG("[YELLOW] [vk] texture storage map: no room near %p (serial %llu not recorded for aliasing)", m, (unsigned long long)serial); }
 }
-static vtex *gm_find(const void *m) {
-    uint32_t i = gm_hash(m);
-    for (uint32_t k = 0; k < 64 && g_gm[i].m; k++, i = (i + 1) & (GM_CAP - 1))
-        if (g_gm[i].m == m) { vtex *b = tex_slot(g_gm[i].serial, 0); if (b && b->img && b->gkey == m) return b; }
-    return NULL;
+// A live texture at storage m whose image another of this shape can share (w ~0: any): the most recently made one (highest serial)
+static vtex *gm_find(const void *m, uint32_t w, uint32_t h, uint32_t layers, uint32_t levels, uint32_t samples, int is3d, VkFormat f, vtex **any) {
+    uint32_t i = gm_hash(m); vtex *best = NULL; *any = NULL;
+    for (uint32_t k = 0; k < 128 && g_gm[i].m; k++, i = (i + 1) & (GM_CAP - 1)) {
+        if (g_gm[i].m != m || gm_dead(i)) continue;
+        vtex *b = tex_slot(g_gm[i].serial, 0);
+        if (!*any || b->serial > (*any)->serial) *any = b;
+        int ok = b->w == w && b->h == h && b->layers == layers && b->levels >= levels && b->samples == samples && b->is3d == is3d && (f == b->fmt || (b->twin && f == fmt_twin(b->fmt)));
+        if (ok && !b->alias && (!best || b->serial > best->serial)) best = b;
+    }
+    return best;
 }
 // The texture's vtex, following an alias to the image it shares
 static vtex *tex_find(uint64_t serial) {
@@ -183,8 +198,11 @@ static vtex *tex_get(const tex_t *t) {
     // Another texture over the same storage, of the same shape, in this format or its twin: this texture is that one's image (an alias)
     const void *key = tex_key(t);
     if (key && !depth) {
-        vtex *b = gm_find(key);
-        if (b && b != v) {
+        vtex *other = NULL;
+        vtex *b = gm_find(key, ci.extent.width, ci.extent.height, ci.arrayLayers, ci.mipLevels, samples, ci.imageType == VK_IMAGE_TYPE_3D, f, &other);
+        if (b == v) b = NULL;
+        if (!b) b = other != v ? other : NULL;
+        if (b) {
             int shape = b->w == ci.extent.width && b->h == ci.extent.height && b->layers == ci.arrayLayers && b->levels >= ci.mipLevels && b->samples == samples && b->is3d == (ci.imageType == VK_IMAGE_TYPE_3D);
             if (shape && (f == b->fmt || (b->twin && f == fmt_twin(b->fmt)))) {
                 v->alias = b->serial;

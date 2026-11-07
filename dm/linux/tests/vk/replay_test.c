@@ -137,6 +137,12 @@ int main(int argc, char **argv) {
       p_copy_t2t *c2 = rec(OP_COPY_T2B, sizeof *c2); c2->src = (const tex_t *)(void *)ap; c2->dst = &al; c2->dr.width = 64; c2->dr.height = 64; c2->dr.depth = 1;
       rec(OP_END, 0); mtl_sub_begin(); mtl_exec(cmd); mtl_sub_commit(); mtl_finish();
       LOG("alias: row 50 col 50 %08x (as the target: %08x)", ap[50 * 64 + 50], px[50 * 64 + 50]); }
+    // a texture of another shape made later at the same storage does not hide the target from a later alias
+    { static tex_t sm, a2; sm = rt; sm.serial = 10; sm.d.width = sm.d.height = 32; a2 = rt; a2.serial = 11; a2.d.format = NVN_FORMAT_RGBA8_SRGB; static uint32_t sp[32 * 32], bp[64 * 64]; cn = 0;
+      p_copy_t2t *c3 = rec(OP_COPY_T2B, sizeof *c3); c3->src = (const tex_t *)(void *)sp; c3->dst = &sm; c3->dr.width = 32; c3->dr.height = 32; c3->dr.depth = 1;
+      p_copy_t2t *c4 = rec(OP_COPY_T2B, sizeof *c4); c4->src = (const tex_t *)(void *)bp; c4->dst = &a2; c4->dr.width = 64; c4->dr.height = 64; c4->dr.depth = 1;
+      rec(OP_END, 0); mtl_sub_begin(); mtl_exec(cmd); mtl_sub_commit(); mtl_finish();
+      LOG("alias past another texture at the same storage: row 50 col 50 %08x (as the target: %08x)", bp[50 * 64 + 50], px[50 * 64 + 50]); }
     LOG("validation errors: %d", g_val_errors);
     return g_val_errors ? 1 : 0;
 }
