@@ -477,7 +477,7 @@ static vtex *prep_tex(const tex_t *t) {
 #define PQ_CAP 2048
 // DM_VK_ABTEST=gs: draws with a geometry stage are skipped every other profile period (the profile says which), to measure what they cost
 static int g_ab_skip_gs, g_ab = -1;
-static VkQueryPool g_pq;
+static VkQueryPool g_pq; static uint32_t g_npq; static int g_prof = -1;
 static uint32_t g_gs_vps = 4;   // viewports a passthrough geometry shader's draw goes to without it (DM_SPV_VIEWPORTS, as spv_passthrough.py)
 typedef struct { uint64_t key, fs; uint32_t w, h, ncol, depth, compute; double ms; uint64_t n, draws; } pkind;
 static pkind g_pk[512]; static int g_npk;
