@@ -454,7 +454,7 @@ static void mtl_exec_body(const uint8_t *p);
 // The submission being recorded belongs to one thread at a time: from mtl_sub_begin (or the first mtl_exec) to mtl_sub_commit. Others that need the recorded work on the
 // GPU (a fence, a wait, a present, a texture's release) take it too and hand the batch over (sub_flush)
 static pthread_mutex_t g_rec_mu = PTHREAD_MUTEX_INITIALIZER; static __thread int t_rec_held;
-static _Atomic uint64_t g_wait_sync_ns, g_wait_acq_ns;   // how long the game blocked for the GPU in sync waits (an acquired texture's sync apart)
+static uint64_t g_early_syncs; static _Atomic uint64_t g_wait_sync_ns, g_wait_acq_ns;   // how long the game blocked for the GPU in sync waits (an acquired texture's sync apart)
 static int g_batch = -1, g_deferred; static uint64_t g_batched, g_gpu_subs, g_flush_why[8];
 enum { FL_COMMIT, FL_PRESENT, FL_FENCE, FL_WAIT, FL_RELEASE, FL_MAX, FL_NEED };
 static const char *const k_flush[] = {"a game submission that could not wait", "a present", "a fence", "a wait", "a texture release", "four batched", "other"};
@@ -529,6 +529,7 @@ typedef struct {
     int idx, queued;   // queued: handed over, its completion not started (the completion thread's mark)
     int dirty;   // completed, its Vulkan objects not reset yet
     int failed;  // vkQueueSubmit refused it: no fence to wait for
+    int cpu_out; // it writes guest memory when it completes (read-backs, storage write-backs): a sync covering it waits for the GPU
 } subslot;
 static subslot g_sl[NSUB - 1] = {{.dp = g_dp_store[1], .pm = g_pm_store[1], .ring_base = RING_PART, .idx = 0}, {.dp = g_dp_store[2], .pm = g_pm_store[2], .ring_base = 2 * RING_PART, .idx = 1}};
 static pthread_mutex_t g_cm_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cm_done, g_cm_work; static int g_cm_started, g_async = -1, g_inflight = 2;
@@ -641,6 +642,7 @@ static void slot_handover(subslot *P, uint64_t id, int failed) {
     SWP(g_pq, P->pq); SWP(g_npq, P->npq); SWP(g_pm, P->pm); SWP(g_npm, P->npm);
     SWP(RG.base, P->ring_base);   // the GPU reads its ring part until it completes: the recording goes on in the completed slot's part
     P->id = id; P->dirty = 1; P->failed = failed;
+    P->cpu_out = P->nwb > 0 || P->nlw > 0; for (int i = 0; i < P->nstage && !P->cpu_out; i++) if (P->stage[i].rb_dst) P->cpu_out = 1;
     // linear textures it reads back: written again by a later submission, they are read back with that one too
     if (P->nlw > P->clws) { P->clws = P->clw; P->lws = realloc(P->lws, P->clws * sizeof *P->lws); }
     for (int i = 0; i < P->nlw; i++) { P->lws[i] = P->lw[i]->serial; P->lw[i]->wrote = 0; }
@@ -738,8 +740,8 @@ static uint64_t sub_commit_locked(int force) {
             (unsigned long long)g_hazard_waits, g_wb_bytes / 1048576.0 / g_t_n, g_wb_changed / 1048576.0 / g_t_n, ring_mb_per_sub(g_t_n));
         if (g_gpu_subs) { char fw[400]; int o = 0; fw[0] = 0; for (int i = 0; i < 7; i++) if (g_flush_why[i] && o < 380) o += snprintf(fw + o, sizeof fw - o, "%s%llu at %s", o ? ", " : "", (unsigned long long)g_flush_why[i], k_flush[i]);
             static uint64_t tlast; uint64_t tn = mono_ns(); double secs = tlast ? (tn - tlast) / 1e9 : 0; tlast = tn;
-            LOG("[vk] batching: %.2f game submissions per GPU submission; batches handed over at: %s; the game blocked for the GPU %.0f ms a second in sync waits, %.0f in acquired-texture syncs",
-                (double)(g_gpu_subs + g_batched) / g_gpu_subs, o ? fw : "none", secs > 0 ? atomic_exchange(&g_wait_sync_ns, 0) / 1e6 / secs : 0.0, secs > 0 ? atomic_exchange(&g_wait_acq_ns, 0) / 1e6 / secs : 0.0);
+            LOG("[vk] batching: %.2f game submissions per GPU submission; batches handed over at: %s; the game blocked for the GPU %.0f ms a second in sync waits, %.0f in acquired-texture syncs; syncs done early %llu",
+                (double)(g_gpu_subs + g_batched) / g_gpu_subs, o ? fw : "none", secs > 0 ? atomic_exchange(&g_wait_sync_ns, 0) / 1e6 / secs : 0.0, secs > 0 ? atomic_exchange(&g_wait_acq_ns, 0) / 1e6 / secs : 0.0, (unsigned long long)g_early_syncs); g_early_syncs = 0;
             g_gpu_subs = g_batched = 0; memset(g_flush_why, 0, sizeof g_flush_why); }
         if (g_t_n) LOG("[vk] completion per submission: thread wake-up %.2f ms, after the fence %.2f ms (events and counters %.2f ms, %.0f of them)", g_t_wake / 1e6 / g_t_n, g_t_land / 1e6 / g_t_n,
                        g_t_post / 1e6 / g_t_n, (double)g_n_post / g_t_n);
@@ -752,6 +754,33 @@ static uint64_t sub_commit_locked(int force) {
 }
 uint64_t mtl_last_fence(void) { if (g_deferred) flush_from(FL_FENCE); return atomic_load(&g_fence); }   // a fence covers everything submitted: batched work goes first
 // Completed up to fence: waited for (up to timeout_ns) when that submission was handed to the GPU; one still being recorded is not waited for, as before
+// A sync whose submissions the GPU has not finished: done already, when none of them writes guest memory at its end. The replay takes everything a submission reads from
+// guest memory at the time it is recorded (ring copies, texture uploads), so the game may reuse its buffers as soon as the work is handed over; what it may read back
+// (events, counters) is written now, and again when the GPU is done. The game waited for each frame's sync, so the CPU and GPU took turns (Mario Tennis Fever blocked
+// about 600 ms a second). DM_VK_EARLY_SYNC=0 waits for the GPU
+static int early_done(uint64_t fence) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_EARLY_SYNC"); on = !(e && *e == '0'); if (on) LOG("[vk] syncs: done once their work is handed to the GPU, unless it reads results back (DM_VK_EARLY_SYNC=0 waits for the GPU)"); }
+    if (!on || fence > atomic_load(&g_fence)) return 0;
+    pthread_once(&g_cm_once, cm_init);
+    pthread_mutex_lock(&g_cm_mu);
+    int ok = 1;
+    for (int i = 0; i < NSUB - 1; i++) if (atomic_load(&g_pr[i].busy) && g_sl[i].id <= fence && g_sl[i].cpu_out) ok = 0;
+    if (ok) {
+        uint64_t now = gpu_ticks();
+        for (int i = 0; i < NSUB - 1; i++) {
+            subslot *sl = &g_sl[i]; if (!atomic_load(&g_pr[i].busy) || sl->id > fence) continue;
+            for (int k = 0; k < sl->npost; k++) {
+                post_op *o = &sl->post[k];
+                if (o->kind == 1) { dm_guest_write_prepare((void *)o->val, 4); if (o->mode == 1) continue; *o->val = o->v; }   // an add waits for the GPU's end (it would count twice)
+                else { uint64_t rec[2] = {o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1 : (o->type == 0 || o->type == 0x10) && !DM_GAME_RENDER_COND ? now : 0, now};
+                       dm_guest_write_prepare((void *)(uintptr_t)o->addr, sizeof rec); memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec); }
+            }
+        }
+        g_early_syncs++;
+    }
+    pthread_mutex_unlock(&g_cm_mu);
+    return ok;
+}
 static int wait_timed(uint64_t fence, uint64_t timeout_ns) {
     if (fence <= atomic_load(&g_done)) return 1;
     if (fence > atomic_load(&g_fence) && g_deferred) {   // batched work: handed over first (a poll does it only when the recording is free)
@@ -759,6 +788,7 @@ static int wait_timed(uint64_t fence, uint64_t timeout_ns) {
         else if (t_rec_held) sub_flush(FL_WAIT);
         else if (!pthread_mutex_trylock(&g_rec_mu)) { sub_flush(FL_WAIT); pthread_mutex_unlock(&g_rec_mu); }
     }
+    if (early_done(fence)) return 1;
     if (!timeout_ns || fence > atomic_load(&g_fence)) return 0;
     pthread_once(&g_cm_once, cm_init);
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);

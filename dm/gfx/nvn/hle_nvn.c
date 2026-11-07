@@ -1431,14 +1431,14 @@ static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // Accumulated display-link wait 
 static uint64_t g_fs_start, g_fs_wait;   // frame step (fstep_tick): when the first acquire after a present returned (the frame's start, 0 = none yet), and its pacing wait
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // Host process start point (main.c; same base as the UIMSG timestamps)
-// The fence an acquired swapchain texture's sync gets. Here (Metal, and Linux with DM_ACQUIRE_SYNC=all): everything submitted so far. On Linux by default: what was
+// The fence an acquired swapchain texture's sync gets: everything submitted so far. On Linux with DM_ACQUIRE_SYNC=texture: what was
 // submitted when that texture was last presented, the frame drawn into it. The Vulkan replay orders the GPU's work itself (each submission starts after the one before), so
 // the sync only tells the game when the texture's last frame is done, as on the Switch, where it means the display has let go of it. Waiting for everything made the game
 // wait for the GPU to finish the frame just submitted before starting the next: CPU and GPU took turns (Mario Tennis Fever on the AYN Thor)
 static struct { const void *w; uint64_t f[4]; } g_acqf[8];
 static int acq_per_tex(void) {
 #ifdef __linux__
-    static int on = -1; if (on < 0) { const char *e = getenv("DM_ACQUIRE_SYNC"); on = !(e && !strcmp(e, "all")); } return on;
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_ACQUIRE_SYNC"); on = e && !strcmp(e, "texture"); } return on;   // off by default: the game never blocked on these syncs, and with it on it stuttered more
 #else
     return 0;
 #endif
