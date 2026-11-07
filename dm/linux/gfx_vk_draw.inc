@@ -175,6 +175,13 @@ void mtl_tex_cpu_written(const tex_t *t) {
     if (!t || !t->serial) return;
     pthread_mutex_lock(&g_tex_mu); vtex *v = tex_find(t->serial); if (v && !v->gpu) v->uploaded = 0; pthread_mutex_unlock(&g_tex_mu);
 }
+// The CPU wrote a registered texture's pages after its first use (hle_nvn.c nvn_ft_poll, profile key tex_dirty_upload): uploaded again from its storage, unless the GPU
+// has written the texture (then its content is the GPU's: left to it until the CPU rewrites it)
+int mtl_tex_cpu_rewritten(const tex_t *t) {
+    if (!t || !t->serial) return MTL_REWRITE_UPLOADED;
+    pthread_mutex_lock(&g_tex_mu); vtex *v = tex_find(t->serial); int gpu = v && v->gpu && !v->linear; if (v && !gpu) v->uploaded = 0; pthread_mutex_unlock(&g_tex_mu);
+    return gpu ? MTL_REWRITE_GPU_NOW : MTL_REWRITE_UPLOADED;
+}
 int mtl_tex_gpu_owned(uint64_t serial) { pthread_mutex_lock(&g_tex_mu); vtex *v = tex_find(serial); int r = v && v->gpu; pthread_mutex_unlock(&g_tex_mu); return r; }
 
 // ---------------------------------------------------------------- texture contents from guest memory
