@@ -12,10 +12,11 @@
 // Not yet: transform feedback, tessellation and geometry stages, conditional rendering, alpha test, logic ops, quads, texture buffers, bindless handles in uniform buffers
 // (those draws are skipped or drawn without them; the summary line counts them).
 
-// ---------------------------------------------------------------- the upload ring: one host-visible buffer, refilled from its start at each submission
+// ---------------------------------------------------------------- the upload ring: one host-visible buffer in two halves, one per submission slot: a submission fills its half
+// from the start while the GPU reads the other one's
 #define RING_SIZE (192ull << 20)
 #define RING_ALIGN 256
-static struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; uint64_t used; int full_warned; } RG;
+static struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; uint64_t used, base; int full_warned; } RG;   // base: the start of the recording slot's half
 typedef struct { uint64_t addr, size, off; } ring_hit;
 #define RH_CAP 8192
 static ring_hit g_rh[RH_CAP]; static int g_nrh_used; static uint16_t g_rh_idx[RH_CAP];   // (address, size) → ring offset for this submission (open addressing, cleared at the submission's end)
@@ -38,7 +39,7 @@ static int ring_init(void) {
 static uint64_t ring_alloc(uint64_t n) {
     uint64_t off = (RG.used + RING_ALIGN - 1) & ~(uint64_t)(RING_ALIGN - 1);
     uint64_t n16 = (n + 15) & ~15ull;   // reserved in whole 16-byte rows: a binding's range may round up past the copied bytes
-    if (off + n16 > RING_SIZE) { g_ring_full++; if (!RG.full_warned++) LOG("[RED] [vk] the upload ring is full within one submission: draws past it are skipped"); return ~0ull; }
+    if (off + n16 > RG.base + RING_SIZE / 2) { g_ring_full++; if (!RG.full_warned++) LOG("[RED] [vk] the upload ring is full within one submission: draws past it are skipped"); return ~0ull; }
     RG.used = off + n16; g_ring_bytes += n; return off;
 }
 // The guest's bytes [addr, addr + size) in the ring (the same range again in this submission: the same copy)
@@ -50,6 +51,7 @@ static uint64_t ring_put(uint64_t addr, uint64_t size) {
         if (!g_rh[i].addr) break;
     }
     uint64_t off = ring_alloc(size); if (off == ~0ull) return off;
+    if (addr) pend_hazard(addr, size);
     if (addr) memcpy(RG.p + off, (const void *)(uintptr_t)addr, size); else memset(RG.p + off, 0, size);
     if (addr && !g_rh[i].addr && g_nrh_used < RH_CAP) { g_rh[i] = (ring_hit){addr, size, off}; g_rh_idx[g_nrh_used++] = (uint16_t)i; }
     return off;
@@ -151,6 +153,7 @@ static void tex_fill(vtex *v, const tex_t *t) {
         static int n; if (n++ < 10) LOG("[YELLOW] [vk] texture serial %llu (%ux%u, %llu bytes) at offset %#llx runs past its pool (%#llx bytes, flags %#x, mode %d)", (unsigned long long)t->serial, t->d.width, t->d.height,
             (unsigned long long)total, (unsigned long long)(t->mem - t->pool->mem), (unsigned long long)t->pool->size, t->pool->flags, t->pool->vmode);
     }
+    pend_hazard((uint64_t)(uintptr_t)t->mem, linear && t->d.stride ? (uint64_t)t->d.stride * ((v->h + bh - 1) / bh) : total);
     stage_t *s = stage_new(total); if (!s) { UPFAIL("no staging memory"); return; }
     VkBufferImageCopy bic[32]; uint32_t nb = 0; uint64_t off = 0;
     VkImageAspectFlags asp = fmt_aspects(v->fmt);
@@ -368,7 +371,7 @@ static uint64_t support_buffer(void) {
 
 // ---------------------------------------------------------------- descriptor pools, one chain per submission
 #define DP_MAX 64
-static VkDescriptorPool g_dp[DP_MAX]; static int g_ndp, g_dp_cur;
+static VkDescriptorPool g_dp_store[2][DP_MAX], *g_dp = g_dp_store[0]; static int g_ndp, g_dp_cur;   // the recording slot's pools (the slot in flight has the other array)
 static VkDescriptorSet desc_alloc(VkDescriptorSetLayout l) {
     for (;;) {
         if (g_dp_cur >= g_ndp) {
@@ -493,7 +496,7 @@ static uint32_t g_gs_vps = 4;   // viewports a passthrough geometry shader's dra
 typedef struct { uint64_t key, fs; uint32_t w, h, ncol, depth, compute; double ms; uint64_t n, draws; } pkind;
 static pkind g_pk[512]; static int g_npk;
 typedef struct { uint32_t q0; uint64_t key, fs; uint32_t w, h, ncol, depth, compute; uint64_t draws; } pmark;
-static pmark g_pm[PQ_CAP / 2]; static int g_npm; static double g_prof_total_ms; static uint64_t g_prof_subs;
+static pmark g_pm_store[2][PQ_CAP / 2], *g_pm = g_pm_store[0]; static int g_npm; static pthread_mutex_t g_prof_mu = PTHREAD_MUTEX_INITIALIZER; static double g_prof_total_ms; static uint64_t g_prof_subs;
 static uint32_t g_pm_cur = ~0u;
 static int prof_on(void) {
     if (g_prof < 0) { const char *e = getenv("DM_VK_PROFILE"); g_prof = !(e && *e == '0') && VK.limits.timestampPeriod > 0; }
@@ -520,24 +523,27 @@ static void prof_mark(int begin, uint32_t w, uint32_t h, uint32_t ncol, uint32_t
     }
 }
 static void prof_cb_end(void) { if (g_prof && g_pq && g_npq < PQ_CAP) vkCmdWriteTimestamp_(g_cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_pq, g_npq++); }
-static void prof_collect(void) {   // after the submission completed
-    if (!g_prof || !g_pq || g_npq < 2) return;
+static void prof_collect(VkQueryPool pq, uint32_t npq, const pmark *pm, int npm) {   // after a submission completed (its slot's queries; on the completion thread)
+    if (!g_prof || !pq || npq < 2) return;
     static uint64_t ts[PQ_CAP];
-    if (vkGetQueryPoolResults_(VK.dev, g_pq, 0, g_npq, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT)) return;
+    if (vkGetQueryPoolResults_(VK.dev, pq, 0, npq, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT)) return;
+    pthread_mutex_lock(&g_prof_mu);
     double per = VK.limits.timestampPeriod / 1e6;
-    g_prof_total_ms += (ts[g_npq - 1] - ts[0]) * per; g_prof_subs++;
-    for (int i = 0; i < g_npm; i++) {
-        pmark *m = &g_pm[i]; if (m->q0 + 1 >= g_npq) continue;
+    g_prof_total_ms += (ts[npq - 1] - ts[0]) * per; g_prof_subs++;
+    for (int i = 0; i < npm; i++) {
+        const pmark *m = &pm[i]; if (m->q0 + 1 >= npq) continue;
         double ms = (ts[m->q0 + 1] - ts[m->q0]) * per; if (ms < 0 || ms > 1000) continue;
         uint64_t key = (uint64_t)m->w << 40 ^ (uint64_t)m->h << 24 ^ m->ncol << 4 ^ m->depth << 2 ^ m->compute ^ m->fs * 31;
         int k = 0; while (k < g_npk && g_pk[k].key != key) k++;
         if (k == g_npk) { if (g_npk >= 512) continue; g_pk[g_npk++] = (pkind){key, m->fs, m->w, m->h, m->ncol, m->depth, m->compute, 0, 0, 0}; }
         g_pk[k].ms += ms; g_pk[k].n++; g_pk[k].draws += m->draws;
     }
-    g_npq = 0;
+    pthread_mutex_unlock(&g_prof_mu);
 }
 static void prof_report(void) {
-    if (!g_prof || !g_prof_subs) return;
+    if (!g_prof) return;
+    pthread_mutex_lock(&g_prof_mu);
+    if (!g_prof_subs) { pthread_mutex_unlock(&g_prof_mu); return; }
     double sum = 0; for (int i = 0; i < g_npk; i++) sum += g_pk[i].ms;
     LOG("[vk] GPU profile (last %llu submissions): %.2f ms GPU per submission, %.2f ms of it in passes and dispatches; the most expensive kinds:", (unsigned long long)g_prof_subs, g_prof_total_ms / g_prof_subs, sum / g_prof_subs);
     for (int r = 0; r < 14; r++) {
@@ -549,6 +555,7 @@ static void prof_report(void) {
         k->n = 0;
     }
     g_npk = 0; g_prof_total_ms = 0; g_prof_subs = 0;
+    pthread_mutex_unlock(&g_prof_mu);
     if (g_ab < 0) { const char *e = getenv("DM_VK_ABTEST"); g_ab = e && !strcmp(e, "gs"); }
     if (g_ab) { g_ab_skip_gs = !g_ab_skip_gs; LOG("[vk] A/B test: the next period %s draws with a geometry stage", g_ab_skip_gs ? "SKIPS" : "draws"); }
 }
@@ -789,6 +796,7 @@ static uint32_t handle_of(int st, const vks_bind *b, int *ok) {
     if (b->aux >= 3 && b->aux - 3 < 18) {   // bindless: the handle words are in the game's uniform buffer
         const p_bind_buf *u = &D.ubo[st][b->aux - 3];
         if (!u->addr || w0 + 4 > u->size || (type == 1 && w1 + 4 > u->size)) return 0;
+        pend_hazard(u->addr + w0, 4); if (type == 1) pend_hazard(u->addr + w1, 4);
         uint32_t v; memcpy(&v, (const void *)(uintptr_t)(u->addr + w0), 4);
         if (type == 1) { uint32_t s2; memcpy(&s2, (const void *)(uintptr_t)(u->addr + w1), 4); v |= s2; }
         *ok = 1; return v;
@@ -799,7 +807,7 @@ typedef struct { VkWriteDescriptorSet w[256]; VkDescriptorBufferInfo bi[512]; Vk
 static wset g_ws;
 
 // Texture buffers (NVN_TEXTURE_TARGET_BUFFER): the texture's storage (width texels of its format) copied into the ring like a uniform buffer, and a buffer view of
-// the format over it, made for this submission (draw_submitted destroys them). Written ones (shader images of buffer textures) are copied back with the submission
+// the format over it, made for this submission (destroyed when its slot is reused: slot_clean). Written ones (shader images of buffer textures) are copied back with the submission
 static VkBufferView *g_tbv; static int g_ntbv, g_ctbv; static uint64_t g_tbuf_n, g_tbuf_miss;
 static VkBufferView tbuf_view(int st, const vks_bind *b, int storage) {
     int ok = 0; uint32_t h = handle_of(st, b, &ok);
@@ -943,6 +951,7 @@ static int quad_indices(int prim, const draw_args *a, uint64_t *off, uint32_t *c
     uint32_t *dst = (uint32_t *)(RG.p + o);
     uint32_t isz = !a->indexed ? 0 : a->itype == NVN_INDEX_TYPE_UNSIGNED_INT ? 4 : a->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 1;
     const uint8_t *ib = a->indexed ? (const uint8_t *)(uintptr_t)a->ibuf : NULL;
+    if (ib) pend_hazard(a->ibuf, (uint64_t)a->count * isz);
     #define QI(n) (ib ? (isz == 4 ? ((const uint32_t *)ib)[n] : isz == 2 ? ((const uint16_t *)ib)[n] : ib[n]) : a->first + (n))
     for (uint32_t q = 0; q < nq; q++) {
         uint32_t v0, v1, v2, v3;
@@ -970,6 +979,7 @@ static int gs_mask(const vks_shader *s, uint32_t *mask) {
             int gst = 0; for (int x = 0; x < NST; x++) if (k_nvn2model[x] == s->model) gst = x;   // the NVN stage of the geometry shader
             const p_bind_buf *u = &D.ubo[gst][slot - 3];
             if (!u->addr || (uint64_t)dw * 4 + 4 > u->size) return 0;
+            pend_hazard(u->addr + (uint64_t)dw * 4, 4);
             memcpy(&st[sp - 1], (const uint8_t *)(uintptr_t)u->addr + (uint64_t)dw * 4, 4);
         } else {
             if (sp < 2) return 0;
@@ -1066,7 +1076,7 @@ static void do_draw(const draw_args *a) {
         if (!a->ibuf) return;
         if (isz == 1) {
             ib_off = ring_alloc((uint64_t)a->count * 2); if (ib_off == ~0ull) { g_skip[SK_RING]++; return; }
-            const uint8_t *src = (const uint8_t *)(uintptr_t)a->ibuf; uint16_t *dst = (uint16_t *)(RG.p + ib_off);
+            const uint8_t *src = (const uint8_t *)(uintptr_t)a->ibuf; uint16_t *dst = (uint16_t *)(RG.p + ib_off); pend_hazard(a->ibuf, a->count);
             for (uint32_t i = 0; i < a->count; i++) dst[i] = src[i] == 0xff && D.prim_restart ? 0xffff : src[i];
         } else {
             ib_off = ring_put(a->ibuf, (uint64_t)a->count * isz); if (ib_off == ~0ull) { g_skip[SK_RING]++; return; }
@@ -1136,12 +1146,16 @@ static void do_draw(const draw_args *a) {
 static void draw_op(uint32_t op, const uint8_t *a, uint32_t size) {
     if (op == OP_DRAW) {
         p_draw t; const p_draw *d = draw_rec(a, size, &t);
+        if (d->mdi_cnt) pend_hazard(d->mdi_cnt, 4);
+        if (d->ind) pend_hazard(d->ind, 20);
         if (d->mdi_cnt && (uint32_t)d->mdi_i >= *(const uint32_t *)(uintptr_t)d->mdi_cnt) return;
         draw_args x = {d->prim, 0, (uint32_t)d->count, (uint32_t)d->instances, (uint32_t)d->first, (uint32_t)d->base_instance, 0, 0, 0};
         if (d->ind) { const uint32_t *g = (const uint32_t *)(uintptr_t)d->ind; x.count = g[0]; x.instances = g[1]; x.first = g[2]; x.base_instance = g[3]; }   // the arguments as the CPU sees them
         do_draw(&x);
     } else if (op == OP_DRAW_IDX) {
         p_draw_idx t; const p_draw_idx *d = draw_idx_rec(a, size, &t);
+        if (d->mdi_cnt) pend_hazard(d->mdi_cnt, 4);
+        if (d->ind) pend_hazard(d->ind, 20);
         if (d->mdi_cnt && (uint32_t)d->mdi_i >= *(const uint32_t *)(uintptr_t)d->mdi_cnt) return;
         draw_args x = {d->prim, 1, (uint32_t)d->count, (uint32_t)d->instances, 0, (uint32_t)d->base_instance, d->base_vertex, d->ibuf, d->itype};
         if (d->ind) {
@@ -1151,6 +1165,8 @@ static void draw_op(uint32_t op, const uint8_t *a, uint32_t size) {
         do_draw(&x);
     } else if (op == OP_MULTI_DRAW) {
         const p_multi_draw *m = (const p_multi_draw *)a;
+        if (m->cnt) pend_hazard(m->cnt, 4);
+        if (m->ind && m->max) pend_hazard(m->ind, (uint64_t)m->max * (m->stride ? (uint64_t)m->stride : 20));
         uint32_t n = (uint32_t)m->max; if (m->cnt) { uint32_t c = *(const uint32_t *)(uintptr_t)m->cnt; if (c < n) n = c; }
         int idx = m->itype >= 0; uint64_t stride = m->stride ? (uint64_t)m->stride : idx ? 20 : 16;
         uint32_t isz = m->itype == NVN_INDEX_TYPE_UNSIGNED_INT ? 4 : m->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 1;
@@ -1187,7 +1203,7 @@ static void dispatch_op(const p_dispatch *d) {
     pass_end();   // a texture's first use may have needed command-buffer work
     vkCmdBindPipeline_(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_cp[i].p);
     uint32_t x = (uint32_t)d->x, y = (uint32_t)d->y, z = (uint32_t)d->z;
-    if (d->ind) { const uint32_t *g = (const uint32_t *)(uintptr_t)d->ind; x = g[0]; y = g[1]; z = g[2]; }
+    if (d->ind) { pend_hazard(d->ind, 12); const uint32_t *g = (const uint32_t *)(uintptr_t)d->ind; x = g[0]; y = g[1]; z = g[2]; }
     if (x && y && z) { prof_mark(1, x, y, z, 0, 1, 0, 0); vkCmdDispatch_(g_cb, x, y, z); prof_mark(0, x, y, z, 0, 1, pr->st[VKS_CS] ? pr->st[VKS_CS]->key : 0, 1); full_barrier(); g_disp_done++; g_cb_ops++; }
 }
 
@@ -1310,6 +1326,7 @@ static void dump_pass(void) {
 static void dump_submitted(void) {
     if (g_dump_subs) {
         if (!--g_dump_subs) {   // complete: it takes the place of the last one (a game closed during a dump keeps the one before)
+            pend_wait();   // the last submission's pictures are written when it completes
             char fin[400]; size_t l = strlen(g_dump_dir); snprintf(fin, sizeof fin, "%.*s", (int)(l > 4 ? l - 4 : l), g_dump_dir);
             char cmd[900]; snprintf(cmd, sizeof cmd, "rm -rf '%s' && mv '%s' '%s'", fin, g_dump_dir, fin);
             if (system(cmd)) LOG("[vk] dump: could not move %s to %s", g_dump_dir, fin);
@@ -1365,18 +1382,9 @@ static void linear_readbacks(void) {
     }
     if (g_nlw) full_barrier();
 }
-static void linear_done(void) {   // after the readbacks landed (stages_done): their storage is the content again
-    for (int i = 0; i < g_nlw; i++) { vtex *v = g_lw[i]; v->wrote = 0; if (v->img) { v->uploaded = 1; track(v); } }
-    g_nlw = 0;
-}
-static void draw_submitted(void) {
-    for (int i = 0; i < g_nwb; i++) { memcpy((void *)(uintptr_t)g_wb[i].addr, RG.p + g_wb[i].off, g_wb[i].size); g_wb_bytes += g_wb[i].size; }
-    g_nwb = 0;
-    RG.used = 0; DZ.support_off = 0; g_support_n++;
+static void rec_reset(void) {   // a new submission starts recording: the ring half and the descriptor pools it was given are its own from the start
+    RG.used = RG.base; DZ.support_off = 0; g_support_n++;
     if (g_nrh_used) { memset(g_rh, 0, sizeof g_rh); g_nrh_used = 0; }
-    for (int i = 0; i < g_ndp; i++) vkResetDescriptorPool_(VK.dev, g_dp[i], 0);
-    for (int i = 0; i < g_ntbv; i++) vkDestroyBufferView_(VK.dev, g_tbv[i], NULL);
-    g_ntbv = 0;
     g_dp_cur = 0;
 }
 static void draw_summary(char *out, size_t n) {

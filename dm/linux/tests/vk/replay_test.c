@@ -120,9 +120,13 @@ int main(int argc, char **argv) {
     mtl_sub_commit();
     // read the target back
     static uint32_t px[64 * 64]; cn = 0;
+    // the first submission may still be in flight: a buffer copy on the CPU from the storage buffer it writes back waits for it first
+    static uint32_t sbuf2[16]; { uint8_t *cp = rec(OP_COPY_B2B, 24); uint64_t s_ = (uint64_t)(uintptr_t)sbuf, d_ = (uint64_t)(uintptr_t)sbuf2, n_ = sizeof sbuf; memcpy(cp, &s_, 8); memcpy(cp + 8, &d_, 8); memcpy(cp + 16, &n_, 8); }
     p_copy_t2t *c = rec(OP_COPY_T2B, sizeof *c); c->src = (const tex_t *)(void *)px; c->dst = &rt; c->dr.width = 64; c->dr.height = 64; c->dr.depth = 1;
     rec(OP_END, 0);
-    mtl_sub_begin(); mtl_exec(cmd); mtl_sub_commit();
+    mtl_sub_begin(); mtl_exec(cmd); uint64_t f2 = mtl_sub_commit();
+    LOG("buffer copy after the write-back in flight: %u %u ... %u (7 8 ... 14 expected)", sbuf2[0], sbuf2[1], sbuf2[7]);
+    LOG("fence wait: %d (1 expected), completed %d", mtl_wait(f2, 2000000000ull), mtl_wait(f2, 0));
     LOG("view swizzle: row 63 col 63 %08x (80800000 expected: b = one x 0.5 after the uniform update, a = r x 1)", px[63 * 64 + 63]);
     LOG("alpha test: row 50 col 40 %08x (discarded: ffff0000), row 50 col 56 %08x (drawn: 80202020)", px[50 * 64 + 40], px[50 * 64 + 56]);
     LOG("pixels: row 0 %08x, row 20 %08x, row 40 %08x, row 63 %08x; quad: row 50 col 5 %08x, row 50 col 50 %08x", px[0], px[20 * 64 + 5], px[40 * 64 + 5], px[63 * 64 + 5], px[50 * 64 + 5], px[50 * 64 + 50]);
@@ -131,7 +135,7 @@ int main(int argc, char **argv) {
     // an alias: an sRGB texture over the linear target's storage reads what was drawn into the UNORM one (one image)
     { static tex_t al; al = rt; al.serial = 9; al.d.format = NVN_FORMAT_RGBA8_SRGB; static uint32_t ap[64 * 64]; cn = 0;
       p_copy_t2t *c2 = rec(OP_COPY_T2B, sizeof *c2); c2->src = (const tex_t *)(void *)ap; c2->dst = &al; c2->dr.width = 64; c2->dr.height = 64; c2->dr.depth = 1;
-      rec(OP_END, 0); mtl_sub_begin(); mtl_exec(cmd); mtl_sub_commit();
+      rec(OP_END, 0); mtl_sub_begin(); mtl_exec(cmd); mtl_sub_commit(); mtl_finish();
       LOG("alias: row 50 col 50 %08x (as the target: %08x)", ap[50 * 64 + 50], px[50 * 64 + 50]); }
     LOG("validation errors: %d", g_val_errors);
     return g_val_errors ? 1 : 0;

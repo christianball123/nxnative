@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds and runs the Vulkan replay test on this machine (x86_64 or arm64): needs clang, glslangValidator, a Vulkan loader + driver and the validation layer
 # (Ubuntu: apt install glslang-tools mesa-vulkan-drivers vulkan-validationlayers libvulkan-dev; Fedora: dnf install glslang mesa-vulkan-drivers vulkan-validation-layers vulkan-loader-devel)
-# Expected: "alpha test: row 50 col 40 ffff0000 (discarded: ffff0000), row 50 col 56 80202020 (drawn: 80202020)", "pixels: row 0 80202020, row 20 80202020, row 40 ffff0000, row 63 ffff0000; quad: row 50 col 5 80202020, row 50 col 50 ffff0000", "linear target's guest memory: row 0 80202020, row 50 col 5 80202020, row 50 col 50 ffff0000", "storage buffer after the submission: 7 8 9 10 ... 14", "validation errors: 0"
+# Expected: "alpha test: row 50 col 40 ffff0000 (discarded: ffff0000), row 50 col 56 80202020 (drawn: 80202020)", "pixels: row 0 80202020, row 20 80202020, row 40 ffff0000, row 63 ffff0000; quad: row 50 col 5 80202020, row 50 col 50 ffff0000", "linear target's guest memory: row 0 80202020, row 50 col 5 80202020, row 50 col 50 ffff0000", "storage buffer after the submission: 7 8 9 10 ... 14", "buffer copy after the write-back in flight: 7 8 ... 14", "fence wait: 1 (1 expected), completed 1", "validation errors: 0"
 set -e
 cd "$(dirname "$0")/../.."
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT

@@ -7,7 +7,7 @@
 //   - with a window (DM_WINDOW=1): textures as VkImages (by serial, made at first use), colour and depth / stencil clears of the render targets, texture clears, buffer → texture,
 //     texture → texture and texture → buffer copies, and the present of the game's swapchain image
 // What it does not do yet: draws and compute (stage C: shaders), packaged texture uploads (their storage is block-linear), partial clears (a scissor, a channel mask), sparse textures.
-// Every image stays in VK_IMAGE_LAYOUT_GENERAL, and every GPU operation is followed by a full memory barrier: simple and correct, not fast. A submission waits for the GPU to finish.
+// Every image stays in VK_IMAGE_LAYOUT_GENERAL, and every GPU operation is followed by a full memory barrier: simple and correct, not fast. A submission runs on the GPU while the next one is recorded (two slots: gfx_vk_draw.inc and the end of this file); DM_VK_ASYNC=0 waits for each.
 #include "dm.h"
 #include "../gfx/nvn/nvn_obj.h"
 #include "../gfx/nvn/nvn_mtl.h"
@@ -232,8 +232,10 @@ static vtex *tex_get(const tex_t *t) {
 }
 static void vk_views_drop(vtex *v);
 void mtl_tex_init(const tex_t *t) { (void)t; }   // made at first use (tex_get): most textures a game initializes are packaged textures stage B does not upload yet
+static void sub_wait_all(void);
 void mtl_tex_release(tex_t *t) {
     if (!t || !t->serial) return;
+    sub_wait_all();   // a submission in flight may still read its storage back into guest memory: done first, so nothing lands in memory the game reuses
     pthread_mutex_lock(&g_tex_mu);
     vtex *v = tex_slot(t->serial, 0);
     if (v) {
@@ -244,9 +246,21 @@ void mtl_tex_release(tex_t *t) {
     pthread_mutex_unlock(&g_tex_mu);
 }
 
-// ---------------------------------------------------------------- the submission: one command buffer, waited for at commit
+// ---------------------------------------------------------------- the submission being recorded: its command buffer and fence (the one in flight has the other pair: subslot, below)
 static VkCommandPool g_pool; static VkCommandBuffer g_cb; static VkFence g_fence_vk; static int g_cb_open, g_cb_ops;
-static _Atomic uint64_t g_fence;   // submissions committed (each completes before the next starts)
+static _Atomic uint64_t g_fence;   // submissions handed to the GPU (mtl_last_fence)
+static _Atomic uint64_t g_done;    // submissions completed: their read-backs, write-backs, events and counters are in guest memory
+// Guest bytes the submission in flight writes when it completes (read-backs, storage buffer write-backs, events and counters). The replay reads and writes guest memory
+// on the CPU as it records (ring copies, uploads, indirect arguments, buffer copies and updates): where that touches these bytes, the submission in flight is waited for
+// first, so the CPU work sees (and comes after) what the GPU wrote, in submission order. Built and read by the recording thread only
+typedef struct { uint64_t lo, hi; } grange;
+static grange *g_pr; static int g_npr, g_cpr; static uint64_t g_pr_lo, g_pr_hi, g_hazard_waits;
+static _Atomic int g_pend_busy;   // a submission is in flight (its completion has not run yet)
+static void pend_wait(void);
+static inline void pend_hazard(uint64_t addr, uint64_t n) {
+    if (!atomic_load_explicit(&g_pend_busy, memory_order_acquire) || !addr || !n || addr >= g_pr_hi || addr + n <= g_pr_lo) return;
+    for (int i = 0; i < g_npr; i++) if (addr < g_pr[i].hi && g_pr[i].lo < addr + n) { g_hazard_waits++; pend_wait(); return; }
+}
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; } post_op;   // 1 event, 2 counter
 static post_op *g_post; static int g_npost, g_postcap;
 static struct { p_set_rt rt; int has_rt; int64_t copy_stride, copy_img_stride; } R;
@@ -258,12 +272,14 @@ static stage_t *g_stage; static int g_nstage, g_stagecap;
 static void post(post_op o) { if (g_npost == g_postcap) { g_postcap = g_postcap ? g_postcap * 2 : 64; g_post = realloc(g_post, g_postcap * sizeof *g_post); } g_post[g_npost++] = o; }
 static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g = (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; } return nvn_timestamp_from_ns(g); }
 
-static void prof_cb_begin(void); static void prof_cb_end(void); static void prof_collect(void); static void prof_report(void);   // gfx_vk_draw.inc: the GPU profile
+static void prof_cb_begin(void); static void prof_cb_end(void); static void prof_report(void);   // gfx_vk_draw.inc: the GPU profile
 static int cb_begin(void) {
     if (!VK.ok) return 0;
     if (!g_pool) {
         VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, VK.qfam};
         vkCreateCommandPool_(VK.dev, &pci, NULL, &g_pool);
+    }
+    if (!g_cb) {   // one per slot: the second is made when the first is in flight
         VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, g_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
         vkAllocateCommandBuffers_(VK.dev, &cai, &g_cb);
         VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0}; vkCreateFence_(VK.dev, &fi, NULL, &g_fence_vk);
@@ -271,7 +287,11 @@ static int cb_begin(void) {
     if (!g_cb_open) {
         vkResetCommandBuffer_(g_cb, 0);
         VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
-        vkBeginCommandBuffer_(g_cb, &bi); g_cb_open = 1; g_cb_ops = 0; prof_cb_begin();
+        vkBeginCommandBuffer_(g_cb, &bi); g_cb_open = 1; g_cb_ops = 0;
+        // the submission before may still run: nothing here starts before it has finished (a barrier's first scope is all earlier work on the queue)
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT};
+        vkCmdPipelineBarrier_(g_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        prof_cb_begin();
     }
     return 1;
 }
@@ -312,17 +332,6 @@ static stage_t *stage_new(uint64_t n) {
     vkBindBufferMemory_(VK.dev, s->b, s->m, 0); vkMapMemory_(VK.dev, s->m, 0, VK_WHOLE_SIZE, 0, &s->p); s->n = n;
     g_nstage++; return s;
 }
-static void stages_done(void) {
-    for (int i = 0; i < g_nstage; i++) {
-        stage_t *s = &g_stage[i];
-        if (s->rb_dst) dm_guest_write_prepare(s->rb_dst, (s->rb_rows - 1) * s->rb_row + s->rb_n);   // guest pages the dirty tracking protects are opened first
-        if (s->rb_dst) for (size_t r = 0; r < s->rb_rows; r++) memcpy(s->rb_dst + r * s->rb_row, (uint8_t *)s->p + r * s->rb_src_row, s->rb_n);
-        if (s->dump_fmt) dump_write(s);
-        vkUnmapMemory_(VK.dev, s->m); vkDestroyBuffer_(VK.dev, s->b, NULL); vkFreeMemory_(VK.dev, s->m, NULL);
-    }
-    g_nstage = 0;
-}
-
 void ring_forget(uint64_t addr, uint64_t n);   // gfx_vk_draw.inc: guest bytes changed mid-submission
 static void tex_fill(vtex *v, const tex_t *t);   // gfx_vk_draw.inc: a texture the GPU has not written gets its guest-memory content
 
@@ -457,10 +466,10 @@ static void mtl_exec_body(const uint8_t *p) {
         case OP_CALL: { uint64_t t; memcpy(&t, a, 8); mtl_exec((const uint8_t *)(uintptr_t)t); break; }
         case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); post((post_op){1, val, m, v, 0, 0}); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); post((post_op){2, NULL, 0, 0, ad, (uint32_t)t}); break; }
-        case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = atomic_load(&g_fence) + 1; s->fenced = 1; break; }
-        case OP_CLEAR_BUF: { const p_clear_buf *c = (const p_clear_buf *)a; uint32_t *d = (uint32_t *)(uintptr_t)c->addr; for (uint64_t i = 0; i < c->size / 4; i++) d[i] = c->value; ring_forget(c->addr, c->size); break; }
-        case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); memmove((void *)(uintptr_t)d, (const void *)(uintptr_t)s_, n); ring_forget(d, n); break; }
-        case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); memcpy((void *)(uintptr_t)d, a + 16, n); ring_forget(d, n); break; }
+        case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = atomic_load(&g_fence) + 1; s->fenced = 1; break; }   // this submission's number when it is handed over
+        case OP_CLEAR_BUF: { const p_clear_buf *c = (const p_clear_buf *)a; pend_hazard(c->addr, c->size); uint32_t *d = (uint32_t *)(uintptr_t)c->addr; for (uint64_t i = 0; i < c->size / 4; i++) d[i] = c->value; ring_forget(c->addr, c->size); break; }
+        case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); pend_hazard(s_, n); pend_hazard(d, n); memmove((void *)(uintptr_t)d, (const void *)(uintptr_t)s_, n); ring_forget(d, n); break; }
+        case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); pend_hazard(d, n); memcpy((void *)(uintptr_t)d, a + 16, n); ring_forget(d, n); break; }
         case OP_COPY_STRIDE: { const p_copy_stride *cs = (const p_copy_stride *)a; if (cs->image) R.copy_img_stride = cs->stride; else R.copy_stride = cs->stride; break; }
         case OP_SET_RT: if (VK.ok) pass_end(); R.rt = *(const p_set_rt *)a; R.has_rt = 1; break;
         case OP_CLEAR_COLOR: if (VK.ok) { pass_end(); clear_color((const p_clear_color *)a); } break;
@@ -489,7 +498,122 @@ void mtl_sub_begin(void) {
     // the window comes up with the first submission, so the game's textures have a device from the start
     if (vkw_wanted() && !VK.ok) { vkw_init(); const char *e = getenv("DM_VK_DRAW"); g_draw_on = !(e && *e == '0'); if (VK.ok) LOG("[vk] draws: %s", g_draw_on ? "on (stage C)" : "off (DM_VK_DRAW=0)"); }
 }
+// ---------------------------------------------------------------- submissions in flight: two slots. The submitting thread records one while the GPU runs the other; at a commit
+// the recorded one is handed to the GPU, the one before is waited for (usually long done: it ran while this one was recorded), and the two swap. A completion thread waits
+// for each submission's fence and lands what the game sees of it (read-backs, storage buffer write-backs, events, counters) as soon as the GPU is done, so a game polling
+// an event never waits for its next submission. Vulkan objects (staging buffers, buffer views, descriptor pools, the command buffer) are reset on the submitting thread
+typedef struct {
+    uint64_t id; VkCommandBuffer cb; VkFence fence;
+    stage_t *stage; int nstage, stagecap;
+    post_op *post; int npost, postcap;
+    vtex **lw; int nlw, clw; uint64_t *lws; int clws;   // lws: the linear textures' serials (one released meanwhile is left alone)
+    wback *wb; int nwb, cwb;
+    VkBufferView *tbv; int ntbv, ctbv;
+    VkDescriptorPool *dp; int ndp;
+    VkQueryPool pq; uint32_t npq; pmark *pm; int npm;
+    int dirty;   // completed, its Vulkan objects not reset yet
+    int failed;  // vkQueueSubmit refused it: no fence to wait for
+} subslot;
+static subslot g_pend = {.dp = g_dp_store[1], .pm = g_pm_store[1]};
+static pthread_mutex_t g_cm_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cm_done, g_cm_work; static int g_cm_go, g_cm_started, g_async = -1;
+static uint64_t g_t_gpu;   // the completion thread's waits for the GPU (how long submissions ran after their hand-over)
+static void cm_init(void) {
+    pthread_condattr_t ca; pthread_condattr_init(&ca); pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&g_cm_done, &ca); pthread_cond_init(&g_cm_work, NULL); pthread_condattr_destroy(&ca);
+}
+static pthread_once_t g_cm_once = PTHREAD_ONCE_INIT;
+static void pend_wait(void) {   // the submission in flight has completed when this returns
+    if (!atomic_load(&g_pend_busy)) return;
+    pthread_once(&g_cm_once, cm_init);
+    pthread_mutex_lock(&g_cm_mu); while (atomic_load(&g_pend_busy)) pthread_cond_wait(&g_cm_done, &g_cm_mu); pthread_mutex_unlock(&g_cm_mu);
+}
+static void sub_wait_all(void) { pend_wait(); }   // one submission at most is in flight
+// What the game sees of a completed submission, on the completion thread (guest pages the dirty tracking protects are opened first)
+static void slot_land(subslot *s) {
+    if (s->cb && !s->failed) {
+        uint64_t t0 = mono_ns();
+        VkResult w = vkWaitForFences_(VK.dev, 1, &s->fence, VK_TRUE, 5000000000ull);
+        if (w) { LOG("[RED] [vk] the GPU did not finish a submission in 5 s (%d): device lost or hung", w); vkDeviceWaitIdle_(VK.dev); }
+        vkResetFences_(VK.dev, 1, &s->fence);
+        g_t_gpu += mono_ns() - t0;
+    }
+    prof_collect(s->pq, s->npq, s->pm, s->npm);
+    for (int i = 0; i < s->nstage; i++) {
+        stage_t *st = &s->stage[i];
+        if (st->rb_dst) { dm_guest_write_prepare(st->rb_dst, (st->rb_rows - 1) * st->rb_row + st->rb_n); for (size_t r = 0; r < st->rb_rows; r++) memcpy(st->rb_dst + r * st->rb_row, (uint8_t *)st->p + r * st->rb_src_row, st->rb_n); }
+        if (st->dump_fmt) dump_write(st);
+    }
+    for (int i = 0; i < s->nwb; i++) { dm_guest_write_prepare((void *)(uintptr_t)s->wb[i].addr, s->wb[i].size); memcpy((void *)(uintptr_t)s->wb[i].addr, RG.p + s->wb[i].off, s->wb[i].size); g_wb_bytes += s->wb[i].size; }
+    // its events and counters, in record order
+    uint64_t now = gpu_ticks();
+    for (int i = 0; i < s->npost; i++) {
+        post_op *o = &s->post[i];
+        if (o->kind == 1) { dm_guest_write_prepare((void *)o->val, 4); if (o->mode == 1) *o->val += o->v; else *o->val = o->v; }
+        else {
+            // samples passed (occlusion queries): every query is reported visible rather than culling everything; timestamps: the guest clock in GPU ticks
+            uint64_t rec[2] = {o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1 : (o->type == 0 || o->type == 0x10) && !DM_GAME_RENDER_COND ? now : 0, now};
+            dm_guest_write_prepare((void *)(uintptr_t)o->addr, sizeof rec); memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
+        }
+    }
+}
+static void *cm_thread(void *u) {
+    (void)u;
+    for (;;) {
+        pthread_mutex_lock(&g_cm_mu); while (!g_cm_go) pthread_cond_wait(&g_cm_work, &g_cm_mu); g_cm_go = 0; pthread_mutex_unlock(&g_cm_mu);
+        slot_land(&g_pend);
+        pthread_mutex_lock(&g_cm_mu); atomic_store(&g_done, g_pend.id); atomic_store(&g_pend_busy, 0); pthread_cond_broadcast(&g_cm_done); pthread_mutex_unlock(&g_cm_mu);
+    }
+    return NULL;
+}
+// A completed slot's Vulkan objects reset for its next submission (the submitting thread), and its linear textures' storage is their content again
+static void slot_clean(subslot *s) {
+    if (!s->dirty) return;
+    s->dirty = 0;
+    for (int i = 0; i < s->nstage; i++) { stage_t *st = &s->stage[i]; vkUnmapMemory_(VK.dev, st->m); vkDestroyBuffer_(VK.dev, st->b, NULL); vkFreeMemory_(VK.dev, st->m, NULL); }
+    s->nstage = 0;
+    if (s->nlw) {
+        pthread_mutex_lock(&g_tex_mu);
+        for (int i = 0; i < s->nlw; i++) { vtex *v = s->lw[i]; if (v->serial == s->lws[i] && v->img && !v->wrote) { v->uploaded = 1; track(v); } }
+        pthread_mutex_unlock(&g_tex_mu);
+        s->nlw = 0;
+    }
+    for (int i = 0; i < s->ntbv; i++) vkDestroyBufferView_(VK.dev, s->tbv[i], NULL);
+    s->ntbv = 0;
+    for (int i = 0; i < s->ndp; i++) vkResetDescriptorPool_(VK.dev, s->dp[i], 0);
+    s->npost = 0; s->nwb = 0; s->npq = 0; s->npm = 0;
+}
+#define SWP(a, b) do { __typeof__(a) t_ = (a); (a) = (b); (b) = t_; } while (0)
+// The recorded submission (submitted already) becomes the one in flight; the completed slot becomes the recording one
+static void slot_handover(uint64_t id, int failed) {
+    subslot *P = &g_pend;
+    SWP(g_cb, P->cb); SWP(g_fence_vk, P->fence);
+    SWP(g_stage, P->stage); SWP(g_nstage, P->nstage); SWP(g_stagecap, P->stagecap);
+    SWP(g_post, P->post); SWP(g_npost, P->npost); SWP(g_postcap, P->postcap);
+    SWP(g_lw, P->lw); SWP(g_nlw, P->nlw); SWP(g_clw, P->clw);
+    SWP(g_wb, P->wb); SWP(g_nwb, P->nwb); SWP(g_cwb, P->cwb);
+    SWP(g_tbv, P->tbv); SWP(g_ntbv, P->ntbv); SWP(g_ctbv, P->ctbv);
+    SWP(g_dp, P->dp); SWP(g_ndp, P->ndp);
+    SWP(g_pq, P->pq); SWP(g_npq, P->npq); SWP(g_pm, P->pm); SWP(g_npm, P->npm);
+    P->id = id; P->dirty = 1; P->failed = failed;
+    // linear textures it reads back: written again by a later submission, they are read back with that one too
+    if (P->nlw > P->clws) { P->clws = P->clw; P->lws = realloc(P->lws, P->clws * sizeof *P->lws); }
+    for (int i = 0; i < P->nlw; i++) { P->lws[i] = P->lw[i]->serial; P->lw[i]->wrote = 0; }
+    // the guest bytes it writes when it completes
+    g_npr = 0; g_pr_lo = ~0ull; g_pr_hi = 0;
+    #define PR(a, n) do { uint64_t a_ = (a), n_ = (n); if (!a_ || !n_) break; if (g_npr == g_cpr) { g_cpr = g_cpr ? 2 * g_cpr : 64; g_pr = realloc(g_pr, g_cpr * sizeof *g_pr); } \
+        g_pr[g_npr++] = (grange){a_, a_ + n_}; if (a_ < g_pr_lo) g_pr_lo = a_; if (a_ + n_ > g_pr_hi) g_pr_hi = a_ + n_; } while (0)
+    for (int i = 0; i < P->nstage; i++) if (P->stage[i].rb_dst) PR((uint64_t)(uintptr_t)P->stage[i].rb_dst, (P->stage[i].rb_rows - 1) * P->stage[i].rb_row + P->stage[i].rb_n);
+    for (int i = 0; i < P->nwb; i++) PR(P->wb[i].addr, P->wb[i].size);
+    for (int i = 0; i < P->npost; i++) { if (P->post[i].kind == 1) PR((uint64_t)(uintptr_t)P->post[i].val, 4); else PR(P->post[i].addr, 16); }
+    #undef PR
+    RG.base = RG.base ? 0 : RING_SIZE / 2;
+    rec_reset();
+    if (!g_cm_started) { pthread_once(&g_cm_once, cm_init); pthread_t th; pthread_create(&th, NULL, cm_thread, NULL); pthread_detach(th); g_cm_started = 1; }
+    pthread_mutex_lock(&g_cm_mu); atomic_store(&g_pend_busy, 1); g_cm_go = 1; pthread_cond_signal(&g_cm_work); pthread_mutex_unlock(&g_cm_mu);
+}
 uint64_t mtl_sub_commit(void) {
+    if (g_async < 0) { const char *e = getenv("DM_VK_ASYNC"); g_async = !(e && *e == '0'); LOG("[vk] submissions: %s", g_async ? "recorded while the one before runs on the GPU (DM_VK_ASYNC=0 waits for each)" : "each waited for (DM_VK_ASYNC=0)"); }
+    uint64_t f;
     if (g_cb_open) {
         uint64_t t0 = mono_ns();
         pass_end();
@@ -500,35 +624,31 @@ uint64_t mtl_sub_commit(void) {
         pthread_mutex_lock(&VK.qmu);
         VkResult r = vkQueueSubmit_(VK.q, 1, &si, g_fence_vk);
         pthread_mutex_unlock(&VK.qmu);
-        uint64_t t1 = mono_ns(); g_t_submit += t1 - t0;
         if (r) LOG("[RED] [vk] submission failed (%d)", r);
-        else {
-            VkResult w = vkWaitForFences_(VK.dev, 1, &g_fence_vk, VK_TRUE, 5000000000ull);
-            if (w) { LOG("[RED] [vk] the GPU did not finish a submission in 5 s (%d): device lost or hung", w); vkDeviceWaitIdle_(VK.dev); }
-            vkResetFences_(VK.dev, 1, &g_fence_vk);
-        }
+        uint64_t t1 = mono_ns(); g_t_submit += t1 - t0;
+        pend_wait();   // the one before (it ran while this one was recorded): its slot is reused next
         uint64_t t2 = mono_ns(); g_t_wait += t2 - t1;
-        prof_collect();
-        stages_done();
-        linear_done();
-        draw_submitted();
+        slot_clean(&g_pend);
+        f = atomic_load(&g_fence) + 1;
+        slot_handover(f, r != VK_SUCCESS);
+        atomic_store(&g_fence, f);
+        if (!g_async) pend_wait();
         g_t_done += mono_ns() - t2; g_t_n++;
+    } else {
+        // nothing for the GPU: its events and counters land after the submissions before it, now
+        pend_wait(); slot_clean(&g_pend);
+        f = atomic_load(&g_fence) + 1;
+        uint64_t now = gpu_ticks();
+        for (int i = 0; i < g_npost; i++) {
+            post_op *o = &g_post[i];
+            if (o->kind == 1) { if (o->mode == 1) *o->val += o->v; else *o->val = o->v; }
+            else { uint64_t rec[2] = {o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1 : (o->type == 0 || o->type == 0x10) && !DM_GAME_RENDER_COND ? now : 0, now}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec); }
+        }
+        g_npost = 0;
+        pthread_mutex_lock(&g_cm_mu); atomic_store(&g_fence, f); atomic_store(&g_done, f); pthread_once(&g_cm_once, cm_init); pthread_cond_broadcast(&g_cm_done); pthread_mutex_unlock(&g_cm_mu);
     }
     dump_submitted();
-    // The submission has completed: its events and counters land, in record order
-    uint64_t now = gpu_ticks();
-    for (int i = 0; i < g_npost; i++) {
-        post_op *o = &g_post[i];
-        if (o->kind == 1) { if (o->mode == 1) *o->val += o->v; else *o->val = o->v; }
-        else {
-            // samples passed (occlusion queries): no draws yet, so every query is reported visible rather than culling everything; timestamps: the guest clock in GPU ticks
-            uint64_t rec[2] = {o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1 : (o->type == 0 || o->type == 0x10) && !DM_GAME_RENDER_COND ? now : 0, now};
-            memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
-        }
-    }
-    g_npost = 0;
     static uint64_t reported;
-    uint64_t f = atomic_fetch_add(&g_fence, 1) + 1;
     if (f == 1 || f - reported >= 600) {
         reported = f; uint64_t np = 0, nm = 0, nf = 0; vks_stats(&np, &nm, &nf);
         char ds[640]; draw_summary(ds, sizeof ds);
@@ -541,18 +661,32 @@ uint64_t mtl_sub_commit(void) {
         LOG("[vk] replay: %llu submissions; draws %llu (%llu with their shaders ready), dispatches %llu (%llu ready); programs %llu, shaders missing %llu, refused %llu; %s",
             (unsigned long long)f, (unsigned long long)g_draws, (unsigned long long)g_draws_ready, (unsigned long long)g_dispatches, (unsigned long long)g_disp_ready,
             (unsigned long long)np, (unsigned long long)nm, (unsigned long long)nf, ds);
-        if (g_t_n) LOG("[vk] time per submission (last %llu): recording %.2f ms, submit %.2f ms, GPU wait %.2f ms, after %.2f ms; ring %.2f MB per submission",
-            (unsigned long long)g_t_n, g_t_rec / 1e6 / g_t_n, g_t_submit / 1e6 / g_t_n, g_t_wait / 1e6 / g_t_n, g_t_done / 1e6 / g_t_n, ring_mb_per_sub(g_t_n));
-        g_t_rec = g_t_submit = g_t_wait = g_t_done = g_t_n = 0;
+        if (g_t_n) LOG("[vk] time per submission (last %llu): recording %.2f ms, submit %.2f ms, waiting for the one before %.2f ms, after %.2f ms; GPU still busy at hand-over %.2f ms; "
+                       "waits for a write-back in flight %llu; ring %.2f MB per submission",
+            (unsigned long long)g_t_n, g_t_rec / 1e6 / g_t_n, g_t_submit / 1e6 / g_t_n, g_t_wait / 1e6 / g_t_n, g_t_done / 1e6 / g_t_n, g_t_gpu / 1e6 / g_t_n,
+            (unsigned long long)g_hazard_waits, ring_mb_per_sub(g_t_n));
+        g_t_rec = g_t_submit = g_t_wait = g_t_done = g_t_n = g_t_gpu = 0; g_hazard_waits = 0;
         prof_report();
     }
     return f;
 }
 uint64_t mtl_last_fence(void) { return atomic_load(&g_fence); }
-int mtl_wait(uint64_t fence, uint64_t timeout_ns) { (void)timeout_ns; return fence <= atomic_load(&g_fence); }   // every submission completes before mtl_sub_commit returns
+// Completed up to fence: waited for (up to timeout_ns) when that submission was handed to the GPU; one still being recorded is not waited for, as before
+int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
+    if (fence <= atomic_load(&g_done)) return 1;
+    if (!timeout_ns || fence > atomic_load(&g_fence)) return 0;
+    pthread_once(&g_cm_once, cm_init);
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t lim = timeout_ns > 3600ull * 1000000000ull ? 3600ull * 1000000000ull : timeout_ns, ns = (uint64_t)ts.tv_nsec + lim % 1000000000ull;
+    ts.tv_sec += (time_t)(lim / 1000000000ull + ns / 1000000000ull); ts.tv_nsec = (long)(ns % 1000000000ull);
+    pthread_mutex_lock(&g_cm_mu);
+    while (fence > atomic_load(&g_done)) if (pthread_cond_timedwait(&g_cm_done, &g_cm_mu, &ts)) break;
+    pthread_mutex_unlock(&g_cm_mu);
+    return fence <= atomic_load(&g_done);
+}
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return mtl_wait(fence, timeout_ns); }
-void mtl_drain(void) {}
-void mtl_finish(void) {}
+void mtl_drain(void) { sub_wait_all(); }
+void mtl_finish(void) { sub_wait_all(); }
 
 // The image to show for a present (gfx_null.c mtl_present): the swapchain texture's VkImage, or none (stage A's colour) while nothing has written it
 int vk_present_image(const tex_t *t, VkImage *img, uint32_t *w, uint32_t *h, int *srgb) {
