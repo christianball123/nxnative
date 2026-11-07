@@ -850,6 +850,14 @@ static uint64_t sub_commit_locked(int force) {
         long rss_kb = 0, avail_kb = 0, swapf_kb = 0; char ln[256];
         FILE *fs = fopen("/proc/self/status", "r"); if (fs) { while (fgets(ln, sizeof ln, fs)) sscanf(ln, "VmRSS: %ld", &rss_kb); fclose(fs); }
         FILE *fm = fopen("/proc/meminfo", "r"); if (fm) { while (fgets(ln, sizeof ln, fm)) { sscanf(ln, "MemAvailable: %ld", &avail_kb); sscanf(ln, "SwapFree: %ld", &swapf_kb); } fclose(fm); }
+        {   // heat and clocks: the hottest thermal zone, the CPU cores' current clocks (first core of each cluster) and the GPU's (a hot device lowers them)
+            long tmax = 0; char pth[128];
+            for (int i = 0; i < 64; i++) { snprintf(pth, sizeof pth, "/sys/class/thermal/thermal_zone%d/temp", i); FILE *ft = fopen(pth, "r"); if (!ft) { if (i > 8) break; continue; } long tv = 0; if (fscanf(ft, "%ld", &tv) == 1 && tv > tmax && tv < 150000) tmax = tv; fclose(ft); }
+            char cl[160]; int co = 0; cl[0] = 0;
+            for (int pol = 0; pol < 8; pol++) { snprintf(pth, sizeof pth, "/sys/devices/system/cpu/cpufreq/policy%d/scaling_cur_freq", pol); FILE *fc = fopen(pth, "r"); if (!fc) continue; long f = 0; if (fscanf(fc, "%ld", &f) == 1 && co < 140) co += snprintf(cl + co, sizeof cl - co, "%s%.2f", co ? " / " : "", f / 1e6); fclose(fc); }
+            long gf = 0; FILE *fg = fopen("/sys/class/devfreq/3d00000.gpu/cur_freq", "r"); if (fg) { if (fscanf(fg, "%ld", &gf) != 1) gf = 0; fclose(fg); }
+            LOG("[vk] heat and clocks: hottest sensor %.1f C, CPU clusters %s GHz, GPU %ld MHz", tmax / 1000.0, co ? cl : "?", gf / 1000000);
+        }
         LOG("[vk] memory: textures alive %llu (%.0f MB), process resident %.2f GB, system available %.2f GB, swap free %.2f GB", (unsigned long long)g_tex_live, g_tex_live_bytes / 1048576.0,
             rss_kb / 1048576.0, avail_kb / 1048576.0, swapf_kb / 1048576.0);
         LOG("[vk] replay: %llu submissions; draws %llu (%llu with their shaders ready), dispatches %llu (%llu ready); programs %llu, shaders missing %llu, refused %llu; %s",
