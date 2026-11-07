@@ -143,6 +143,14 @@ int main(int argc, char **argv) {
       p_copy_t2t *c4 = rec(OP_COPY_T2B, sizeof *c4); c4->src = (const tex_t *)(void *)bp; c4->dst = &a2; c4->dr.width = 64; c4->dr.height = 64; c4->dr.depth = 1;
       rec(OP_END, 0); mtl_sub_begin(); mtl_exec(cmd); mtl_sub_commit(); mtl_finish();
       LOG("alias past another texture at the same storage: row 50 col 50 %08x (as the target: %08x)", bp[50 * 64 + 50], px[50 * 64 + 50]); }
+    // batching: a clear into a texture is kept back (nothing in it lands in guest memory), the read-back after it takes both to the GPU in one submission
+    { static tex_t bt; bt = tx; bt.serial = 12; bt.mem = calloc(1, tx.L.size); static uint32_t bpx[64 * 64]; cn = 0;
+      p_set_rt *r2 = rec(OP_SET_RT, sizeof(p_set_rt)); r2->n = 1; r2->color[0] = &bt;
+      p_clear_color *c5 = rec(OP_CLEAR_COLOR, sizeof *c5); c5->index = 0; c5->mask = 0xf; c5->rgba[0] = 1; c5->rgba[3] = 1;
+      rec(OP_END, 0); mtl_sub_begin(); mtl_exec(cmd); mtl_sub_commit(); cn = 0;
+      p_copy_t2t *c6 = rec(OP_COPY_T2B, sizeof *c6); c6->src = (const tex_t *)(void *)bpx; c6->dst = &bt; c6->dr.width = 64; c6->dr.height = 64; c6->dr.depth = 1;
+      rec(OP_END, 0); mtl_sub_begin(); mtl_exec(cmd); mtl_sub_commit(); mtl_finish();
+      LOG("batched clear then read-back: %08x (ff0000ff expected)", bpx[5]); }
     LOG("validation errors: %d", g_val_errors);
     return g_val_errors ? 1 : 0;
 }

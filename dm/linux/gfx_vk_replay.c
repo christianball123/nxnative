@@ -451,7 +451,16 @@ static int g_draw_on = 1;   // DM_VK_DRAW=0: count draws without drawing (stage 
 static uint64_t g_t_rec, g_t_submit, g_t_wait, g_t_done, g_t_n; static int g_exec_depth; static uint64_t g_exec_t0;
 static uint64_t mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }
 static void mtl_exec_body(const uint8_t *p);
+// The submission being recorded belongs to one thread at a time: from mtl_sub_begin (or the first mtl_exec) to mtl_sub_commit. Others that need the recorded work on the
+// GPU (a fence, a wait, a present, a texture's release) take it too and hand the batch over (sub_flush)
+static pthread_mutex_t g_rec_mu = PTHREAD_MUTEX_INITIALIZER; static __thread int t_rec_held;
+static int g_batch = -1, g_deferred; static uint64_t g_batched, g_gpu_subs, g_flush_why[8];
+enum { FL_COMMIT, FL_PRESENT, FL_FENCE, FL_WAIT, FL_RELEASE, FL_MAX, FL_NEED };
+static const char *const k_flush[] = {"a game submission that could not wait", "a present", "a fence", "a wait", "a texture release", "four batched", "other"};
+static void rec_take(void) { if (!t_rec_held) { pthread_mutex_lock(&g_rec_mu); t_rec_held = 1; } }
+static void rec_give(void) { if (t_rec_held) { t_rec_held = 0; pthread_mutex_unlock(&g_rec_mu); } }
 void mtl_exec(const uint8_t *p) {
+    if (!g_exec_depth) rec_take();
     if (!g_exec_depth++) g_exec_t0 = mono_ns();
     mtl_exec_body(p);
     if (!--g_exec_depth) g_t_rec += mono_ns() - g_exec_t0;
@@ -496,6 +505,7 @@ void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 
 void mtl_sub_begin(void) {
+    rec_take();
     // the window comes up with the first submission, so the game's textures have a device from the start
     if (vkw_wanted() && !VK.ok) { vkw_init(); const char *e = getenv("DM_VK_DRAW"); g_draw_on = !(e && *e == '0'); if (VK.ok) LOG("[vk] draws: %s", g_draw_on ? "on (stage C)" : "off (DM_VK_DRAW=0)"); }
 }
@@ -538,7 +548,8 @@ static void pend_wait(void) {   // every submission in flight has completed when
     pthread_once(&g_cm_once, cm_init);
     pthread_mutex_lock(&g_cm_mu); while (any_busy()) pthread_cond_wait(&g_cm_done, &g_cm_mu); pthread_mutex_unlock(&g_cm_mu);
 }
-static void sub_wait_all(void) { pend_wait(); }
+static void flush_from(int why);
+static void sub_wait_all(void) { flush_from(FL_RELEASE); pend_wait(); }
 // What the game sees of a completed submission, on the completion thread (guest pages the dirty tracking protects are opened first)
 static void slot_land(subslot *s) {
     if (s->cb && !s->failed) {
@@ -646,7 +657,26 @@ static void slot_handover(subslot *P, uint64_t id, int failed) {
     P->t_handed = mono_ns();
     pthread_mutex_lock(&g_cm_mu); atomic_store(&R->busy, 1); P->queued = 1; pthread_cond_signal(&g_cm_work); pthread_mutex_unlock(&g_cm_mu);
 }
-uint64_t mtl_sub_commit(void) {
+// Game submissions batched into one GPU submission: each GPU submission cost about 2.5 ms of GPU time before it started (on the Thor, in Game Mode and on the desktop
+// alike), three a frame. A game submission stays in the open command buffer when nothing in it needs landing in guest memory soon (no event, no read-back or write-back),
+// and goes to the GPU with the next one that does, a present, a fence or wait, a texture's release, or after a few. DM_VK_BATCH=0 hands each one over
+static int batch_ok(void) {
+    if (!g_batch || g_dump_subs || g_deferred >= 3 || g_nlw || g_nwb) return 0;
+    for (int i = 0; i < g_npost; i++) if (g_post[i].kind == 1) return 0;   // an event: a game may poll it
+    for (int i = 0; i < g_nstage; i++) if (g_stage[i].rb_dst || g_stage[i].dump_fmt) return 0;
+    return RG.used - RG.base < RING_PART / 2;
+}
+static uint64_t sub_commit_locked(int force);
+static void sub_flush(int why) {   // the batched game submissions to the GPU (the caller holds the recording)
+    if (g_cb_open && g_deferred) { g_flush_why[why]++; sub_commit_locked(1); }
+}
+static void flush_from(int why) { int mine = t_rec_held; if (!mine) pthread_mutex_lock(&g_rec_mu); sub_flush(why); if (!mine) pthread_mutex_unlock(&g_rec_mu); }
+uint64_t mtl_sub_commit(void) { uint64_t f = sub_commit_locked(0); rec_give(); return f; }
+static uint64_t sub_commit_locked(int force) {
+    if (g_batch < 0) { const char *e = getenv("DM_VK_BATCH"); g_batch = !(e && *e == '0'); LOG("[vk] game submissions %s", g_batch ? "batched into GPU submissions (DM_VK_BATCH=0: one each)" : "each a GPU submission (DM_VK_BATCH=0)"); }
+    if (!force && g_cb_open && batch_ok()) { g_deferred++; g_batched++; return atomic_load(&g_fence) + 1; }
+    if (!force && g_deferred) g_flush_why[g_deferred >= 3 ? FL_MAX : FL_COMMIT]++;
+    g_deferred = 0;
     if (g_async < 0) {
         const char *e = getenv("DM_VK_ASYNC"); g_async = !(e && *e == '0');
         const char *n = getenv("DM_VK_INFLIGHT"); if (n && (*n == '1' || *n == '2')) g_inflight = *n - '0';
@@ -671,7 +701,7 @@ uint64_t mtl_sub_commit(void) {
         slot_clean(P);
         f = atomic_load(&g_fence) + 1;
         slot_handover(P, f, r != VK_SUCCESS);
-        atomic_store(&g_fence, f);
+        atomic_store(&g_fence, f); g_gpu_subs++;
         if (!g_async) pend_wait();
         g_t_done += mono_ns() - t2; g_t_n++;
     } else {
@@ -705,6 +735,9 @@ uint64_t mtl_sub_commit(void) {
                        "waits for a write-back in flight %llu; storage write-backs %.2f MB per submission, %.3f MB of it changed; ring %.2f MB per submission",
             (unsigned long long)g_t_n, g_t_rec / 1e6 / g_t_n, g_t_submit / 1e6 / g_t_n, g_t_wait / 1e6 / g_t_n, g_t_done / 1e6 / g_t_n, g_t_gpu / 1e6 / g_t_n,
             (unsigned long long)g_hazard_waits, g_wb_bytes / 1048576.0 / g_t_n, g_wb_changed / 1048576.0 / g_t_n, ring_mb_per_sub(g_t_n));
+        if (g_gpu_subs) { char fw[400]; int o = 0; fw[0] = 0; for (int i = 0; i < 7; i++) if (g_flush_why[i] && o < 380) o += snprintf(fw + o, sizeof fw - o, "%s%llu at %s", o ? ", " : "", (unsigned long long)g_flush_why[i], k_flush[i]);
+            LOG("[vk] batching: %.2f game submissions per GPU submission; batches handed over at: %s", (double)(g_gpu_subs + g_batched) / g_gpu_subs, o ? fw : "none");
+            g_gpu_subs = g_batched = 0; memset(g_flush_why, 0, sizeof g_flush_why); }
         if (g_t_n) LOG("[vk] completion per submission: thread wake-up %.2f ms, after the fence %.2f ms (events and counters %.2f ms, %.0f of them)", g_t_wake / 1e6 / g_t_n, g_t_land / 1e6 / g_t_n,
                        g_t_post / 1e6 / g_t_n, (double)g_n_post / g_t_n);
         g_t_wake = g_t_land = g_t_post = g_n_post = 0;
@@ -714,10 +747,15 @@ uint64_t mtl_sub_commit(void) {
     }
     return f;
 }
-uint64_t mtl_last_fence(void) { return atomic_load(&g_fence); }
+uint64_t mtl_last_fence(void) { if (g_deferred) flush_from(FL_FENCE); return atomic_load(&g_fence); }   // a fence covers everything submitted: batched work goes first
 // Completed up to fence: waited for (up to timeout_ns) when that submission was handed to the GPU; one still being recorded is not waited for, as before
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     if (fence <= atomic_load(&g_done)) return 1;
+    if (fence > atomic_load(&g_fence) && g_deferred) {   // batched work: handed over first (a poll does it only when the recording is free)
+        if (timeout_ns) flush_from(FL_WAIT);
+        else if (t_rec_held) sub_flush(FL_WAIT);
+        else if (!pthread_mutex_trylock(&g_rec_mu)) { sub_flush(FL_WAIT); pthread_mutex_unlock(&g_rec_mu); }
+    }
     if (!timeout_ns || fence > atomic_load(&g_fence)) return 0;
     pthread_once(&g_cm_once, cm_init);
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -735,6 +773,7 @@ void mtl_finish(void) { sub_wait_all(); }
 // The image to show for a present (gfx_null.c mtl_present): the swapchain texture's VkImage, or none (stage A's colour) while nothing has written it
 int vk_present_image(const tex_t *t, VkImage *img, uint32_t *w, uint32_t *h, int *srgb) {
     if (!t || !VK.ok) return 0;
+    if (g_deferred) flush_from(FL_PRESENT);   // the frame's batched work goes to the GPU before the present that shows it
     pthread_mutex_lock(&g_tex_mu); vtex *v = tex_find(t->serial); int ok = v && v->img && (v->bad & 2);
     if (ok) { VkFormat f = tex_view_fmt(v, t); *img = v->img; *w = v->w; *h = v->h; *srgb = f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_A8B8G8R8_SRGB_PACK32; }
     pthread_mutex_unlock(&g_tex_mu);
