@@ -120,6 +120,10 @@ int main(int argc, char **argv) {
     mtl_sub_commit();
     // read the target back
     static uint32_t px[64 * 64]; cn = 0;
+    // the storage buffer again in a dispatch (a write-back in flight: forwarded on the GPU, or waited for)
+    { p_bind_program *cbp2 = rec(OP_BIND_PROGRAM, sizeof *cbp2); cbp2->prog = &cprog; cbp2->stages = NVN_SHADER_STAGE_COMPUTE_BIT;
+      p_bind_buf *sb2 = rec(OP_BIND_SSBO, sizeof *sb2); sb2->stage = 5; sb2->index = 0; sb2->addr = (uint64_t)(uintptr_t)sbuf; sb2->size = sizeof sbuf;
+      p_dispatch *dp2 = rec(OP_DISPATCH, sizeof *dp2); dp2->x = 1; dp2->y = 1; dp2->z = 1; }
     // the first submission may still be in flight: a buffer copy on the CPU from the storage buffer it writes back waits for it first
     static uint32_t sbuf2[16]; { uint8_t *cp = rec(OP_COPY_B2B, 24); uint64_t s_ = (uint64_t)(uintptr_t)sbuf, d_ = (uint64_t)(uintptr_t)sbuf2, n_ = sizeof sbuf; memcpy(cp, &s_, 8); memcpy(cp + 8, &d_, 8); memcpy(cp + 16, &n_, 8); }
     p_copy_t2t *c = rec(OP_COPY_T2B, sizeof *c); c->src = (const tex_t *)(void *)px; c->dst = &rt; c->dr.width = 64; c->dr.height = 64; c->dr.depth = 1;

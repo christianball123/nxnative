@@ -265,7 +265,7 @@ void mtl_tex_release(tex_t *t) {
 }
 
 // ---------------------------------------------------------------- the submission being recorded: its command buffer and fence (the one in flight has the other pair: subslot, below)
-static VkCommandPool g_pool; static VkCommandBuffer g_cb; static VkFence g_fence_vk; static int g_cb_open, g_cb_ops;
+static VkCommandPool g_pool; static VkCommandBuffer g_cb, g_pre; static VkFence g_fence_vk; static int g_cb_open, g_cb_ops, g_pre_open;   // g_pre: GPU copies that go before g_cb (forwarding)
 static _Atomic uint64_t g_fence;   // submissions handed to the GPU (mtl_last_fence)
 static _Atomic uint64_t g_done;    // submissions completed: their read-backs, write-backs, events and counters are in guest memory
 // Guest bytes each submission in flight writes when it completes (read-backs, storage buffer write-backs, events and counters). The replay reads and writes guest memory
@@ -531,7 +531,7 @@ typedef struct {
     VkBufferView *tbv; int ntbv, ctbv;
     VkDescriptorPool *dp; int ndp;
     VkQueryPool pq; uint32_t npq; pmark *pm; int npm;
-    uint64_t ring_base, t_handed;
+    uint64_t ring_base, t_handed; VkCommandBuffer pre;
     int idx, queued;   // queued: handed over, its completion not started (the completion thread's mark)
     int dirty;   // completed, its Vulkan objects not reset yet
     int failed;  // vkQueueSubmit refused it: no fence to wait for
@@ -636,10 +636,42 @@ static subslot *slot_free(void) {
         pend_wait_slot(old->idx);
     }
 }
+// Forwarding (gfx_vk_draw.inc, the forwarding buffer): the bytes [addr, addr + size) wanted in the ring at ring_off are a storage buffer result of a submission in flight,
+// copied to the forwarding buffer at its end. When the guest's bytes are still those it recorded (the CPU has not written them since), a GPU copy before this submission
+// puts the result in the ring and nothing waits. 0: not forwarded (the caller waits as before)
+static int fwd_try(uint64_t addr, uint64_t size, uint64_t ring_off) {
+    const wback *best = NULL; uint64_t best_id = 0;
+    for (int s = 0; s < NSUB - 1; s++) {
+        if (!atomic_load_explicit(&g_pr[s].busy, memory_order_acquire) || addr >= g_pr[s].hi || addr + size <= g_pr[s].lo) continue;
+        subslot *sl = &g_sl[s]; int hit = 0;
+        for (int i = 0; i < sl->nwb; i++) {
+            const wback *w = &sl->wb[i];
+            if (addr < w->addr + w->size && w->addr < addr + size) {
+                hit = 1;
+                if (w->addr <= addr && addr + size <= w->addr + w->size && w->fwo >= 0 && w->orig && (!best || sl->id > best_id)) { best = w; best_id = sl->id; }
+            }
+        }
+        if (!hit) return 0;   // a read-back or a counter in flight writes these bytes: waited for
+        for (int i = 0; i < sl->nstage; i++) if (sl->stage[i].rb_dst && addr < (uint64_t)(uintptr_t)sl->stage[i].rb_dst + (sl->stage[i].rb_rows - 1) * sl->stage[i].rb_row + sl->stage[i].rb_n && (uint64_t)(uintptr_t)sl->stage[i].rb_dst < addr + size) return 0;
+    }
+    if (!best || best->fw_epoch != FW.epoch) { if (best) g_fwd_miss++; return 0; }
+    if (memcmp((const void *)(uintptr_t)addr, best->orig + (addr - best->addr), size)) { g_fwd_miss++; return 0; }   // the CPU wrote them since: its bytes are the newer ones
+    if (!g_pre_open) {
+        if (!g_pre) { VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, g_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1}; if (vkAllocateCommandBuffers_(VK.dev, &cai, &g_pre)) { g_pre = VK_NULL_HANDLE; return 0; } }
+        vkResetCommandBuffer_(g_pre, 0);
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+        vkBeginCommandBuffer_(g_pre, &bi); g_pre_open = 1;
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT};
+        vkCmdPipelineBarrier_(g_pre, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
+    VkBufferCopy bc = {(uint64_t)best->fwo + (addr - best->addr), ring_off, size}; vkCmdCopyBuffer_(g_pre, FW.b, RG.b, 1, &bc);
+    static int said; g_fwd_n++; if (!said++) LOG("[vk] first storage result forwarded on the GPU (%llu bytes at %#llx)", (unsigned long long)size, (unsigned long long)addr);
+    return 1;
+}
 #define SWP(a, b) do { __typeof__(a) t_ = (a); (a) = (b); (b) = t_; } while (0)
 // The recorded submission (submitted already) goes into slot P, in flight; P's completed (and cleaned) things become the recording ones
 static void slot_handover(subslot *P, uint64_t id, int failed) {
-    SWP(g_cb, P->cb); SWP(g_fence_vk, P->fence);
+    SWP(g_cb, P->cb); SWP(g_fence_vk, P->fence); SWP(g_pre, P->pre);
     SWP(g_stage, P->stage); SWP(g_nstage, P->nstage); SWP(g_stagecap, P->stagecap);
     SWP(g_post, P->post); SWP(g_npost, P->npost); SWP(g_postcap, P->postcap);
     SWP(g_lw, P->lw); SWP(g_nlw, P->nlw); SWP(g_clw, P->clw);
@@ -698,10 +730,13 @@ static uint64_t sub_commit_locked(int force) {
     if (g_cb_open) {
         uint64_t t0 = mono_ns();
         pass_end();
+        fw_copy_out();
         linear_readbacks();
         prof_cb_end();
         vkEndCommandBuffer_(g_cb); g_cb_open = 0;
-        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &g_cb, 0, NULL};
+        VkCommandBuffer cbs[2] = {g_pre, g_cb}; int npre = g_pre_open;
+        if (g_pre_open) { vkEndCommandBuffer_(g_pre); g_pre_open = 0; }
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, npre ? 2 : 1, npre ? cbs : &g_cb, 0, NULL};
         pthread_mutex_lock(&VK.qmu);
         VkResult r = vkQueueSubmit_(VK.q, 1, &si, g_fence_vk);
         pthread_mutex_unlock(&VK.qmu);
@@ -759,6 +794,7 @@ static uint64_t sub_commit_locked(int force) {
         if (g_hz[0].line) { char hb[400]; int o = 0; for (int i = 0; i < 16 && g_hz[i].line && o < 380; i++) o += snprintf(hb + o, sizeof hb - o, "%s%s:%d: %llu waits, %.1f ms, %llu bytes read each", i ? "; " : "", strrchr(g_hz[i].file, '/') ? strrchr(g_hz[i].file, '/') + 1 : g_hz[i].file, g_hz[i].line,
                 (unsigned long long)g_hz[i].n, g_hz[i].ns / 1e6, (unsigned long long)(g_hz[i].bytes / g_hz[i].n));
             LOG("[vk] waits for a write-back in flight, by where the bytes are read: %s", hb); memset(g_hz, 0, sizeof g_hz); }
+        if (g_fwd_n || g_fwd_miss) { LOG("[vk] storage results forwarded on the GPU %llu times (%llu could not be: the CPU had written them, or the forwarding buffer had moved on)", (unsigned long long)g_fwd_n, (unsigned long long)g_fwd_miss); g_fwd_n = g_fwd_miss = 0; }
         g_t_rec = g_t_submit = g_t_wait = g_t_done = g_t_n = g_t_gpu = 0; g_hazard_waits = 0;
         prof_report();
     }

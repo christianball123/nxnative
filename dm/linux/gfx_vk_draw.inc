@@ -43,6 +43,7 @@ static uint64_t ring_alloc(uint64_t n) {
     if (off + n16 > RG.base + RING_PART) { g_ring_full++; if (!RG.full_warned++) LOG("[RED] [vk] the upload ring is full within one submission: draws past it are skipped"); return ~0ull; }
     RG.used = off + n16; g_ring_bytes += n; return off;
 }
+static int fwd_try(uint64_t addr, uint64_t size, uint64_t ring_off);   // gfx_vk_replay.c
 // The guest's bytes [addr, addr + size) in the ring (the same range again in this submission: the same copy)
 static uint64_t ring_put(uint64_t addr, uint64_t size) {
     if (!size) size = 16;
@@ -52,7 +53,8 @@ static uint64_t ring_put(uint64_t addr, uint64_t size) {
         if (!g_rh[i].addr) break;
     }
     uint64_t off = ring_alloc(size); if (off == ~0ull) return off;
-    if (addr) pend_hazard(addr, size);
+    int fwd = addr && fwd_try(addr, size, off);   // a storage buffer result of a submission in flight: copied on the GPU (else waited for)
+    if (addr && !fwd) pend_hazard(addr, size);
     if (addr) memcpy(RG.p + off, (const void *)(uintptr_t)addr, size); else memset(RG.p + off, 0, size);
     if (addr && !g_rh[i].addr && g_nrh_used < RH_CAP) { g_rh[i] = (ring_hit){addr, size, off}; g_rh_idx[g_nrh_used++] = (uint16_t)i; }
     return off;
@@ -72,13 +74,50 @@ void ring_forget(uint64_t addr, uint64_t n) {
 // Storage buffers shaders wrote in this submission: copied back into guest memory when it completes, so the game (and the next submission's copies) see the results
 // Only the bytes the GPU changed go back (orig: the copy as recorded): the submission completes while the game runs on, and the rest of the buffer may hold what the CPU
 // wrote since (the next frame's data); writing the whole range back put the old bytes over it
-typedef struct { uint64_t addr, size, off; uint8_t *orig; } wback;
+typedef struct { uint64_t addr, size, off; uint8_t *orig; int64_t fwo; uint32_t fw_epoch; } wback;   // fwo: its copy in the forwarding buffer (-1: none)
 static wback *g_wb; static int g_nwb, g_cwb; static uint64_t g_wb_bytes, g_wb_changed;
 static void wb_add(uint64_t addr, uint64_t size, uint64_t off) {
     for (int i = 0; i < g_nwb; i++) if (g_wb[i].addr == addr && g_wb[i].size == size) return;
     if (g_nwb == g_cwb) { g_cwb = g_cwb ? 2 * g_cwb : 64; g_wb = realloc(g_wb, g_cwb * sizeof *g_wb); }
     uint8_t *o = malloc(size); if (o) memcpy(o, RG.p + off, size);
-    g_wb[g_nwb++] = (wback){addr, size, off, o};
+    g_wb[g_nwb++] = (wback){addr, size, off, o, -1, 0};
+}
+// Storage buffer results kept on the GPU: at the end of a submission each range a shader wrote is also copied into the forwarding buffer, so a later submission that reads
+// those bytes before the GPU is done (and before they are back in guest memory) copies them on the GPU instead of waiting. Mario Tennis Fever's compute writes a small
+// buffer each frame that the next frame reads: the replay waited for the whole frame to finish, every frame. DM_VK_FORWARD=0 waits
+#define FW_SIZE (16ull << 20)
+static struct { VkBuffer b; VkDeviceMemory m; uint64_t used; uint32_t epoch; int failed; } FW;
+typedef struct { uint64_t addr, size, off; } fwent;
+static fwent g_fw[1024]; static int g_nfw; static uint64_t g_fwd_n, g_fwd_miss;
+static int fw_init(void) {
+    if (FW.b) return 1;
+    if (FW.failed) return 0;
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, FW_SIZE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    if (vkCreateBuffer_(VK.dev, &bci, NULL, &FW.b)) { FW.failed = 1; return 0; }
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements_(VK.dev, FW.b, &mr);
+    uint32_t mt = vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, mt};
+    if (mt == ~0u || vkAllocateMemory_(VK.dev, &ai, NULL, &FW.m)) { vkDestroyBuffer_(VK.dev, FW.b, NULL); FW.b = VK_NULL_HANDLE; FW.failed = 1; return 0; }
+    vkBindBufferMemory_(VK.dev, FW.b, FW.m, 0);
+    return 1;
+}
+static int64_t fw_slot(uint64_t addr, uint64_t size) {   // the forwarding buffer's place for this range (a new epoch when it runs out: older places are not trusted)
+    for (int i = 0; i < g_nfw; i++) if (g_fw[i].addr == addr && g_fw[i].size == size) return (int64_t)g_fw[i].off;
+    uint64_t n = (size + 255) & ~255ull;
+    if (n > FW_SIZE) return -1;
+    if (g_nfw == 1024 || FW.used + n > FW_SIZE) { g_nfw = 0; FW.used = 0; FW.epoch++; }
+    g_fw[g_nfw++] = (fwent){addr, size, FW.used}; FW.used += n;
+    return (int64_t)(FW.used - n);
+}
+static void fw_copy_out(void) {   // at the submission's end (no pass open): its write-backs into the forwarding buffer
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_FORWARD"); on = !(e && *e == '0'); }
+    if (!on || !g_nwb || !fw_init()) return;
+    full_barrier();
+    for (int i = 0; i < g_nwb; i++) {
+        wback *w = &g_wb[i]; int64_t o = fw_slot(w->addr, w->size); if (o < 0) continue;
+        VkBufferCopy bc = {w->off, (uint64_t)o, w->size}; vkCmdCopyBuffer_(g_cb, RG.b, FW.b, 1, &bc);
+        w->fwo = o; w->fw_epoch = FW.epoch;
+    }
 }
 static void wb_land(const wback *w) {   // on the completion thread
     uint8_t *g = (uint8_t *)(uintptr_t)w->addr; const uint8_t *r = RG.p + w->off;
