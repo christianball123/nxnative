@@ -411,7 +411,8 @@ static stage_t *stage_new(uint64_t n) {
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, s->cap ? s->cap : n ? n : 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     if (vkCreateBuffer_(VK.dev, &bci, NULL, &s->b)) return NULL;
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements_(VK.dev, s->b, &mr);
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)};   // cached: read-backs land from here
+    if (ai.memoryTypeIndex == ~0u) ai.memoryTypeIndex = vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (ai.memoryTypeIndex == ~0u || vkAllocateMemory_(VK.dev, &ai, NULL, &s->m)) { vkDestroyBuffer_(VK.dev, s->b, NULL); return NULL; }
     vkBindBufferMemory_(VK.dev, s->b, s->m, 0); vkMapMemory_(VK.dev, s->m, 0, VK_WHOLE_SIZE, 0, &s->p); s->n = n;
     g_nstage++; return s;

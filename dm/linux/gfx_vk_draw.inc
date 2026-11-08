@@ -33,12 +33,17 @@ static int ring_init(void) {
     if (VK.f_xfb) bci.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;   // captured vertices are written into the ring (do_draw)
     if (vkCreateBuffer_(VK.dev, &bci, NULL, &RG.b)) { LOG("[RED] [vk] the upload ring buffer was refused"); return 0; }
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements_(VK.dev, RG.b, &mr);
-    uint32_t mt = vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    // Cached memory first: the CPU reads the ring back (storage write-backs are compared with guest memory there), and uncached memory reads at tens of MB/s on the Adreno 740:
+    // Ocarina of Time's 34 MB of write-backs a submission took 518 ms to land. Turnip offers a cached coherent type where the GPU snoops the CPU's caches
+    uint32_t mt = vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (getenv("DM_VK_RING_UNCACHED")) mt = ~0u;
+    if (mt == ~0u) mt = vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mt == ~0u) mt = vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, mt};
     if (mt == ~0u || vkAllocateMemory_(VK.dev, &ai, NULL, &RG.m)) { LOG("[RED] [vk] the upload ring's memory (%llu MB) was refused", (unsigned long long)(RING_SIZE >> 20)); return 0; }
     vkBindBufferMemory_(VK.dev, RG.b, RG.m, 0); vkMapMemory_(VK.dev, RG.m, 0, VK_WHOLE_SIZE, 0, (void **)&RG.p);
-    LOG("[vk] upload ring: %llu MB", (unsigned long long)(RING_SIZE >> 20));
+    { VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties_(VK.phys, &mp);
+      LOG("[vk] upload ring: %llu MB, %s memory", (unsigned long long)(RING_SIZE >> 20), (mp.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? "cached" : "uncached"); }
     return 1;
 }
 static uint64_t ring_alloc(uint64_t n) {
@@ -1738,7 +1743,7 @@ static void movie_stub(const vks_prog *pr) {
         if (nimgs < 32) imgs[nimgs++] = v->img;
         uint64_t a = (uint64_t)v->w * v->h; if (a > oa) { oa = a; out = v; rout = r; }
     }
-    if (!out) return;
+    static int nwhy; if (!out) { if (nwhy++ < 6) LOG("[vk] movie network %016llx left out: no storage image among its %d bindings, nothing stands in", (unsigned long long)s->key, s->nb); return; }
     for (int k = 0; k < s->nb; k++) { const vks_bind *b = &s->b[k];   // the colour textures it samples that it does not also write
         if (b->vktype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->vktype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
         uint32_t h = handle_of(st, b, &ok); if (!ok) continue;
@@ -1747,6 +1752,8 @@ static void movie_stub(const vks_prog *pr) {
         int w = 0; for (int q = 0; q < nimgs; q++) w |= imgs[q] == v->img; if (w) continue;
         uint64_t a = (uint64_t)v->w * v->h; if (a > ia) { ia = a; in = v; rin = r; }
     }
+    if ((!in || oa <= ia) && nwhy++ < 6) LOG("[vk] movie network %016llx left out: writes serial %llu %ux%u, %s", (unsigned long long)s->key, (unsigned long long)rout->t.serial, out->w, out->h,
+                                             in ? "samples nothing smaller" : "samples no colour texture it does not also write");
     if (!in || oa <= ia || in->samples > 1 || out->samples > 1 || (in->fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && in->fmt <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) ||
         (out->fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && out->fmt <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) || (fmt_aspects(in->fmt) | fmt_aspects(out->fmt)) != VK_IMAGE_ASPECT_COLOR_BIT) return;
     VkFormatProperties fi, fo; vkGetPhysicalDeviceFormatProperties_(VK.phys, in->fmt, &fi); vkGetPhysicalDeviceFormatProperties_(VK.phys, out->fmt, &fo);
