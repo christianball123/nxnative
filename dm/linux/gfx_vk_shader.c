@@ -198,10 +198,20 @@ static vks_prog *cache_find(uint64_t serial, uint32_t *slot) {
 static void cache_put(uint32_t slot, vks_prog *r) { if (slot < PR_CAP && !g_pr[slot]) g_pr[slot] = r; }   // a full table stops caching (a program resolves again at each bind)
 const vks_prog *vks_prog_get(const void *prog) {
     const prog_t *p = prog;
-    if (!p || !p->serial || !VK.ok || !vks_init()) return NULL;
+    if (!p || !VK.ok || !vks_init()) return NULL;
+    // A program the game filled in itself, not through nvnProgramSetShaders, has no serial (hle_nvn.c prog_key): it is known by its shaders' keys instead, hashed into a serial
+    // with the top bit set (SetShaders' serials count up from 1). Pokémon Legends: Z-A binds such programs, about 19 draws a frame, among them its skinning draws: they were
+    // all skipped as "shaders not ready", and its characters drew as black shapes. The Mac resolves them the same way (nvn_mtl.m prog_get)
+    uint64_t ser = p->serial;
+    if (!ser) {
+        ser = 0xcbf29ce484222325ull;
+        for (unsigned st = 0; st < p->nstage && st < 6; st++) { uint8_t kb[8]; if (!prog_key(p, st, kb)) continue; for (int j = 0; j < 8; j++) ser = (ser ^ kb[j]) * 0x100000001b3ull; ser = (ser ^ st) * 0x100000001b3ull; }
+        ser |= 1ull << 63;
+        static int n; if (!n++) LOG("[vk] a program without a serial (the game filled it in itself): known by its shaders' keys");
+    }
     pthread_mutex_lock(&g_mu);
-    uint32_t slot; vks_prog *r = cache_find(p->serial, &slot);
-    if (!r) { r = prog_build(p, p->serial, -1); g_progs++; cache_put(slot, r); }
+    uint32_t slot; vks_prog *r = cache_find(ser, &slot);
+    if (!r) { r = prog_build(p, ser, -1); g_progs++; cache_put(slot, r); }
     r->prog = p;
     pthread_mutex_unlock(&g_mu);
     return r->ok ? r : NULL;
