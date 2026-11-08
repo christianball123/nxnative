@@ -273,6 +273,10 @@ static vtex *tex_get(const tex_t *t) {
 static void vk_views_drop(vtex *v);
 void mtl_tex_init(const tex_t *t) { (void)t; }   // made at first use (tex_get): most textures a game initializes are packaged textures stage B does not upload yet
 static void sub_wait_all(void);
+// A released texture's image is destroyed a little later rather than after vkQueueWaitIdle: the game's own submissions are done by then (sub_wait_all), and only a present blit
+// still in flight can read one. Waiting for the whole queue at every release serialized the CPU and GPU, and in Ocarina of Time's first scene (thousands of textures made and
+// released) the main thread sat in vkQueueWaitIdle for over a minute, the game frozen. Kept 300 ms (several presents), then destroyed; the oldest go first when 1024 are waiting
+static void tex_bury(vtex *v);   // gfx_vk_draw.inc
 void mtl_tex_release(tex_t *t) {
     if (!t || !t->serial) return;
     sub_wait_all();   // a submission in flight may still read its storage back into guest memory: done first, so nothing lands in memory the game reuses
@@ -281,7 +285,7 @@ void mtl_tex_release(tex_t *t) {
     vtex *v = tex_slot(t->serial, 0);
     if (v) {
         if (v->alias) { memset(v, 0, sizeof *v); v->serial = ~0ull; pthread_mutex_unlock(&g_tex_mu); return; }   // owns no image
-        if (v->img) { pthread_mutex_lock(&VK.qmu); vkQueueWaitIdle_(VK.q); pthread_mutex_unlock(&VK.qmu); vk_views_drop(v); vkDestroyImage_(VK.dev, v->img, NULL); vkFreeMemory_(VK.dev, v->mem, NULL); g_tex_live--; g_tex_live_bytes -= v->bytes; }
+        if (v->img) { tex_bury(v); g_tex_live--; g_tex_live_bytes -= v->bytes; }
         memset(v, 0, sizeof *v); v->serial = ~0ull;   // a tombstone keeps later probes going
     }
     pthread_mutex_unlock(&g_tex_mu);

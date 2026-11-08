@@ -305,6 +305,21 @@ static VkFormat storage_twin(VkFormat f) {
 }
 typedef struct vview { struct vview *next; VkImageViewType type; VkFormat fmt; uint32_t lv, nl, l0, nlay; VkComponentMapping sw; VkImageAspectFlags asp; int storage; VkImageView view; } vview;
 static void vk_views_drop(vtex *v) { for (vview *w = v->views, *n; w; w = n) { n = w->next; vkDestroyImageView_(VK.dev, w->view, NULL); free(w); } v->views = NULL; }
+typedef struct { VkImage img; VkDeviceMemory mem; struct vview *views; uint64_t t; } grave_t;
+static grave_t g_grave[1024]; static uint32_t g_ngrave;
+static void tex_bury(vtex *v) {   // g_tex_mu held
+    uint64_t now = mono_ns(); uint32_t k = 0;
+    for (uint32_t i = 0; i < g_ngrave; i++) {
+        grave_t *g = &g_grave[i];
+        if (now - g->t > 300000000ull || (g_ngrave == 1024 && i == 0)) {
+            for (vview *w = g->views, *n; w; w = n) { n = w->next; vkDestroyImageView_(VK.dev, w->view, NULL); free(w); }
+            vkDestroyImage_(VK.dev, g->img, NULL); vkFreeMemory_(VK.dev, g->mem, NULL);
+        } else g_grave[k++] = *g;
+    }
+    g_ngrave = k;
+    g_grave[g_ngrave++] = (grave_t){v->img, v->mem, v->views, now};
+    v->views = NULL; v->img = VK_NULL_HANDLE; v->mem = VK_NULL_HANDLE;
+}
 static VkImageView view_get_fmt(vtex *v, VkFormat fmt, VkImageViewType type, uint32_t lv, uint32_t nl, uint32_t l0, uint32_t nlay, VkComponentMapping sw, VkImageAspectFlags asp, int storage);
 static VkImageView view_get(vtex *v, VkImageViewType type, uint32_t lv, uint32_t nl, uint32_t l0, uint32_t nlay, VkComponentMapping sw, VkImageAspectFlags asp, int storage) {
     return view_get_fmt(v, v->fmt, type, lv, nl, l0, nlay, sw, asp, storage);
