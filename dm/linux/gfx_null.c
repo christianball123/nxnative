@@ -17,12 +17,19 @@ static uint64_t now_mono(void);
 static void *present_watchdog(void *arg) {
     (void)arg; void svc_thread_dump(void);
     const char *e = getenv("DM_WATCHDOG_S"); double lim = e && *e ? atof(e) : 20; if (lim <= 0) return NULL;
-    int dumps = 0; uint64_t seen = 0;
+    int dumps = 0, slow = 0; uint64_t seen = 0, slow_at = 0;
+    const char *se = getenv("DM_WATCHDOG_SLOW"); double slow_lim = se && *se ? atof(se) : 0.9;   // a frame this long (s) is sampled: what the threads do while the game crawls (0: off)
     for (;;) {
-        sleep(2);
+        usleep(250000);
         uint64_t last = atomic_load(&g_wd_last), now = now_mono(), n = atomic_load(&g_presents);
         if (n != seen) { seen = n; dumps = 0; }
         double idle = (double)(now - last) / 1e9;
+        // Slow frames: up to 6 samples, 15 s apart (Pokémon Legends: Z-A went from 30 fps to one frame a second in Lumiose, with the GPU idle)
+        if (slow_lim > 0 && idle > slow_lim && idle < lim && slow < 6 && (!slow_at || now - slow_at > 15000000000ull)) {
+            slow++; slow_at = now;
+            LOG("[RED] watchdog: a slow frame (%.1f s so far since present #%llu): sample %d of the guest threads", idle, (unsigned long long)n, slow);
+            svc_thread_dump();
+        }
         if ((dumps == 0 && idle > lim) || (dumps == 1 && idle > 3 * lim)) {
             LOG("[RED] watchdog: no present for %.0f s (last was #%llu): the guest threads", idle, (unsigned long long)n);
             svc_thread_dump(); dumps++;
