@@ -9,6 +9,27 @@
 #include <time.h>
 
 static _Atomic uint64_t g_presents;
+// A game that stops presenting (a hang, or a load that never ends) gives no crash dump: after DM_WATCHDOG_S seconds (default 20; 0 off) without a present, every guest thread's
+// state is logged once (svc_thread_dump: where each one waits, or the code a spinning one runs), and again after three times as long. Pokémon Legends: Z-A stopped presenting
+// as its story began, with sound still playing
+static _Atomic uint64_t g_wd_last;
+static uint64_t now_mono(void);
+static void *present_watchdog(void *arg) {
+    (void)arg; void svc_thread_dump(void);
+    const char *e = getenv("DM_WATCHDOG_S"); double lim = e && *e ? atof(e) : 20; if (lim <= 0) return NULL;
+    int dumps = 0; uint64_t seen = 0;
+    for (;;) {
+        sleep(2);
+        uint64_t last = atomic_load(&g_wd_last), now = now_mono(), n = atomic_load(&g_presents);
+        if (n != seen) { seen = n; dumps = 0; }
+        double idle = (double)(now - last) / 1e9;
+        if ((dumps == 0 && idle > lim) || (dumps == 1 && idle > 3 * lim)) {
+            LOG("[RED] watchdog: no present for %.0f s (last was #%llu): the guest threads", idle, (unsigned long long)n);
+            svc_thread_dump(); dumps++;
+        }
+    }
+    return NULL;
+}
 static uint64_t now_mono(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 
 // Presents: the null device has no display link, so it paces itself. Each present is held until the previous one has been on "screen" for its period (the game's present interval),
@@ -36,6 +57,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n == 1 || n % 600 == 0) LOG("[null gfx] present #%llu (%.1f s since the first; %.1f fps over the last %s)", (unsigned long long)n, g_times[n % 64],
                                     g_last_present_ns && n > 1 ? 600.0 / ((double)(now - g_last_present_ns) / 1e9) : 0.0, n > 1 ? "600" : "0");
     if (n % 600 == 0 || n == 1) g_last_present_ns = now;
+    atomic_store(&g_wd_last, now);
+    if (n == 1) { pthread_t th; if (!pthread_create(&th, NULL, present_watchdog, NULL)) pthread_detach(th); }
     pthread_mutex_unlock(&g_pmu);
     return n;
 }

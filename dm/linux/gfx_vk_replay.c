@@ -174,7 +174,7 @@ static vtex *tex_get(const tex_t *t) {
                             (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT), VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     switch (target) {
     case NVN_TEXTURE_TARGET_1D: ci.imageType = VK_IMAGE_TYPE_1D; ci.extent.height = 1; break;   // a real 1D image: the translated shaders sample it as one
-    case NVN_TEXTURE_TARGET_3D: ci.imageType = VK_IMAGE_TYPE_3D; ci.extent.depth = t->d.depth ? t->d.depth : 1; break;
+    case NVN_TEXTURE_TARGET_3D: ci.imageType = VK_IMAGE_TYPE_3D; ci.extent.depth = t->d.depth ? t->d.depth : 1; ci.flags = VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT; break;   // its slices drawn as layers (pass_begin)
     case NVN_TEXTURE_TARGET_1D_ARRAY: ci.imageType = VK_IMAGE_TYPE_1D; ci.arrayLayers = t->d.height ? t->d.height : 1; ci.extent.height = 1; break;
     case NVN_TEXTURE_TARGET_2D_ARRAY: case NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY: ci.arrayLayers = t->d.depth ? t->d.depth : 1; break;
     case NVN_TEXTURE_TARGET_CUBEMAP: ci.arrayLayers = 6; ci.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT; break;

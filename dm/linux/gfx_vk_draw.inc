@@ -591,7 +591,7 @@ static uint64_t g_xfb_draws;
 static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g_tex_missing, g_tex_unres, g_tex_unreg, g_storage_unsup;
 
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
-static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0, cser[8]; VkFormat cvf[8]; vtex *clr[10]; int nclr; uint32_t cdirty; int ddirty; float sc; } P;   // sc: the targets' resolution scale   // clr: attachments this pass cleared (load op or in-pass clear)
+static struct { int open; VkFormat cf[8]; VkFormat df; uint32_t ncol, w, h, samples; int has_d, has_s; vtex *cv[8], *dv; uint32_t clv[8], cl0[8], dlv, dl0; uint64_t draws0, cser[8]; VkFormat cvf[8]; vtex *clr[10]; int nclr; uint32_t cdirty; int ddirty; float sc; uint32_t layers; } P;   // sc: the targets' resolution scale   // clr: attachments this pass cleared (load op or in-pass clear)
 static void dump_pass(void);
 static int g_dump_subs, g_dump_pass, g_dump_lines, g_dump_light;
 static vtex *g_dump_tex[64]; static int g_ndump_tex; static uint64_t g_dump_saved[512]; static int g_ndump_saved;   // sampled textures to save after the pass (once per dump)   // frame dumps (below)
@@ -641,7 +641,7 @@ static int clear_defer(vtex *v, uint32_t lv, uint32_t l0, uint32_t nlay, VkImage
             for (uint32_t i = 0; i < P.ncol && i < 8; i++) if (P.cv[i] == v && P.clv[i] == lv && P.cl0[i] == l0) { ca.colorAttachment = i; ca.clearValue = pcl_value(&c, P.cf[i]); ok = 1; break; }
         } else ok = P.dv == v && P.dlv == lv && P.dl0 == l0 && (!(asp & VK_IMAGE_ASPECT_DEPTH_BIT) || P.has_d) && (!(asp & VK_IMAGE_ASPECT_STENCIL_BIT) || P.has_s);
         if (ok && lvl_is(v, lv, P.w, P.h)) {
-            VkClearRect r = {{{0, 0}, {P.w, P.h}}, 0, 1};
+            VkClearRect r = {{{0, 0}, {P.w, P.h}}, 0, P.layers ? P.layers : 1};   // every layer of a layered pass
             vkCmdClearAttachments_(g_cb, 1, &ca, 1, &r); g_clear_att++; g_cb_ops++; if (P.nclr < 10) P.clr[P.nclr++] = v;
             return 1;
         }
@@ -794,7 +794,7 @@ static void prof_report(void) {
 static int pass_begin(void) {
     if (P.open) return 1;
     if (!R.has_rt) return 0;
-    VkRenderingAttachmentInfo ca[8], da, sa; uint32_t nc = 0, w = ~0u, h = ~0u, samples = 0; int any = 0;
+    VkRenderingAttachmentInfo ca[8], da, sa; uint32_t nc = 0, w = ~0u, h = ~0u, samples = 0, layers = 0; int any = 0;
     memset(&P, 0, sizeof P); P.sc = 1.0f;
     for (int i = 0; i < R.rt.n && i < 8; i++) {
         ca[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, 0, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED,
@@ -809,8 +809,16 @@ static int pass_begin(void) {
             if (j == ns && ns < 40) { seen[ns++] = k; LOG("[vk] render target serial %llu (NVN format %#x, %ux%u) drawn through a view of NVN format %#x: Vulkan format %d (image format %d)",
                 (unsigned long long)t->serial, t->d.format, t->d.width, t->d.height, R.rt.cview[i].format, vf, v->fmt); }
         }
-        VkImageView iv = view_get_fmt(v, vf, v->is3d ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, v->is3d ? 0 : l0, 1, (VkComponentMapping){0, 0, 0, 0}, VK_IMAGE_ASPECT_COLOR_BIT, 2);
+        // Layered rendering: a 3D target (each depth slice a layer: Pokémon Legends: Z-A builds its 32x32x32 colour grading table one slice per instance, the vertex shader
+        // writing the layer) or an array target bound with several layers is attached whole, and the pass has as many layers as its targets all have. With one layer every
+        // slice landed in slice 0, the rest stayed black, and the game's picture, graded through that table, went black once the story began (as on the Mac before its fix)
+        uint32_t ln = 1, lb = v->is3d ? 0 : l0;
+        if (v->is3d) { uint32_t d = v->d >> lv; ln = d ? d : 1; }
+        else if (nlay > 1) ln = nlay;
+        VkImageView iv = view_get_fmt(v, vf, v->is3d || ln > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, lb, ln, (VkComponentMapping){0, 0, 0, 0}, VK_IMAGE_ASPECT_COLOR_BIT, 2);
+        if (!iv && ln > 1) { ln = 1; iv = view_get_fmt(v, vf, v->is3d ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, lv, 1, lb, 1, (VkComponentMapping){0, 0, 0, 0}, VK_IMAGE_ASPECT_COLOR_BIT, 2); }
         if (!iv) continue;
+        if (!layers || ln < layers) layers = ln;
         if (v->sc != 1.0f) P.sc = v->sc;
         gpu_wrote(v); ca[i].imageView = iv; P.cf[i] = vf; P.cser[i] = t->serial; P.cvf[i] = vf; any = 1; P.cv[i] = v; P.clv[i] = lv; P.cl0[i] = v->is3d ? 0 : l0;
         uint32_t lw = v->w >> lv ? v->w >> lv : 1, lh = v->h >> lv ? v->h >> lv : 1;
@@ -829,6 +837,7 @@ static int pass_begin(void) {
             VkImageView iv = view_get(v, VK_IMAGE_VIEW_TYPE_2D, lv, 1, l0, 1, (VkComponentMapping){0, 0, 0, 0}, fmt_aspects(v->fmt), 2);
             if (iv) {
                 if (v->sc != 1.0f) P.sc = v->sc;
+                layers = 1;   // the depth target is attached with one layer: so is the pass
                 gpu_wrote(v); P.df = v->fmt; any = 1; P.dv = v; P.dlv = lv; P.dl0 = l0;
                 VkImageAspectFlags a = fmt_aspects(v->fmt);
                 if (a & VK_IMAGE_ASPECT_DEPTH_BIT) { da.imageView = iv; P.has_d = 1; }
@@ -850,7 +859,9 @@ static int pass_begin(void) {
     if (!cb_begin()) return 0;
     clears_into_pass(ca, &da, &sa, w, h);
     P.w = w; P.h = h; P.samples = samples ? samples : 1; P.draws0 = g_drawn;
-    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, 1, 0, nc, ca, P.has_d ? &da : NULL, P.has_s ? &sa : NULL};
+    P.layers = layers ? layers : 1;
+    { static int n; if (P.layers > 1 && n++ < 6) LOG("[vk] a layered pass: %ux%u, %u layers (colour serial %llu)", w, h, P.layers, (unsigned long long)P.cser[0]); }
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, P.layers, 0, nc, ca, P.has_d ? &da : NULL, P.has_s ? &sa : NULL};
     g_pass_fs = 0; prof_mark(1, w, h, nc, P.dv != NULL, 0, 0, 0);
     vkCmdBeginRendering_(g_cb, &ri);
     P.open = 1; g_cb_ops++;
