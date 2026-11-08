@@ -320,7 +320,7 @@ typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t ad
 static post_op *g_post; static int g_npost, g_postcap;
 static struct { p_set_rt rt; int has_rt; int64_t copy_stride, copy_img_stride; } R;
 // Staging buffers of this submission (texture uploads and readbacks), freed at commit; readbacks copy into guest memory after the GPU finishes
-typedef struct { VkBuffer b; VkDeviceMemory m; void *p; uint64_t n; uint8_t *rb_dst; size_t rb_row, rb_src_row, rb_rows, rb_n; int dump_fmt, lin_rb; uint32_t dw, dh; char dump_name[160]; uint8_t *orig; int64_t fwo; uint32_t fw_epoch; } stage_t;   // orig, fwo: forwarding (gfx_vk_draw.inc)
+typedef struct { VkBuffer b; VkDeviceMemory m; void *p; uint64_t n, cap; uint8_t *rb_dst; size_t rb_row, rb_src_row, rb_rows, rb_n; int dump_fmt, lin_rb; uint32_t dw, dh; char dump_name[160]; uint8_t *orig; int64_t fwo; uint32_t fw_epoch; } stage_t;   // orig, fwo: forwarding (gfx_vk_draw.inc)
 static void dump_write(const stage_t *s);   // gfx_vk_draw.inc: a frame dump's image (DM debug: L3 + R3 or F12)
 static stage_t *g_stage; static int g_nstage, g_stagecap;
 
@@ -377,10 +377,38 @@ static void view_range(const vtex *v, const view_t *vw, int has, uint32_t *lv, u
     if (*l0 + *nlay > v->layers) *nlay = v->layers - *l0;
 }
 
+// Staging buffers are kept for reuse, by power-of-two size class, instead of being made and freed for each copy: Pokémon Legends: Z-A's submissions in Lumiose had over 500
+// texture uploads and read-backs each, and every one was a vkAllocateMemory, a map and a free (each a trip into the kernel on Turnip); its frames fell to one a second.
+// Up to 256 MB stays cached (DM_VK_STAGE_CACHE_MB; 0 makes and frees each as before)
+typedef struct { VkBuffer b; VkDeviceMemory m; void *p; uint64_t cap; } stage_buf;
+#define SB_CLASSES 48
+static stage_buf *g_sb[SB_CLASSES]; static int g_nsb[SB_CLASSES], g_csb[SB_CLASSES]; static uint64_t g_sb_bytes, g_sb_hits, g_sb_new; static pthread_mutex_t g_sb_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t sb_limit(void) { static int64_t l = -1; if (l < 0) { const char *e = getenv("DM_VK_STAGE_CACHE_MB"); l = (e && *e ? atoll(e) : 256) << 20; } return (uint64_t)l; }
+static int sb_class(uint64_t n) { int c = 12; while (c < SB_CLASSES - 1 && (1ull << c) < n) c++; return c; }
+static void stage_put(VkBuffer b, VkDeviceMemory m, void *p, uint64_t cap) {
+    int c = cap ? sb_class(cap) : -1;
+    pthread_mutex_lock(&g_sb_mu);
+    if (c >= 0 && (1ull << c) == cap && g_sb_bytes + cap <= sb_limit()) {
+        if (g_nsb[c] == g_csb[c]) { g_csb[c] = g_csb[c] ? 2 * g_csb[c] : 16; g_sb[c] = realloc(g_sb[c], g_csb[c] * sizeof *g_sb[c]); }
+        g_sb[c][g_nsb[c]++] = (stage_buf){b, m, p, cap}; g_sb_bytes += cap;
+        pthread_mutex_unlock(&g_sb_mu); return;
+    }
+    pthread_mutex_unlock(&g_sb_mu);
+    vkUnmapMemory_(VK.dev, m); vkDestroyBuffer_(VK.dev, b, NULL); vkFreeMemory_(VK.dev, m, NULL);
+}
 static stage_t *stage_new(uint64_t n) {
     if (g_nstage == g_stagecap) { g_stagecap = g_stagecap ? g_stagecap * 2 : 16; g_stage = realloc(g_stage, g_stagecap * sizeof *g_stage); }
     stage_t *s = &g_stage[g_nstage]; memset(s, 0, sizeof *s);
-    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n ? n : 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    if (sb_limit()) {
+        int c = sb_class(n ? n : 4);
+        pthread_mutex_lock(&g_sb_mu);
+        if (g_nsb[c]) { stage_buf sb = g_sb[c][--g_nsb[c]]; g_sb_bytes -= sb.cap; g_sb_hits++; pthread_mutex_unlock(&g_sb_mu);
+                        s->b = sb.b; s->m = sb.m; s->p = sb.p; s->cap = sb.cap; s->n = n; g_nstage++; return s; }
+        pthread_mutex_unlock(&g_sb_mu);
+        g_sb_new++;
+        if ((1ull << c) <= (64ull << 20)) { s->cap = 1ull << c; }   // a new one of its class's size, to be reused (larger ones are made to measure and freed)
+    }
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, s->cap ? s->cap : n ? n : 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     if (vkCreateBuffer_(VK.dev, &bci, NULL, &s->b)) return NULL;
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements_(VK.dev, s->b, &mr);
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
@@ -680,7 +708,7 @@ static void *cm_thread(void *u) {
 static void slot_clean(subslot *s) {
     if (!s->dirty) return;
     s->dirty = 0;
-    for (int i = 0; i < s->nstage; i++) { stage_t *st = &s->stage[i]; vkUnmapMemory_(VK.dev, st->m); vkDestroyBuffer_(VK.dev, st->b, NULL); vkFreeMemory_(VK.dev, st->m, NULL); free(st->orig); }
+    for (int i = 0; i < s->nstage; i++) { stage_t *st = &s->stage[i]; stage_put(st->b, st->m, st->p, st->cap); free(st->orig); }
     s->nstage = 0;
     if (s->nlw) {
         pthread_mutex_lock(&g_tex_mu);
@@ -895,9 +923,9 @@ static uint64_t sub_commit_locked(int force) {
                 (double)(g_gpu_subs + g_batched) / g_gpu_subs, o ? fw : "none", secs > 0 ? atomic_exchange(&g_wait_sync_ns, 0) / 1e6 / secs : 0.0, secs > 0 ? atomic_exchange(&g_wait_acq_ns, 0) / 1e6 / secs : 0.0, (unsigned long long)g_early_syncs,
                 secs > 0 ? atomic_exchange(&g_wait_flush_ns, 0) / 1e6 / secs : 0.0, secs > 0 ? atomic_exchange(&g_wait_gpu_ns, 0) / 1e6 / secs : 0.0, (unsigned long long)atomic_exchange(&g_wait_gpu_n, 0), (unsigned long long)atomic_exchange(&g_wait_unsub, 0)); g_early_syncs = 0;
             g_gpu_subs = g_batched = 0; memset(g_flush_why, 0, sizeof g_flush_why); }
-        if (g_t_n) LOG("[vk] completion per submission: thread wake-up %.2f ms, after the fence %.2f ms (events and counters %.2f ms, %.0f of them; read-backs into guest memory %.2f ms, %.2f MB, the slowest %.1f ms for %.2f MB; storage write-backs %.2f ms, %.2f MB)",
+        if (g_t_n) LOG("[vk] completion per submission: thread wake-up %.2f ms, after the fence %.2f ms (events and counters %.2f ms, %.0f of them; read-backs into guest memory %.2f ms, %.2f MB, the slowest %.1f ms for %.2f MB; storage write-backs %.2f ms, %.2f MB; staging buffers reused %llu, made %llu, %.0f MB cached)",
                        g_t_wake / 1e6 / g_t_n, g_t_land / 1e6 / g_t_n, g_t_post / 1e6 / g_t_n, (double)g_n_post / g_t_n, g_t_stage / 1e6 / g_t_n, g_b_stage / 1048576.0 / g_t_n, g_t_stage_max / 1e6, g_b_stage_max / 1048576.0,
-                       g_t_wb / 1e6 / g_t_n, g_b_wb / 1048576.0 / g_t_n);
+                       g_t_wb / 1e6 / g_t_n, g_b_wb / 1048576.0 / g_t_n, (unsigned long long)g_sb_hits, (unsigned long long)g_sb_new, g_sb_bytes / 1048576.0); g_sb_hits = g_sb_new = 0;
         g_t_wake = g_t_land = g_t_post = g_n_post = g_t_stage = g_t_wb = g_b_stage = g_b_wb = g_t_stage_max = g_b_stage_max = 0;
         g_wb_bytes = g_wb_changed = 0;
         if (g_hz[0].line) { char hb[400]; int o = 0; for (int i = 0; i < 16 && g_hz[i].line && o < 380; i++) o += snprintf(hb + o, sizeof hb - o, "%s%s:%d: %llu waits, %.1f ms, %llu bytes read each", i ? "; " : "", strrchr(g_hz[i].file, '/') ? strrchr(g_hz[i].file, '/') + 1 : g_hz[i].file, g_hz[i].line,
