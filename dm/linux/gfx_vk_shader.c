@@ -138,11 +138,12 @@ static int g_logged_missing;
 // A program's shaders, modules, set layouts and pipeline layout. gs_class >= 0: its geometry shader is the translator's ordinary one for that input topology
 // (spv_pack.py packs <key>_g<t> under key ^ GVAR * (t + 1)), not the base translation, which uses NVIDIA's passthrough geometry shaders
 #define GVAR 0x9E3779B97F4A7C15ull
-static vks_prog *prog_build(const prog_t *p, uint64_t serial, int gs_class) {
-    vks_prog *r = calloc(1, sizeof *r); r->serial = serial; r->ok = 1; r->gs_class = gs_class; r->prog = p;
-    for (unsigned st = 0; st < p->nstage && st < 6; st++) {
-        uint8_t kb[8]; if (!prog_key(p, st, kb)) continue;
-        uint64_t key = 0; for (int j = 0; j < 8; j++) key = key << 8 | kb[j];
+static vks_prog *prog_build_k(const uint64_t *keys, unsigned nk, uint64_t serial, int gs_class) {
+    vks_prog *r = calloc(1, sizeof *r); r->serial = serial; r->ok = 1; r->gs_class = gs_class;
+    for (unsigned st = 0; st < nk && st < 6; st++) r->keys[st] = keys[st];
+    r->nkeys = nk < 6 ? nk : 6;
+    for (unsigned st = 0; st < nk && st < 6; st++) {
+        uint64_t key = keys[st]; if (!key) continue;
         const vks_shader *s = find_locked(key);
         if (!s) {
             r->ok = 0; g_missing++;
@@ -187,6 +188,12 @@ static vks_prog *prog_build(const prog_t *p, uint64_t serial, int gs_class) {
     }
     return r;
 }
+static vks_prog *prog_build(const prog_t *p, uint64_t serial, int gs_class) {
+    uint64_t keys[6] = {0}; unsigned n = p->nstage < 6 ? p->nstage : 6;
+    for (unsigned st = 0; st < n; st++) { uint8_t kb[8]; if (!prog_key(p, st, kb)) continue; for (int j = 0; j < 8; j++) keys[st] = keys[st] << 8 | kb[j]; }
+    vks_prog *r = prog_build_k(keys, n, serial, gs_class); r->prog = p;
+    return r;
+}
 static vks_prog *cache_find(uint64_t serial, uint32_t *slot) {
     uint32_t i = (uint32_t)(serial * 0x9E3779B97F4A7C15ull >> 50) & (PR_CAP - 1);
     for (uint32_t k = 0; k < PR_CAP; k++, i = (i + 1) & (PR_CAP - 1)) {
@@ -227,8 +234,36 @@ const vks_prog *vks_prog_topology(const vks_prog *base, int cls) {
         static int n; int say = n++ < 30;
         if (say) { LOG("[vk] building a geometry program for input topology %d (vertex %016llx, geometry %016llx, fragment %016llx)", cls, base->st[VKS_VS] ? (unsigned long long)base->st[VKS_VS]->key : 0ull,
                        base->st[VKS_GS] ? (unsigned long long)base->st[VKS_GS]->key : 0ull, base->st[VKS_FS] ? (unsigned long long)base->st[VKS_FS]->key : 0ull); fflush(stderr); }
-        r = prog_build(base->prog, serial, cls); cache_put(slot, r);
+        r = prog_build_k(base->keys, (unsigned)base->nkeys, serial, cls); r->prog = base->prog; cache_put(slot, r);
         if (say) { LOG("[vk] geometry program built: %s", r->ok ? "ok" : "failed"); fflush(stderr); }
+    }
+    pthread_mutex_unlock(&g_mu);
+    return r->ok ? r : NULL;
+}
+// NVN's BindProgram(program, stage bits) binds per stage: the stages in the bits take that program's shaders (a null program unbinds them), the others stay. The replay used to take
+// the program as a whole, and a bind of one stage (or a null program for one stage) left draws with no program: skipped as "shaders not ready" (Pokémon Legends: Z-A, about
+// 19 draws a frame, its character skinning among them). As nvn_mtl.m bind_stages: when every stage comes from one program it is that program; otherwise a program is made of
+// each stage's shader from the program bound there, cached by those shaders' keys
+const vks_prog *vks_bind_gfx(const void *prog, int stages, const vks_prog *pr) {
+    static const vks_prog *bpr[5]; static const void *bp[5];   // per NVN stage bit: vertex, fragment, geometry, tessellation control, evaluation
+    static const int model_of[5] = {VKS_VS, VKS_FS, VKS_GS, VKS_TCS, VKS_TES};
+    for (int i = 0; i < 5; i++) if (stages >> i & 1) { bp[i] = prog; bpr[i] = prog ? pr : NULL; }
+    if (!bp[0]) return NULL;
+    int same = 1; for (int i = 1; i < 5; i++) if (bp[i] != bp[0]) same = 0;
+    if (same) return bpr[0];
+    uint64_t keys[6] = {0}, ser = 0xcbf29ce484222325ull; unsigned n = 0;
+    for (int i = 0; i < 5; i++) {
+        const vks_shader *s = bpr[i] ? bpr[i]->st[model_of[i]] : NULL;
+        if (!s) continue;
+        keys[n++] = s->key; ser = (ser ^ s->key) * 0x100000001b3ull; ser = (ser ^ (uint64_t)i) * 0x100000001b3ull;
+    }
+    if (!n || !bpr[0] || !bpr[0]->st[VKS_VS]) return NULL;
+    ser |= 3ull << 62;
+    pthread_mutex_lock(&g_mu);
+    uint32_t slot; vks_prog *r = cache_find(ser, &slot);
+    if (!r) {
+        r = prog_build_k(keys, n, ser, -1); g_progs++; cache_put(slot, r);
+        static int c; if (c++ < 4) LOG("[vk] per-stage program binding: a program made of the vertex shader %016llx and %u other stage(s) bound apart (%s)", (unsigned long long)bpr[0]->st[VKS_VS]->key, n - 1, r->ok ? "ok" : "failed");
     }
     pthread_mutex_unlock(&g_mu);
     return r->ok ? r : NULL;

@@ -560,7 +560,11 @@ static void mtl_exec_body(const uint8_t *p) {
         case OP_COPY_T2T: if (VK.ok) { pass_end(); copy_t2t((const p_copy_t2t *)a); } break;
         case OP_BIND_PROGRAM: if (VK.ok) {
             const p_bind_program *b = (const p_bind_program *)a; const vks_prog *pr = vks_prog_get(b->prog);
-            if (pr && pr->compute) g_cs_prog = pr; else if (pr || !(b->stages & NVN_SHADER_STAGE_COMPUTE_BIT)) g_gfx_prog = pr; else g_cs_prog = NULL;
+            if (pr && pr->compute) g_cs_prog = pr;
+            else {
+                if ((b->stages & NVN_SHADER_STAGE_COMPUTE_BIT) && !pr) g_cs_prog = NULL;
+                if (b->stages & NVN_SHADER_STAGE_ALL_GRAPHICS_BITS) g_gfx_prog = vks_bind_gfx(b->prog, b->stages & NVN_SHADER_STAGE_ALL_GRAPHICS_BITS, pr);   // per stage (gfx_vk_shader.c)
+            }
         } break;
         case OP_DRAW: case OP_DRAW_IDX: case OP_MULTI_DRAW: g_draws++; if (g_gfx_prog) g_draws_ready++; if (VK.ok && g_draw_on) draw_op(h.op, a, h.size); break;
         case OP_DRAW_TEX: g_draws++; break;
