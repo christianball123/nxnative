@@ -296,8 +296,19 @@ export DM_WINDOW=1 DM_FULLSCREEN="${{DM_FULLSCREEN:-1}}"
 # does not have. DM_FOSSILIZE=1 keeps it
 [ "${{DM_FOSSILIZE:-0}}" = 1 ] || export DISABLE_VK_LAYER_VALVE_steam_fossilize_1=1
 echo "starting the game (DISPLAY=$DISPLAY WAYLAND_DISPLAY=$WAYLAND_DISPLAY XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR)"
-if [ "$cpu_on" = 1 ]; then ./run.sh "$@"; exit $?; fi
-exec ./run.sh "$@"
+# A memory guard: the game runs in a systemd scope capped at 75 % of the RAM and 3 GB of swap, so when it outgrows the machine the kernel stops the game, not the whole system
+# (Ocarina of Time's first scene froze the AYN Thor until it was restarted). DM_MEM_GUARD=0 runs without it; DM_MEM_MAX / DM_SWAP_MAX set the caps (systemd sizes, e.g. 8G)
+runner="./run.sh"
+if [ "${{DM_MEM_GUARD:-1}}" = 1 ] && command -v systemd-run >/dev/null 2>&1; then
+    tot=$(awk '/MemTotal/ {{print int($2 / 1024)}}' /proc/meminfo)
+    mmax="${{DM_MEM_MAX:-$((tot * 3 / 4))M}}"; smax="${{DM_SWAP_MAX:-3G}}"
+    if systemd-run --user --scope --quiet -p MemoryMax=1G true >/dev/null 2>&1; then
+        echo "memory guard: the game may use $mmax of RAM and $smax of swap (DM_MEM_GUARD=0 turns it off)"
+        runner="systemd-run --user --scope --quiet -p MemoryMax=$mmax -p MemorySwapMax=$smax ./run.sh"
+    else echo "memory guard: systemd-run --user does not work here; running without it"; fi
+fi
+if [ "$cpu_on" = 1 ]; then $runner "$@"; st=$?; [ $st = 137 ] && echo "the game was stopped by the memory guard (out of memory)"; exit $st; fi
+exec $runner "$@"
 ''')
     play.chmod(0o755)
     say(f'\ndone. Run it with:\n  {script}\nthen send me {lw / "log.txt"}')
