@@ -798,8 +798,9 @@ static void slot_handover(subslot *P, uint64_t id, int failed) {
     SWP(g_pq, P->pq); SWP(g_npq, P->npq); SWP(g_pm, P->pm); SWP(g_npm, P->npm);
     SWP(RG.base, P->ring_base);   // the GPU reads its ring part until it completes: the recording goes on in the completed slot's part
     P->id = id; P->dirty = 1; P->failed = failed;
-    P->cpu_out = P->nwb > 0; for (int i = 0; i < P->nstage && !P->cpu_out; i++) if (P->stage[i].rb_dst && !P->stage[i].lin_rb) P->cpu_out = 3;
-    if (P->nwb) P->cpu_out = 1; else if (!P->cpu_out && P->nlw) P->cpu_out = 2;
+    int cpu_wb = 0; for (int i = 0; i < P->nwb; i++) if (!P->wb[i].gpu_only) { cpu_wb = 1; break; }   // transform feedback captures do not make a sync wait
+    P->cpu_out = cpu_wb; for (int i = 0; i < P->nstage && !P->cpu_out; i++) if (P->stage[i].rb_dst && !P->stage[i].lin_rb) P->cpu_out = 3;
+    if (cpu_wb) P->cpu_out = 1; else if (!P->cpu_out && P->nlw) P->cpu_out = 2;
     // linear textures it reads back: written again by a later submission, they are read back with that one too
     if (P->nlw > P->clws) { P->clws = P->clw; P->lws = realloc(P->lws, P->clws * sizeof *P->lws); }
     for (int i = 0; i < P->nlw; i++) { P->lws[i] = P->lw[i]->serial; P->lw[i]->wrote = 0; }

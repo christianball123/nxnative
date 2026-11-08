@@ -80,14 +80,15 @@ void ring_forget(uint64_t addr, uint64_t n) {
 // Storage buffers shaders wrote in this submission: copied back into guest memory when it completes, so the game (and the next submission's copies) see the results
 // Only the bytes the GPU changed go back (orig: the copy as recorded): the submission completes while the game runs on, and the rest of the buffer may hold what the CPU
 // wrote since (the next frame's data); writing the whole range back put the old bytes over it
-typedef struct { uint64_t addr, size, off; uint8_t *orig; int64_t fwo; uint32_t fw_epoch; } wback;   // fwo: its copy in the forwarding buffer (-1: none)
+typedef struct { uint64_t addr, size, off; uint8_t *orig; int64_t fwo; uint32_t fw_epoch; int gpu_only; } wback;   // gpu_only: only the GPU reads it (transform feedback): a sync does not wait for it   // fwo: its copy in the forwarding buffer (-1: none)
 static wback *g_wb; static int g_nwb, g_cwb; static uint64_t g_wb_bytes, g_wb_changed;
-static void wb_add(uint64_t addr, uint64_t size, uint64_t off) {
-    for (int i = 0; i < g_nwb; i++) if (g_wb[i].addr == addr && g_wb[i].size == size) return;
+static void wb_add_(uint64_t addr, uint64_t size, uint64_t off, int gpu_only) {
+    for (int i = 0; i < g_nwb; i++) if (g_wb[i].addr == addr && g_wb[i].size == size) { if (!gpu_only) g_wb[i].gpu_only = 0; return; }
     if (g_nwb == g_cwb) { g_cwb = g_cwb ? 2 * g_cwb : 64; g_wb = realloc(g_wb, g_cwb * sizeof *g_wb); }
     uint8_t *o = malloc(size); if (o) memcpy(o, RG.p + off, size);
-    g_wb[g_nwb++] = (wback){addr, size, off, o, -1, 0};
+    g_wb[g_nwb++] = (wback){addr, size, off, o, -1, 0, gpu_only};
 }
+#define wb_add(a, n, o) wb_add_((a), (n), (o), 0)
 // A range inside one a shader of this submission writes (transform feedback's captured vertices, read next as a vertex buffer at its own address and size): the ring offset of
 // that copy, so the draw reads what the GPU wrote and not the guest's old bytes. Only at a 256-byte step from its start (a buffer descriptor's offset must be aligned); ~0: none
 static uint64_t g_wb_within;
@@ -1644,7 +1645,7 @@ static void do_draw(const draw_args *a) {
         static uint64_t no_ext; if (!VK.f_xfb) { if (!no_ext++) LOG("[RED] [vk] a draw captures vertices (transform feedback) and this GPU has no VK_EXT_transform_feedback: drawn without capturing"); }
         else for (int b = 0; b < 4; b++) if (vs->xfb[b] && D.tf[b].addr && D.tf[b].size > D.tf_off[b] && D.tf[b].size <= (32ull << 20)) {
             uint64_t ro = ring_put(D.tf[b].addr, D.tf[b].size); if (ro == ~0ull) { g_skip[SK_RING]++; continue; }
-            wb_add(D.tf[b].addr, D.tf[b].size, ro);
+            wb_add_(D.tf[b].addr, D.tf[b].size, ro, 1);   // the captured vertices go back to guest memory, but only the GPU reads them: a sync need not wait (the replay's own reads still do, pend_hazard)
             VkDeviceSize o = ro + D.tf_off[b], sz = D.tf[b].size - D.tf_off[b];
             VK.xfb_bind(g_cb, (uint32_t)b, 1, &RG.b, &o, &sz); xfb |= 1 << b;
         }
