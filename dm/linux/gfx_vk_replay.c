@@ -607,7 +607,7 @@ typedef struct {
 } subslot;
 static subslot g_sl[NSUB - 1] = {{.dp = g_dp_store[1], .pm = g_pm_store[1], .ring_base = RING_PART, .idx = 0}, {.dp = g_dp_store[2], .pm = g_pm_store[2], .ring_base = 2 * RING_PART, .idx = 1}};
 static pthread_mutex_t g_cm_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cm_done, g_cm_work; static int g_cm_started, g_async = -1, g_inflight = 2;
-static uint64_t g_t_gpu, g_t_land, g_t_wake, g_t_post, g_n_post;   // the completion thread's waits for the GPU (how long submissions ran after their hand-over)
+static uint64_t g_t_gpu, g_t_land, g_t_wake, g_t_post, g_n_post, g_t_stage, g_t_wb, g_b_stage, g_b_wb, g_t_stage_max, g_b_stage_max;   // stage / wb: read-backs into guest memory and storage write-backs (time, bytes, the slowest one)   // the completion thread's waits for the GPU (how long submissions ran after their hand-over)
 static void cm_init(void) {
     pthread_condattr_t ca; pthread_condattr_init(&ca); pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
     pthread_cond_init(&g_cm_done, &ca); pthread_cond_init(&g_cm_work, NULL); pthread_condattr_destroy(&ca);
@@ -638,11 +638,13 @@ static void slot_land(subslot *s) {
     uint64_t tl = mono_ns();
     prof_collect(s->pq, s->npq, s->pm, s->npm);
     for (int i = 0; i < s->nstage; i++) {
-        stage_t *st = &s->stage[i];
-        if (st->rb_dst) { dm_guest_write_prepare(st->rb_dst, (st->rb_rows - 1) * st->rb_row + st->rb_n); for (size_t r = 0; r < st->rb_rows; r++) memcpy(st->rb_dst + r * st->rb_row, (uint8_t *)st->p + r * st->rb_src_row, st->rb_n); }
+        stage_t *st = &s->stage[i]; uint64_t t1 = mono_ns();
+        if (st->rb_dst) { uint64_t n = (st->rb_rows - 1) * st->rb_row + st->rb_n; dm_guest_write_prepare(st->rb_dst, n); for (size_t r = 0; r < st->rb_rows; r++) memcpy(st->rb_dst + r * st->rb_row, (uint8_t *)st->p + r * st->rb_src_row, st->rb_n); g_b_stage += n;
+                          uint64_t d = mono_ns() - t1; if (d > g_t_stage_max) { g_t_stage_max = d; g_b_stage_max = n; } }
         if (st->dump_fmt) dump_write(st);
+        g_t_stage += mono_ns() - t1;
     }
-    for (int i = 0; i < s->nwb; i++) wb_land(&s->wb[i]);
+    { uint64_t t1 = mono_ns(); for (int i = 0; i < s->nwb; i++) { wb_land(&s->wb[i]); g_b_wb += s->wb[i].size; } g_t_wb += mono_ns() - t1; }
     // its events and counters, in record order
     uint64_t now = gpu_ticks(), tp = mono_ns(); g_n_post += s->npost;
     for (int i = 0; i < s->npost; i++) {
@@ -893,9 +895,10 @@ static uint64_t sub_commit_locked(int force) {
                 (double)(g_gpu_subs + g_batched) / g_gpu_subs, o ? fw : "none", secs > 0 ? atomic_exchange(&g_wait_sync_ns, 0) / 1e6 / secs : 0.0, secs > 0 ? atomic_exchange(&g_wait_acq_ns, 0) / 1e6 / secs : 0.0, (unsigned long long)g_early_syncs,
                 secs > 0 ? atomic_exchange(&g_wait_flush_ns, 0) / 1e6 / secs : 0.0, secs > 0 ? atomic_exchange(&g_wait_gpu_ns, 0) / 1e6 / secs : 0.0, (unsigned long long)atomic_exchange(&g_wait_gpu_n, 0), (unsigned long long)atomic_exchange(&g_wait_unsub, 0)); g_early_syncs = 0;
             g_gpu_subs = g_batched = 0; memset(g_flush_why, 0, sizeof g_flush_why); }
-        if (g_t_n) LOG("[vk] completion per submission: thread wake-up %.2f ms, after the fence %.2f ms (events and counters %.2f ms, %.0f of them)", g_t_wake / 1e6 / g_t_n, g_t_land / 1e6 / g_t_n,
-                       g_t_post / 1e6 / g_t_n, (double)g_n_post / g_t_n);
-        g_t_wake = g_t_land = g_t_post = g_n_post = 0;
+        if (g_t_n) LOG("[vk] completion per submission: thread wake-up %.2f ms, after the fence %.2f ms (events and counters %.2f ms, %.0f of them; read-backs into guest memory %.2f ms, %.2f MB, the slowest %.1f ms for %.2f MB; storage write-backs %.2f ms, %.2f MB)",
+                       g_t_wake / 1e6 / g_t_n, g_t_land / 1e6 / g_t_n, g_t_post / 1e6 / g_t_n, (double)g_n_post / g_t_n, g_t_stage / 1e6 / g_t_n, g_b_stage / 1048576.0 / g_t_n, g_t_stage_max / 1e6, g_b_stage_max / 1048576.0,
+                       g_t_wb / 1e6 / g_t_n, g_b_wb / 1048576.0 / g_t_n);
+        g_t_wake = g_t_land = g_t_post = g_n_post = g_t_stage = g_t_wb = g_b_stage = g_b_wb = g_t_stage_max = g_b_stage_max = 0;
         g_wb_bytes = g_wb_changed = 0;
         if (g_hz[0].line) { char hb[400]; int o = 0; for (int i = 0; i < 16 && g_hz[i].line && o < 380; i++) o += snprintf(hb + o, sizeof hb - o, "%s%s:%d: %llu waits, %.1f ms, %llu bytes read each", i ? "; " : "", strrchr(g_hz[i].file, '/') ? strrchr(g_hz[i].file, '/') + 1 : g_hz[i].file, g_hz[i].line,
                 (unsigned long long)g_hz[i].n, g_hz[i].ns / 1e6, (unsigned long long)(g_hz[i].bytes / g_hz[i].n));
