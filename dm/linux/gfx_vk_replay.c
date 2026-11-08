@@ -989,9 +989,10 @@ static int wait_timed(uint64_t fence, uint64_t timeout_ns) {
     static _Atomic int nlog;
     int nl = atomic_fetch_add(&nlog, 1);
     if (nl < 4 || nl % 500 == 0) {   // why this sync waits for the GPU (the first few, then one in 500)
-        char sl[256]; int o = 0;
-        for (int i = 0; i < NSUB - 1; i++) o += snprintf(sl + o, sizeof sl - o, " [slot %d: submission %llu, %s, read-backs kind %d, %d stages, %d write-backs, %d linear]", i, (unsigned long long)g_sl[i].id,
-                                                          atomic_load(&g_pr[i].busy) ? "in flight" : "done", g_sl[i].cpu_out, g_sl[i].nstage, g_sl[i].nwb, g_sl[i].nlw);
+        char sl[512]; int o = 0;
+        for (int i = 0; i < NSUB - 1; i++) { int ngo = 0; for (int k = 0; k < g_sl[i].nwb; k++) ngo += g_sl[i].wb[k].gpu_only;
+            o += snprintf(sl + o, sizeof sl - o, " [slot %d: submission %llu, %s, read-backs kind %d, %d stages, %d write-backs (%d GPU-only), %d linear]", i, (unsigned long long)g_sl[i].id,
+                          atomic_load(&g_pr[i].busy) ? "in flight" : "done", g_sl[i].cpu_out, g_sl[i].nstage, g_sl[i].nwb, ngo, g_sl[i].nlw); }
         LOG("[vk] a sync waits for the GPU: fence %llu, handed over %llu, completed %llu, early mode %s;%s", (unsigned long long)fence, (unsigned long long)atomic_load(&g_fence),
             (unsigned long long)atomic_load(&g_done), getenv("DM_VK_EARLY_SYNC") ? getenv("DM_VK_EARLY_SYNC") : "default", sl);
     }

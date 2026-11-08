@@ -116,15 +116,46 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
         if (i <= q && st == PG_BUSY) release_page(r, i, count);   // another thread is changing it: wait, then unprotect it if it ended up protected
     }
 }
+// The ranges sorted by base, for the host pre-write: it used to test every slot in use for each write, and the Linux replay's storage write-backs (Pokémon Legends: Z-A, about
+// 450 a submission, each against all of its pools) spent 30 ms a submission there. The index holds every slot below g_nr (dead ones too: each use still checks live and the
+// range's own bounds), is rebuilt when a range is (re)registered (g_ix_want), and is read under a read lock; the page-fault path does not use it
+typedef struct { uintptr_t base, end; int i; } ix_ent;
+static _Atomic uint64_t g_ix_want = 1; static uint64_t g_ix_have; static ix_ent *g_ix; static uintptr_t *g_ix_max; static int g_nix, g_ix_cap;
+static pthread_rwlock_t g_ix_rw = PTHREAD_RWLOCK_INITIALIZER;
+static int ix_cmp(const void *x, const void *y) { uintptr_t a = ((const ix_ent *)x)->base, b = ((const ix_ent *)y)->base; return a < b ? -1 : a > b; }
+static void ix_rebuild(uint64_t want) {   // under the write lock
+    int n = atomic_load(&g_nr);
+    if (n > g_ix_cap) { g_ix_cap = n + 1024; g_ix = realloc(g_ix, g_ix_cap * sizeof *g_ix); g_ix_max = realloc(g_ix_max, g_ix_cap * sizeof *g_ix_max); if (!g_ix || !g_ix_max) die("dirty-page index allocation failed"); }
+    for (int i = 0; i < n; i++) { range_t *r = rg(i); g_ix[i] = (ix_ent){r->base, r->end, i}; }
+    qsort(g_ix, (size_t)n, sizeof *g_ix, ix_cmp);
+    uintptr_t m = 0; for (int i = 0; i < n; i++) { if (g_ix[i].end > m) m = g_ix[i].end; g_ix_max[i] = m; }   // the largest end among the first i + 1: the backward walk stops where nothing reaches the address
+    g_nix = n; g_ix_have = want;
+}
+static void prep_range(range_t *r, uintptr_t a, uintptr_t e) {
+    if (e <= r->base || a >= r->end) return;
+    uintptr_t lo = a > r->base ? a : r->base, hi = e < r->end ? e : r->end;
+    release_pages(r, (lo - r->base) >> g_shift, (hi - 1 - r->base) >> g_shift, &g_preps);
+}
 static void prep_write(void *addr, size_t len) {
-    uintptr_t a = (uintptr_t)addr, e = a + len; int n = atomic_load(&g_nr);
+    uintptr_t a = (uintptr_t)addr, e = a + len;
     if (!len) return;
-    for (int i = 0; i < n; i++) {
-        range_t *r = rg(i);
-        if (!live_at(i) || e <= r->base || a >= r->end) continue;
-        uintptr_t lo = a > r->base ? a : r->base, hi = e < r->end ? e : r->end;
-        release_pages(r, (lo - r->base) >> g_shift, (hi - 1 - r->base) >> g_shift, &g_preps);
+    uint64_t want = atomic_load(&g_ix_want);
+    pthread_rwlock_rdlock(&g_ix_rw);
+    if (g_ix_have != want) {
+        pthread_rwlock_unlock(&g_ix_rw); pthread_rwlock_wrlock(&g_ix_rw);
+        if (g_ix_have != want) ix_rebuild(want);
+        pthread_rwlock_unlock(&g_ix_rw); pthread_rwlock_rdlock(&g_ix_rw);
     }
+    int lo = 0, hi = g_nix;   // the entries with base < e are [0, lo)
+    while (lo < hi) { int mid = (lo + hi) / 2; if (g_ix[mid].base < e) lo = mid + 1; else hi = mid; }
+    for (int j = lo - 1; j >= 0 && g_ix_max[j] > a; j--) {
+        int i = g_ix[j].i;
+        if (g_ix[j].end > a && live_at(i)) prep_range(rg(i), a, e);
+    }
+    // Ranges registered after the index was taken (their slot past it, or a slot reused since): checked directly
+    int n = atomic_load(&g_nr);
+    for (int i = g_nix; i < n; i++) if (live_at(i)) prep_range(rg(i), a, e);
+    pthread_rwlock_unlock(&g_ix_rw);
 }
 
 void nvn_dirty_add_range(const void *mem, size_t size) {
@@ -166,6 +197,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen;
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
+    atomic_fetch_add(&g_ix_want, 1);   // the pre-write index takes this range (prep_write)
     pthread_mutex_unlock(&g_slot_mu);
 }
 // Pool destruction: first restore still-protected pages to writable (the pool memory may be reused for something else once returned to the game), then mark invalid
