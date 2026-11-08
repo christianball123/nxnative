@@ -861,6 +861,17 @@ static uint64_t sub_commit_locked(int force) {
         }
         LOG("[vk] memory: textures alive %llu (%.0f MB), process resident %.2f GB, system available %.2f GB, swap free %.2f GB", (unsigned long long)g_tex_live, g_tex_live_bytes / 1048576.0,
             rss_kb / 1048576.0, avail_kb / 1048576.0, swapf_kb / 1048576.0);
+        {   // where the memory is (Linux): the process's anonymous, file and shared (the guest's memory files) pages and what of it is in swap; the system's shared and cached memory,
+            // and the host's staging buffers alive. Ocarina of Time's first scene on the AYN Thor filled its swap with 1 GB of textures alive
+            long ka = 0, kf = 0, ks = 0, kw = 0, msh = 0, mca = 0, mtot = 0, stot = 0; char ln[256];
+            FILE *fs = fopen("/proc/self/status", "r");
+            if (fs) { while (fgets(ln, sizeof ln, fs)) { sscanf(ln, "RssAnon: %ld", &ka); sscanf(ln, "RssFile: %ld", &kf); sscanf(ln, "RssShmem: %ld", &ks); sscanf(ln, "VmSwap: %ld", &kw); } fclose(fs); }
+            FILE *fm = fopen("/proc/meminfo", "r");
+            if (fm) { while (fgets(ln, sizeof ln, fm)) { sscanf(ln, "Shmem: %ld", &msh); sscanf(ln, "Cached: %ld", &mca); sscanf(ln, "MemTotal: %ld", &mtot); sscanf(ln, "SwapTotal: %ld", &stot); } fclose(fm); }
+            uint64_t sb = 0; for (uint32_t i = 0; i < g_nstage; i++) sb += g_stage[i].n;
+            LOG("[vk] memory in detail: process anonymous %.2f GB, file %.2f GB, shared %.2f GB, in swap %.2f GB; system total %.2f GB, shared %.2f GB, cached %.2f GB, swap total %.2f GB; staging buffers %u (%.0f MB)",
+                ka / 1048576.0, kf / 1048576.0, ks / 1048576.0, kw / 1048576.0, mtot / 1048576.0, msh / 1048576.0, mca / 1048576.0, stot / 1048576.0, g_nstage, sb / 1048576.0);
+        }
         LOG("[vk] replay: %llu submissions; draws %llu (%llu with their shaders ready), dispatches %llu (%llu ready); programs %llu, shaders missing %llu, refused %llu; %s",
             (unsigned long long)f, (unsigned long long)g_draws, (unsigned long long)g_draws_ready, (unsigned long long)g_dispatches, (unsigned long long)g_disp_ready,
             (unsigned long long)np, (unsigned long long)nm, (unsigned long long)nf, ds);
