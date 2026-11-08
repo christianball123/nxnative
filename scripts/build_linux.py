@@ -13,6 +13,7 @@
 #   python3 scripts/build_linux.py ~/Games/MarioTennisFever.nup
 #   python3 scripts/build_linux.py ~/Games/MarioTennisFever            (a dump folder: base/exefs, base/romfs, updates/...)
 #   python3 scripts/build_linux.py <game> --version 0 --work-dir ~/Games/MTF_build
+#   python3 scripts/build_linux.py ~/Games/PokemonZA --shaders   (a folder of NSPs: base game, update, DLC; prod.keys from ~/.switch/prod.keys or --keys)
 # Then run the script it prints, and send the log (<work>/linux/log.txt).
 #
 # Needs: python3 (3.14, or pip install backports.zstd), capstone 5 (pip install 'capstone>=5,<6'), clang, lld, make. On ArmadaOS do this inside a toolbox:
@@ -45,8 +46,55 @@ def check_tools():
         if not shutil.which(t): die(f'{t} is not installed (inside the toolbox: sudo dnf install -y clang lld make)')
 
 
-def unpack(game, version, work):
+PACKAGES = ('.nsp', '.xci', '.nsz', '.xcz')
+KEY_PLACES = ('~/.switch/prod.keys', '~/.config/nxnative/prod.keys', '~/prod.keys')   # where prod.keys is looked for when --keys names none (the game folder first)
+
+
+def find_keys(game, given):
+    if given:
+        k = given.expanduser().resolve()
+        if not k.is_file(): die(f'{k}: no such file (--keys)')
+        return k
+    for k in [game / 'prod.keys'] + [Path(p).expanduser() for p in KEY_PLACES]:
+        if k.is_file(): say(f'keys: {k}'); return k.resolve()
+    die('NSP / XCI files need your prod.keys: put it at ~/.switch/prod.keys (or in the game folder), or name it with --keys. It is only used to unpack the game; the built game does not need it')
+
+
+def unpack_nsp(game, version, work, keys):
+    # A folder of NSPs (Switch 1 games: the base game, its updates and DLC) through the NSP script's own steps: every package by its content meta (nx_extract --contents),
+    # NSZ / XCZ converted with nsz, the base game + the chosen update into extract/v<version>/ (ExeFS + RomFS.img), every DLC into aoc/<index>.img. nx_extract needs the .NET 10 SDK
+    import build_ipa_from_nsp as B
+    if not shutil.which('dotnet'): die('unpacking NSPs needs the .NET 10 SDK: sudo dnf install -y dotnet-sdk-10.0 (in the toolbox), then build again')
+    env = B.tool_env(); B.configure_dotnet(env)
+    try:
+        with B.package_reader(REPO, keys, env) as rd:
+            app, fam = B.scan_nsps(game, rd.contents)
+            rd.check_keys(fam)
+        work = work or game / f'{app:016X}_build'
+        logs = work / 'logs'; logs.mkdir(parents=True, exist_ok=True)
+        fam = B.decompress_nsz(game, app, fam, keys, env, work)
+        have = B.nsp_versions(fam)   # {'v0': None, 'v393216': update NSP, ...}
+        name = f'v{version}' if version is not None else max(have, key=B.vnum)
+        if name not in have: die(f'no update {name} in {game} (have: {", ".join(sorted(have, key=B.vnum))})')
+        upd = have[name]
+        say(f'{app:016X}: base game {fam["base"].name}' + (f', update {name}: {upd.name}' if upd else ' alone') + (f', {len(fam["dlc"])} DLC' if fam['dlc'] else ''))
+        nx = B.build_nx_extract(REPO, work, logs, env)
+        out = work / 'extract' / name
+        if (out / 'ExeFS' / 'main').is_file() and (out / 'RomFS.img').is_file(): say(f'reusing the unpacked {name}: {out}')
+        else:
+            tmp = out.with_name(name + '.partial'); shutil.rmtree(tmp, ignore_errors=True); out.parent.mkdir(parents=True, exist_ok=True)
+            say(f'unpacking {name} (the RomFS image is as big as the game: a few minutes)')
+            B.run([nx, keys, fam['base'], upd or '-', tmp, '--romfs-image'] + B.extract_flags(app), logs / f'extract_{name}.log', env=env)
+            shutil.rmtree(out, ignore_errors=True); tmp.rename(out)
+        if fam['dlc']: B.extract_aoc(nx, keys, REPO, work, app, fam, logs)
+    except B.BuildError as e: die(str(e))
+    return f'{app:016X}', B.vnum(name), work, out
+
+
+def unpack(game, version, work, keys=None):
     import pack_nup, pack_dump
+    if game.is_dir() and not any(p.suffix.lower() == '.nup' for p in game.iterdir()) and any(p.suffix.lower() in PACKAGES and p.is_file() for p in game.iterdir()):
+        return unpack_nsp(game, version, work, find_keys(game, keys))
     if game.is_file() and pack_nup.is_nup(game) or game.is_dir() and any(p.suffix.lower() == '.nup' for p in game.iterdir()):
         if pack_nup.zstd is None: die(f'reading a .nup needs the zstd module: use Python 3.14, or {sys.executable} -m pip install --user backports.zstd')
         nup = game if game.is_file() else next(p for p in game.iterdir() if p.suffix.lower() == '.nup')
@@ -79,12 +127,15 @@ def unpack(game, version, work):
     die(f'{game}: neither a .nup file nor a dump folder')
 
 
-def shaders(tid, ver, ext, exefs, nro_dir, lw, env, jobs, retranslate=False):
+def shaders(tid, ver, ext, exefs, nro_dir, lw, env, jobs, retranslate=False, patched=None):
     # Graphics stage C: the game's shaders split out of its files (dm/gfx/tools/shader_split.py, as the NSP script does) and translated to SPIR-V (dm/linux/tools/spv_build.py)
     if not shutil.which('dotnet'): die('the shader step needs the .NET 10 runtime: sudo dnf install -y dotnet-runtime-10.0 (in the toolbox), then build again')
     sh = lw / f'shaders_v{ver}'; pkg, tables, spv = sh / 'pkg', sh / 'tables', sh / 'spv'
     env = dict(env, J=str(jobs))
     if nro_dir.is_dir(): env['DM_NRO_DIR'] = str(nro_dir)
+    # Games whose files are Oodle- or LZ5-compressed (Trinity's packs: Pokémon Legends: Z-A's arc/data.trpfs) are decoded with the game's own decoder: this host in its tool mode
+    # (DM_OODLE_SERVE, dm/host/hle_oodle.c) with the rewritten modules, as the NSP script does with the Mac host
+    if patched is not None and (lw / 'dmhost').is_file(): env.setdefault('DM_OODLE_HOST', str(lw / 'dmhost')); env.setdefault('DM_OODLE_MODULES', str(patched))
     if not (sh / 'split.done').is_file():
         shutil.rmtree(pkg, ignore_errors=True); tables.mkdir(parents=True, exist_ok=True)
         say('splitting out the shaders (a few minutes)')
@@ -114,13 +165,14 @@ def main():
     ap.add_argument('game', type=Path, help='a .nup file, a folder holding one, or a dump folder')
     ap.add_argument('--version', type=int, help='the update to build (default: the newest; 0 = the base game)')
     ap.add_argument('--work-dir', type=Path, help='the build folder (default: <title ID>_build beside the game)')
+    ap.add_argument('--keys', type=Path, help='prod.keys, for a folder of NSPs (default: the game folder, then ~/.switch/prod.keys); only used to unpack the game')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     ap.add_argument('--retranslate', action='store_true', help='translate the shaders again (after a translator change)')
     ap.add_argument('--shaders', action='store_true', help='also translate the game\'s shaders to SPIR-V (graphics stage C; needs the .NET 10 runtime, takes a while)')
     a = ap.parse_args()
     if platform.machine() not in ('aarch64', 'arm64'): say(f'[RED] this machine is {platform.machine()}: the build runs here, but the game only runs on arm64 Linux')
     check_tools()
-    tid, ver, work, ext = unpack(a.game.expanduser().resolve(), a.version, a.work_dir.expanduser().resolve() if a.work_dir else None)
+    tid, ver, work, ext = unpack(a.game.expanduser().resolve(), a.version, a.work_dir.expanduser().resolve() if a.work_dir else None, a.keys)
     exefs = ext / 'ExeFS'
     if not exefs.is_dir(): die(f'no ExeFS in {ext}')
     # The profile: the repository's, or for a game nxnative has none for, a provisional one guessed from the files (the survey the NSP script makes)
@@ -219,7 +271,7 @@ def main():
             import fontTools  # noqa: F401
             run([sys.executable, REPO / 'dm/tools/make_ext_font.py', font / 'nintendo_ext.ttf'] + ([font / 'standard.ttf'] if (font / 'standard.ttf').exists() else []))
         except ImportError: say(f'[YELLOW] no button-icon font: {sys.executable} -m pip install --user fonttools, then build again')
-    if a.shaders or a.retranslate: shaders(tid, ver, ext, exefs, nro_dir, lw, renv, a.jobs, a.retranslate)
+    if a.shaders or a.retranslate: shaders(tid, ver, ext, exefs, nro_dir, lw, renv, a.jobs, a.retranslate, patched)
     aoc = work / 'aoc'
     script = lw / 'run.sh'
     script.write_text(f'''#!/bin/sh
