@@ -179,13 +179,17 @@ def entry(spv_path, res_path, job_path=None):
 # Shaders with the tensor-core emulation (the translator's dmsh_hmma16816_f16 helper, Ocarina of Time's upscaler) pass dozens of function variables to it by pointer, so thousands of
 # them stay in memory form: Turnip's nir_opt_copy_prop_vars took up to 6 GB and minutes on one (Mesa 25.2, drm-shim). spirv-opt inlines the helper and turns the variables into
 # SSA values first (0.8-1.5 GB, a third of the time). The results are kept in <spv dir>/../spv_opt (redone when the translator's file is newer). DM_SPV_OPT=0 skips this
-OPT_PASSES = ['--target-env=vulkan1.3', '--merge-return', '--inline-entry-points-exhaustive', '--eliminate-dead-functions', '--eliminate-local-single-block',
-              '--eliminate-local-single-store', '--ssa-rewrite', '--eliminate-dead-code-aggressive', '--merge-blocks', '--simplify-instructions', '--eliminate-dead-code-aggressive']
+SSA_PASSES = ['--eliminate-local-single-block', '--eliminate-local-single-store', '--ssa-rewrite', '--eliminate-dead-code-aggressive', '--merge-blocks', '--simplify-instructions',
+              '--eliminate-dead-code-aggressive']
+OPT_PASSES = ['--target-env=vulkan1.3', '--merge-return', '--inline-entry-points-exhaustive', '--eliminate-dead-functions'] + SSA_PASSES
+# Every large shader gets the SSA passes too (no inlining: their only calls are the translator's helpers): the translator keeps each register in a function variable, and Turnip took
+# 7-19 s over Ocarina of Time's 280-440 KB foliage and scene shaders on the AYN Thor. DM_SPV_OPT_KB: the size from which (default 48 KB of SPIR-V)
+LARGE_PASSES = ['--target-env=vulkan1.3'] + SSA_PASSES
 
 def _opt_one(args):
-    src, dst = args
+    src, dst, passes = args
     tmp = str(dst) + '.tmp'
-    r = subprocess.run(['spirv-opt', *OPT_PASSES, str(src), '-o', tmp], capture_output=True, text=True)
+    r = subprocess.run(['spirv-opt', *passes, str(src), '-o', tmp], capture_output=True, text=True)
     if r.returncode or not os.path.exists(tmp): return src.stem, (r.stderr or 'spirv-opt failed').strip().splitlines()[-1:]
     v = subprocess.run(['spirv-val', '--target-env', 'vulkan1.3', tmp], capture_output=True, text=True) if shutil.which('spirv-val') else None
     if v is not None and v.returncode: os.remove(tmp); return src.stem, ['the result does not validate: kept the original']
@@ -193,24 +197,31 @@ def _opt_one(args):
 
 def optimize_heavy(src, keys):
     if os.environ.get('DM_SPV_OPT') == '0': return {}
-    heavy = [k for k in keys if k == k[:16] and b'dmsh_hmma' in (src / f'{k}.spv').read_bytes()]
-    if not heavy: return {}
+    lim = int(os.environ.get('DM_SPV_OPT_KB') or 48) << 10
+    jobs_l = []
+    for k in keys:
+        if k != k[:16]: continue
+        p = src / f'{k}.spv'; n = p.stat().st_size
+        if n < lim and n < 4096: continue
+        if b'dmsh_hmma' in p.read_bytes(): jobs_l.append((k, OPT_PASSES))
+        elif n >= lim: jobs_l.append((k, LARGE_PASSES))
+    if not jobs_l: return {}
     if not shutil.which('spirv-opt'):
-        print(f'[YELLOW] {len(heavy)} shaders with tensor-core emulation are packed as translated: install spirv-opt (sudo dnf install -y spirv-tools) and pack again, '
-              'or the driver may take minutes and gigabytes on them', flush=True)
+        print(f'[YELLOW] {len(jobs_l)} large shaders are packed as translated: install spirv-opt (sudo dnf install -y spirv-tools) and pack again, '
+              'or the driver may take seconds to minutes and gigabytes on them', flush=True)
         return {}
-    out = src.parent / 'spv_opt'; out.mkdir(exist_ok=True)
-    todo = [(src / f'{k}.spv', out / f'{k}.spv') for k in heavy if not (out / f'{k}.spv').exists() or (out / f'{k}.spv').stat().st_mtime < (src / f'{k}.spv').stat().st_mtime]
+    out = src.parent / 'spv_opt2'; out.mkdir(exist_ok=True)
+    todo = [(src / f'{k}.spv', out / f'{k}.spv', ps) for k, ps in jobs_l if not (out / f'{k}.spv').exists() or (out / f'{k}.spv').stat().st_mtime < (src / f'{k}.spv').stat().st_mtime]
     if todo:
-        jobs = max(1, min(int(os.environ.get('J') or os.cpu_count() or 2), 3))
-        print(f'optimizing {len(todo)} of {len(heavy)} shaders with tensor-core emulation (spirv-opt, {jobs} at a time; can take a while on the Thor)', flush=True)
+        jobs = max(1, min(int(os.environ.get('J') or os.cpu_count() or 2), 6))
+        print(f'optimizing {len(todo)} of {len(jobs_l)} large shaders (spirv-opt, {jobs} at a time; the first time takes a while on the Thor, later packs reuse them)', flush=True)
         done = 0
         with ProcessPoolExecutor(jobs) as ex:
-            for k, err in ex.map(_opt_one, todo):
+            for k, err in ex.map(_opt_one, todo, chunksize=4):
                 done += 1
                 if err: print(f'[YELLOW] {k}: {err[0] if err else ""}', flush=True)
-                if done % 10 == 0 or done == len(todo): print(f'  {done}/{len(todo)}', flush=True)
-    return {k: out / f'{k}.spv' for k in heavy if (out / f'{k}.spv').exists()}
+                if done % 200 == 0 or done == len(todo): print(f'  {done}/{len(todo)}', flush=True)
+    return {k: out / f'{k}.spv' for k, _ in jobs_l if (out / f'{k}.spv').exists()}
 
 def main():
     if len(sys.argv) != 3: sys.exit('usage: spv_pack.py <spv dir> <out file>')

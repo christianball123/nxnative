@@ -76,7 +76,23 @@ const vks_shader *vks_find(uint64_t key) {
 }
 
 // A module with every DescriptorSet decoration set to set
+// Modules are shared: one per shader and descriptor set, whatever programs use it. Made per program, a vertex shader in 100 programs was 100 modules, each holding its own copy of the
+// SPIR-V in the driver (and in Steam's Fossilize layer); in Ocarina of Time's first scene, with shaders of 400 KB and more, memory and swap ran out
+static VkShaderModule module_make(const vks_shader *s, uint32_t set);
 static VkShaderModule module_for(const vks_shader *s, uint32_t set) {
+    enum { MC_CAP = 1 << 15 };
+    static struct { const vks_shader *s; uint32_t set; VkShaderModule m; } *mc; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    if (!mc) mc = calloc(MC_CAP, sizeof *mc);
+    uint32_t i = (uint32_t)(((uintptr_t)s * 0x9E3779B97F4A7C15ull + set) >> 49) & (MC_CAP - 1);
+    for (uint32_t n = 0; n < MC_CAP && mc[i].s; n++, i = (i + 1) & (MC_CAP - 1))
+        if (mc[i].s == s && mc[i].set == set) { VkShaderModule m = mc[i].m; pthread_mutex_unlock(&mu); return m; }
+    VkShaderModule m = module_make(s, set);
+    if (m && !mc[i].s) { mc[i].s = s; mc[i].set = set; mc[i].m = m; }
+    pthread_mutex_unlock(&mu);
+    return m;
+}
+static VkShaderModule module_make(const vks_shader *s, uint32_t set) {
     uint32_t *w = malloc(s->nspv * 4); memcpy(w, s->spv, s->nspv * 4);
     for (uint32_t i = 5; i < s->nspv; ) {
         uint32_t n = w[i] >> 16, op = w[i] & 0xffff;

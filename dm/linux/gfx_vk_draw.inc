@@ -913,6 +913,7 @@ static VkPipelineCache g_pcache;
 // 100 % CPU for 25 s and more and the game frozen behind it. The shaders of the build under way are kept for the hang dump (crash.c's wait dump), a build over 1 s is logged with its
 // time, and DM_VK_SKIP_SHADERS=<key>,<key>,... (16-digit hex keys as the log prints them) leaves out every pipeline with one of those shaders: its draws or dispatches are skipped
 static _Atomic uint64_t g_pb_key[3], g_pb_t0;
+static _Thread_local int t_pb_worker;   // the background builder: its builds keep out of the submit thread's record above
 static void pb_dump(void) {
     uint64_t t0 = atomic_load(&g_pb_t0); if (!t0) { fprintf(stderr, "[dm] [vk] no pipeline being built\n"); return; }
     fprintf(stderr, "[dm] [vk] pipeline being built for %.1f s: shaders %016llx %016llx %016llx (DM_VK_SKIP_SHADERS=<key> leaves it out)\n", (mono_ns() - t0) / 1e9,
@@ -936,7 +937,7 @@ static VkPipeline pipe_make(const vks_prog *pr, const pkey *k);
 static pthread_mutex_t g_pbq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pbq_cv = PTHREAD_COND_INITIALIZER;
 static pb_job *g_pbq_head, *g_pbq_tail; static int g_pbq_n;
 static void *pb_worker(void *a) {
-    (void)a; setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 5);   // behind the game's own threads
+    (void)a; t_pb_worker = 1; setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 5);   // behind the game's own threads
     for (;;) {
         pthread_mutex_lock(&g_pbq_mu);
         while (!g_pbq_head) pthread_cond_wait(&g_pbq_cv, &g_pbq_mu);
@@ -993,12 +994,14 @@ static int pb_begin(uint64_t a, uint64_t b, uint64_t c) {   // 0: one of them is
     static int hooked; if (!hooked) { void crash_set_wait_dump(void (*)(void)); crash_set_wait_dump(pb_dump); hooked = 1; }
     if (movie_net(a)) { static int n; if (n++ < 20) LOG("[vk] movie enhancement network %016llx left out", (unsigned long long)a); return 0; }
     if (pb_skip(a) || pb_skip(b) || pb_skip(c)) { static int n; if (n++ < 20) LOG("[vk] pipeline left out (DM_VK_SKIP_SHADERS): shaders %016llx %016llx %016llx", (unsigned long long)a, (unsigned long long)b, (unsigned long long)c); return 0; }
+    if (t_pb_worker) return 1;
     atomic_store(&g_pb_key[0], a); atomic_store(&g_pb_key[1], b); atomic_store(&g_pb_key[2], c); atomic_store(&g_pb_t0, mono_ns());
     return 1;
 }
 static void pb_end(void);
 static VkResult pb_end_r(VkResult r) { pb_end(); return r; }
 static void pb_end(void) {
+    if (t_pb_worker || !atomic_load(&g_pb_t0)) return;
     uint64_t ms = (mono_ns() - atomic_load(&g_pb_t0)) / 1000000; atomic_store(&g_pb_t0, 0);
     if (ms >= 1000) LOG("[RED] [vk] a pipeline took %llu ms to build: shaders %016llx %016llx %016llx", (unsigned long long)ms,
                         (unsigned long long)atomic_load(&g_pb_key[0]), (unsigned long long)atomic_load(&g_pb_key[1]), (unsigned long long)atomic_load(&g_pb_key[2]));

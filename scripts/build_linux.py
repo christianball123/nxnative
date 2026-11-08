@@ -292,6 +292,9 @@ for ef in "$HOME/.config/nxnative/env" "$HOME/.config/nxnative/{tid}.env"; do
     done < "$ef"
 done
 export DM_WINDOW=1 DM_FULLSCREEN="${{DM_FULLSCREEN:-1}}"
+# Steam's Fossilize layer (present when Steam or Gamescope starts the game) records every shader module and pipeline: with the game's multi-megabyte shaders it held gigabytes the AYN Thor
+# does not have. DM_FOSSILIZE=1 keeps it
+[ "${{DM_FOSSILIZE:-0}}" = 1 ] || export DISABLE_VK_LAYER_VALVE_steam_fossilize_1=1
 echo "starting the game (DISPLAY=$DISPLAY WAYLAND_DISPLAY=$WAYLAND_DISPLAY XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR)"
 if [ "$cpu_on" = 1 ]; then ./run.sh "$@"; exit $?; fi
 exec ./run.sh "$@"
