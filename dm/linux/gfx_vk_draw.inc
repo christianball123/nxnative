@@ -1211,6 +1211,7 @@ static VkBufferView tbuf_view(int st, const vks_bind *b, int storage) {
     static int once; if (!once++) LOG("[vk] texture buffers: on (first: NVN format %#x, %llu texels)", r->t.d.format, (unsigned long long)elems);
     return view;
 }
+static uint32_t g_draw_binst;   // the current draw's base instance, for c0 + 0x644 (write_set)
 static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
     wset *W = &g_ws; W->nw = W->nbi = W->nii = W->ntv = 0; W->ndo = 0;
     int sup_bi = -1; float bsc[64]; uint8_t bkind[64]; memset(bkind, 0, sizeof bkind);   // the support buffer's descriptor; each texture / image binding's resolution scale
@@ -1241,6 +1242,21 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                 }
                 else if (b->reg == 1 && s->c1_len) { off = ring_put((uint64_t)(uintptr_t)s->c1, s->c1_len); size = (s->c1_len + 15) & ~15u; }
                 else if (b->reg >= 3 && b->reg - 3 < 18) { addr = D.ubo[st][b->reg - 3].addr; size = D.ubo[st][b->reg - 3].size; }
+                else if (b->reg == 0 && st != 5) {
+                    // The driver's own bank c0, what graphics shaders read of it (as nvn_mtl.m fills it): 0x610 the largest point size, 0x644 the draw's base instance, which GLSLC
+                    // adds to the instance ID. Pokémon Legends: Z-A picks each instanced object's transform this way (1,550 reads in 793 of its vertex shaders): left at zero,
+                    // every bench, wall piece and occlusion box of a draw went to the first one's place and the rest of the station was missing. One 2 KB block per base instance
+                    // and submission, in the ring (the storage buffer table in it is resolved when the shader is bound, k_c0_ssbo)
+                    uint64_t key = ((uint64_t)g_draw_binst << 8) | 0xC1 | (1ull << 63);   // odd, past any guest address: no guest range is cached under it
+                    uint32_t hi = (uint32_t)((key ^ 2048 * 0x9E3779B97F4A7C15ull) * 0xff51afd7ed558ccdull >> 51) & (RH_CAP - 1);
+                    for (int q = 0; q < 32; q++, hi = (hi + 1) & (RH_CAP - 1)) { if (g_rh[hi].addr == key && g_rh[hi].size == 2048) { off = g_rh[hi].off; break; } if (!g_rh[hi].addr) break; }
+                    if (off == ~0ull && (off = ring_alloc(2048)) != ~0ull) {
+                        uint8_t *d = RG.p + off; memset(d, 0, 2048);
+                        const float max_point = 2047.0f; memcpy(d + 0x610, &max_point, 4); memcpy(d + 0x644, &g_draw_binst, 4);
+                        if (!g_rh[hi].addr && g_nrh_used < RH_CAP) { g_rh[hi] = (ring_hit){key, 2048, off}; g_rh_idx[g_nrh_used++] = (uint16_t)hi; }
+                    }
+                    size = 2048;
+                }
             } else if (b->kind == VKS_SBUF) {
                 if (b->aux == 0 && k_c0_ssbo[st] != 0xffff && b->reg >= k_c0_ssbo[st] && (b->reg - k_c0_ssbo[st]) % DMSH_C0_ROW == 0 && (b->reg - k_c0_ssbo[st]) / DMSH_C0_ROW < 16) {
                     const p_bind_buf *q = &D.ssbo[st][(b->reg - k_c0_ssbo[st]) / DMSH_C0_ROW]; addr = q->addr; size = q->size;
@@ -1556,6 +1572,7 @@ static void do_draw(const draw_args *a) {
     VkPipeline pipe = pipe_get(pr, &k);
     if (!pipe) { g_skip[SK_PIPE]++; return; }
     // descriptors (prep_tex may end the pass for a texture's first use: it is begun again below)
+    g_draw_binst = a->base_instance;
     int r = bind_sets(pr, VK_PIPELINE_BIND_POINT_GRAPHICS);
     if (r <= 0) { g_skip[r < 0 ? SK_RING : SK_DESC]++; return; }
     if (!P.open) {
