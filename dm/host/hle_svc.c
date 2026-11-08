@@ -390,6 +390,17 @@ static void alias_query(uint64_t addr, uint64_t *base, uint64_t *size, int *mapp
 // they keep their old bytes, so the call returns 0 and alias_initialize zeroes them when they are mapped again
 static int guest_release(uintptr_t lo, uintptr_t hi) {
     if (g_gf_n) {
+#ifdef __linux__
+        // Linux: the files are memfds on tmpfs, which the kernel never writes out anywhere but swap, so pages the game gave back stayed memory: Ocarina of Time's 6.9 GB of guest
+        // files, of which it used 2.4, filled the AYN Thor and the GPU driver's allocations stalled in the kernel. The range's pages are freed (MADV_REMOVE: a hole in the file, which
+        // reads as zeros), so it holds zero pages. DM_GUEST_PUNCH=0 keeps the old way
+        static int punch = -1; if (punch < 0) { const char *e = getenv("DM_GUEST_PUNCH"); punch = !(e && *e == '0'); }
+        if (punch && !mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE) && !madvise((void *)lo, hi - lo, MADV_REMOVE)) {
+            if (mprotect((void *)lo, hi - lo, PROT_NONE)) die("guest_release mprotect %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);
+            return 1;
+        }
+        if (punch) { static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 4) LOG("[RED] guest memory %#lx+%#lx: MADV_REMOVE refused (errno %d), its pages stay", (unsigned long)lo, (unsigned long)(hi - lo), errno); }
+#endif
         if (mprotect((void *)lo, hi - lo, PROT_NONE)) die("guest_release mprotect %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);
         return 0;
     }
