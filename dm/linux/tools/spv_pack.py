@@ -20,6 +20,7 @@ import spv_passthrough
 import spv_alpha
 import spv_outinit
 import spv_gsmask
+import spv_xfb
 from pathlib import Path
 
 KIND_SUPPORT, KIND_CBUF, KIND_SBUF, KIND_TEX, KIND_IMG, KIND_UNKNOWN = range(6)
@@ -151,6 +152,11 @@ def entry(spv_path, res_path, job_path=None):
     words = add_image_caps(strip_unused(words))
     words, _ = spv_alpha.add_alpha_test(words)   # fragment shaders: NVN's alpha test as code (spv_alpha.py)
     words, _ = spv_outinit.init_outputs(words)   # vertex shaders: outputs start at Maxwell's (0, 0, 0, 1) (spv_outinit.py)
+    try: tf = json.load(open(job_path)).get('tf') if job_path and os.path.exists(job_path) else None
+    except ValueError: tf = None
+    if tf and any(op == 15 and ins[1] == 0 for _, op, ins in spv_xfb._ins(words)):   # a vertex shader (OpEntryPoint Vertex) that captures outputs
+        try: words, _ = spv_xfb.add_xfb(words, tf)   # transform feedback decorations (spv_xfb.py; the host reads the strides back from them)
+        except ValueError as e: print(f'[YELLOW] {Path(spv_path).stem}: transform feedback not added ({e})', flush=True)
     data = struct.pack(f'<{len(words)}I', *words)
     model, binds, vin, fout, local = reflect(words)
     if passthrough: local = (1, len(gsm) if gsm else 0, 0)   # a rewritten passthrough geometry shader (local x 1), and its mask program's words (local y; after c1)

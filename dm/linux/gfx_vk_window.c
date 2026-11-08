@@ -82,7 +82,7 @@ static struct {
     VkSurfaceKHR surf;
     VkSwapchainKHR sc; VkFormat fmt; VkExtent2D ext; uint32_t nimg; VkImage img[SWAP_MAX];
     VkSemaphore acquired[SWAP_MAX], done[SWAP_MAX]; VkCommandPool pool; VkCommandBuffer cb[SWAP_MAX]; VkFence fence[SWAP_MAX]; uint32_t slot;
-    int ok, failed, resized; uint64_t frames; double t0; char devname[256]; int ext_host_mem, ext_push, ext_dcc; int want_srgb, srgb;
+    int ok, failed, resized; uint64_t frames; double t0; char devname[256]; int ext_host_mem, ext_push, ext_dcc, ext_xfb; int want_srgb, srgb;
     VkImage mid; VkDeviceMemory mid_mem; VkExtent2D mid_ext; VkFormat mid_fmt;
     VkImage noa; VkDeviceMemory noa_mem; VkExtent2D noa_ext; int noa_bad;   // the game's picture without its alpha (noa_image)   // an sRGB image of the window's size (sRGB game images when the window has no sRGB format)
 } W;
@@ -194,6 +194,7 @@ static int window_init(void) {
         if (!strcmp(ep[i].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) W.ext_host_mem = 1;
         if (!strcmp(ep[i].extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) W.ext_push = 1;
         if (!strcmp(ep[i].extensionName, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME)) W.ext_dcc = 1;
+        if (!strcmp(ep[i].extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME)) W.ext_xfb = 1;
     }
     free(ep);
     LOG("[vk] GPU %s, Vulkan %u.%u.%u, driver %#x; guest memory import (VK_EXT_external_memory_host): %s", pp.deviceName, VK_API_VERSION_MAJOR(pp.apiVersion), VK_API_VERSION_MINOR(pp.apiVersion),
@@ -202,12 +203,15 @@ static int window_init(void) {
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, VK.qfam, 1, &prio};
     // Stage C's shaders and pipelines: Vulkan 1.3 (dynamic rendering, extended dynamic state) with every feature the GPU has turned on (the translated shaders use what the game's do:
     // image queries, gathers with offsets, subgroup ballots, texel buffers, storage image access without a format, …), and push descriptors when the driver has them
-    const char *dext[4] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME}; uint32_t ndext = 1;
+    const char *dext[8] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME}; uint32_t ndext = 1;
     if (VK_API_VERSION_MINOR(pp.apiVersion) < 3 && VK_API_VERSION_MAJOR(pp.apiVersion) == 1) LOG("[RED] [vk] this driver has Vulkan %u.%u: stage C needs 1.3", VK_API_VERSION_MAJOR(pp.apiVersion), VK_API_VERSION_MINOR(pp.apiVersion));
     if (W.ext_push) { dext[ndext++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME; VK.push_desc = 1; }
     static VkPhysicalDeviceDepthClipControlFeaturesEXT fdcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
     static VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     if (W.ext_dcc) { dext[ndext++] = VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME; f13.pNext = &fdcc; }
+    static VkPhysicalDeviceTransformFeedbackFeaturesEXT fxfb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+    const char *xe = getenv("DM_VK_XFB");   // DM_VK_XFB=0: no transform feedback (the draws that capture go without it)
+    if (W.ext_xfb && !(xe && *xe == '0')) { dext[ndext++] = VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME; fxfb.pNext = f13.pNext; f13.pNext = &fxfb; } else W.ext_xfb = 0;
     static VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
     static VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12};
     static VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
@@ -224,6 +228,13 @@ static int window_init(void) {
     VKD_FUNCS(LD)
 #undef LD
     vkGetDeviceQueue_(VK.dev, VK.qfam, 0, &VK.q);
+    if (W.ext_xfb && fxfb.transformFeedback) {
+        VK.xfb_bind = (PFN_vkCmdBindTransformFeedbackBuffersEXT)vkGetDeviceProcAddr_(VK.dev, "vkCmdBindTransformFeedbackBuffersEXT");
+        VK.xfb_begin = (PFN_vkCmdBeginTransformFeedbackEXT)vkGetDeviceProcAddr_(VK.dev, "vkCmdBeginTransformFeedbackEXT");
+        VK.xfb_end = (PFN_vkCmdEndTransformFeedbackEXT)vkGetDeviceProcAddr_(VK.dev, "vkCmdEndTransformFeedbackEXT");
+        VK.f_xfb = VK.xfb_bind && VK.xfb_begin && VK.xfb_end;
+    }
+    LOG("[vk] transform feedback (VK_EXT_transform_feedback): %s", VK.f_xfb ? "yes" : W.ext_xfb ? "[RED] the extension is there but not its feature" : "no (draws that capture vertices go without it)");
     vkGetPhysicalDeviceMemoryProperties_(VK.phys, &VK.mem);
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, VK.qfam};
     vkCreateCommandPool_(VK.dev, &pci, NULL, &W.pool);

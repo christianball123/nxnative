@@ -30,6 +30,7 @@ static int ring_init(void) {
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, RING_SIZE, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                               VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    if (VK.f_xfb) bci.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;   // captured vertices are written into the ring (do_draw)
     if (vkCreateBuffer_(VK.dev, &bci, NULL, &RG.b)) { LOG("[RED] [vk] the upload ring buffer was refused"); return 0; }
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements_(VK.dev, RG.b, &mr);
     uint32_t mt = vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -47,6 +48,7 @@ static uint64_t ring_alloc(uint64_t n) {
     RG.used = off + n16; g_ring_bytes += n; return off;
 }
 static int fwd_try(uint64_t addr, uint64_t size, uint64_t ring_off);   // gfx_vk_replay.c
+static uint64_t wb_within(uint64_t addr, uint64_t size);   // below
 // The guest's bytes [addr, addr + size) in the ring (the same range again in this submission: the same copy)
 static uint64_t ring_put(uint64_t addr, uint64_t size) {
     if (!size) size = 16;
@@ -55,6 +57,7 @@ static uint64_t ring_put(uint64_t addr, uint64_t size) {
         if (g_rh[i].addr == addr && g_rh[i].size == size) return g_rh[i].off;
         if (!g_rh[i].addr) break;
     }
+    uint64_t in = addr ? wb_within(addr, size) : ~0ull; if (in != ~0ull) return in;
     uint64_t off = ring_alloc(size); if (off == ~0ull) return off;
     int fwd = addr && fwd_try(addr, size, off);   // a storage buffer result of a submission in flight: copied on the GPU (else waited for)
     if (addr && !fwd) pend_hazard(addr, size);
@@ -84,6 +87,16 @@ static void wb_add(uint64_t addr, uint64_t size, uint64_t off) {
     if (g_nwb == g_cwb) { g_cwb = g_cwb ? 2 * g_cwb : 64; g_wb = realloc(g_wb, g_cwb * sizeof *g_wb); }
     uint8_t *o = malloc(size); if (o) memcpy(o, RG.p + off, size);
     g_wb[g_nwb++] = (wback){addr, size, off, o, -1, 0};
+}
+// A range inside one a shader of this submission writes (transform feedback's captured vertices, read next as a vertex buffer at its own address and size): the ring offset of
+// that copy, so the draw reads what the GPU wrote and not the guest's old bytes. Only at a 256-byte step from its start (a buffer descriptor's offset must be aligned); ~0: none
+static uint64_t g_wb_within;
+static uint64_t wb_within(uint64_t addr, uint64_t size) {
+    for (int i = g_nwb - 1; i >= 0; i--) {
+        const wback *w = &g_wb[i];
+        if (addr >= w->addr && addr + size <= w->addr + w->size && !((addr - w->addr) & 255)) { g_wb_within++; return w->off + (addr - w->addr); }
+    }
+    return ~0ull;
 }
 // Storage buffer results kept on the GPU: at the end of a submission each range a shader wrote is also copied into the forwarding buffer, so a later submission that reads
 // those bytes before the GPU is done (and before they are back in guest memory) copies them on the GPU instead of waiting. Mario Tennis Fever's compute writes a small
@@ -503,6 +516,7 @@ static struct {
     float vp[16][4]; float dr[2]; p_scissor sc; int has_sc;
     uint32_t st_vmask[2], st_wmask[2], st_ref[2]; p_poly_offset po; float blend_color[4];
     int depth_clamp, prim_restart; uint32_t restart_index; int rast_discard; float alpha_ref;
+    p_tf_bind tf[4]; int tf_on; uint64_t tf_off[4];   // transform feedback: the bound buffers, capturing or not, the bytes written into each since BeginTransformFeedback
     int init;
 } D;
 static void state_init(void) {
@@ -562,6 +576,10 @@ static void state_op(uint32_t op, const uint8_t *a) {
     case OP_ALPHA_REF: D.alpha_ref = ((const p_alpha_ref *)a)->ref; break;
     case OP_PRIM_RESTART: { const p_prim_restart *b = (const p_prim_restart *)a; D.prim_restart = b->on != 0; D.restart_index = b->index; break; }
     case OP_RAST_DISCARD: D.rast_discard = *(const int32_t *)a != 0; break;
+    case OP_TF_BIND: { const p_tf_bind *b = (const p_tf_bind *)a; if (b->index >= 0 && b->index < 4) { D.tf[b->index] = *b; D.tf_off[b->index] = 0; } break; }
+    case OP_TF_STATE: { const p_tf_state *b = (const p_tf_state *)a;   // 0 begin, 1 end, 2 pause, 3 resume
+        if (b->what == 0) memset(D.tf_off, 0, sizeof D.tf_off);
+        D.tf_on = b->what == 0 || b->what == 3; break; }
     default: break;
     }
 }
@@ -569,6 +587,7 @@ static void state_op(uint32_t op, const uint8_t *a) {
 // ---------------------------------------------------------------- statistics (in the replay's summary line)
 enum { SK_NOPROG, SK_NORT, SK_TESS, SK_PIPE, SK_RING, SK_PRIM, SK_DESC, SK_N };
 static const char *k_sk[SK_N] = {"shaders not ready", "no render target", "tessellation / geometry off", "pipeline refused", "upload ring full", "primitive type", "descriptors"};
+static uint64_t g_xfb_draws;
 static uint64_t g_drawn, g_disp_done, g_skip[SK_N], g_pipes, g_unsup_sbuf_ubo, g_tex_missing, g_tex_unres, g_tex_unreg, g_storage_unsup;
 
 // ---------------------------------------------------------------- the render pass (dynamic rendering) over the current render targets
@@ -1577,11 +1596,43 @@ static void do_draw(const draw_args *a) {
     vkCmdSetBlendConstants_(g_cb, D.blend_color);
     vkCmdSetDepthBias_(g_cb, D.po.units, D.po.clamp, D.po.factor);
     uint32_t inst = a->instances ? a->instances : 1;
+    // Transform feedback (Pokémon Legends: Z-A skins its characters on the GPU: a vertex-only draw under rasterizer discard captures the skinned vertices, the next draws read them
+    // as their vertex buffer). Each bound buffer is put in the ring whole (once per submission) and written back to guest memory when the submission completes (wb_add); a later
+    // draw of the same submission reads the ring's copy (ring_put, wb_within). The capture starts where the previous draw since BeginTransformFeedback left off
+    int xfb = 0;
+    if (D.tf_on && vs && (vs->xfb[0] | vs->xfb[1] | vs->xfb[2] | vs->xfb[3])) {
+        static uint64_t no_ext; if (!VK.f_xfb) { if (!no_ext++) LOG("[RED] [vk] a draw captures vertices (transform feedback) and this GPU has no VK_EXT_transform_feedback: drawn without capturing"); }
+        else for (int b = 0; b < 4; b++) if (vs->xfb[b] && D.tf[b].addr && D.tf[b].size > D.tf_off[b] && D.tf[b].size <= (32ull << 20)) {
+            uint64_t ro = ring_put(D.tf[b].addr, D.tf[b].size); if (ro == ~0ull) { g_skip[SK_RING]++; continue; }
+            wb_add(D.tf[b].addr, D.tf[b].size, ro);
+            VkDeviceSize o = ro + D.tf_off[b], sz = D.tf[b].size - D.tf_off[b];
+            VK.xfb_bind(g_cb, (uint32_t)b, 1, &RG.b, &o, &sz); xfb |= 1 << b;
+        }
+        static int n; if (xfb && n++ < 8) LOG("[vk] transform feedback: vertex shader %016llx captures %u vertices × %u (prim %d) into buffers %#x (strides %u %u %u %u)",
+                                             (unsigned long long)vs->key, a->count, inst, a->prim, xfb, vs->xfb[0], vs->xfb[1], vs->xfb[2], vs->xfb[3]);
+        if (xfb) VK.xfb_begin(g_cb, 0, 0, NULL, NULL);
+    }
     for (uint32_t v = 0; v < (k.nogs ? nvp : 1); v++) {
         if (k.nogs && !(gmask >> v & 1)) continue;
         if (k.nogs) { vkCmdSetViewport_(g_cb, 0, 1, &vps[v]); vkCmdSetScissor_(g_cb, 0, 1, &scs[v]); BS.nvp = 0; }
         if (indexed) vkCmdDrawIndexed_(g_cb, icount, inst, 0, quads && !a->indexed ? 0 : a->base_vertex, a->base_instance);
         else vkCmdDraw_(g_cb, a->count, inst, a->first, a->base_instance);
+    }
+    if (xfb) {
+        VK.xfb_end(g_cb, 0, 0, NULL, NULL);
+        // the vertices each primitive emits, in order (as GL and Vulkan capture them): strips and fans become lists
+        uint32_t n = indexed ? icount : a->count, per;
+        switch (a->prim) {
+        case NVN_DRAW_PRIMITIVE_LINES: per = n / 2 * 2; break;
+        case NVN_DRAW_PRIMITIVE_LINE_STRIP: per = n >= 2 ? 2 * (n - 1) : 0; break;
+        case NVN_DRAW_PRIMITIVE_LINE_LOOP: per = n >= 2 ? 2 * n : 0; break;
+        case NVN_DRAW_PRIMITIVE_TRIANGLES: per = n / 3 * 3; break;
+        case NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP: case NVN_DRAW_PRIMITIVE_TRIANGLE_FAN: per = n >= 3 ? 3 * (n - 2) : 0; break;
+        default: per = n;
+        }
+        for (int b = 0; b < 4; b++) if (xfb >> b & 1) D.tf_off[b] += (uint64_t)per * inst * vs->xfb[b];
+        g_xfb_draws++;
+        pass_end();   // its barrier: the next draws read the captured vertices (the pass begins again at the next draw)
     }
     g_drawn++; g_cb_ops++;
     for (uint32_t c = 0; c < P.ncol && c < 8; c++) if (P.cv[c] && (k.chmask >> (4 * c) & 0xf)) P.cdirty |= 1u << c;
@@ -1880,6 +1931,7 @@ static void draw_summary(char *out, size_t n) {
                      (unsigned long long)g_pipes, (unsigned long long)g_up_tex, g_up_bytes / 1048576.0, (unsigned long long)g_up_fail, (unsigned long long)g_reup, (unsigned long long)g_untracked, (unsigned long long)g_lin_rb, g_lin_rb_bytes / 1048576.0);
     for (int i = 0; i < SK_N && o < (int)n; i++) if (g_skip[i]) o += snprintf(out + o, n - o, "; skipped (%s) %llu", k_sk[i], (unsigned long long)g_skip[i]);
     if (g_tex_missing && o < (int)n) o += snprintf(out + o, n - o, "; texture bindings without a usable view %llu", (unsigned long long)g_tex_missing);
+    if (g_xfb_draws && o < (int)n) o += snprintf(out + o, n - o, "; transform feedback draws %llu (ranges read from their capture %llu)", (unsigned long long)g_xfb_draws, (unsigned long long)g_wb_within);
     if (g_storage_unsup && o < (int)n) o += snprintf(out + o, n - o, "; shader images in a format that cannot be written %llu", (unsigned long long)g_storage_unsup);
     if (g_tex_unreg && o < (int)n) o += snprintf(out + o, n - o, "; bound texture IDs not registered %llu", (unsigned long long)g_tex_unreg);
     if (g_ring_forgot && o < (int)n) o += snprintf(out + o, n - o, "; copies made again after the command stream changed their bytes %llu", (unsigned long long)g_ring_forgot);

@@ -47,6 +47,17 @@ static int entry_of(uint64_t key, vks_shader *s) {
             if (s->model == 3 && s->local[0] == 1 && s->local[1]) { s->gsm = (const uint32_t *)(p + h); s->ngsm = s->local[1]; h += 4 * s->ngsm; }   // the mask program after c1
             if (h >= e.len) return 0;
             s->spv = (const uint32_t *)(p + h); s->nspv = (e.len - h) / 4;
+            memset(s->xfb, 0, sizeof s->xfb);
+            if (s->model == 0) {   // transform feedback (tools/spv_xfb.py): each capture buffer's stride, from its outputs' XfbBuffer and XfbStride decorations
+                uint32_t tgt[64], buf[64], nt = 0;
+                for (uint32_t i = 5; i < s->nspv && nt < 64; ) {
+                    uint32_t n = s->spv[i] >> 16, op = s->spv[i] & 0xffff; if (!n) break;
+                    if (op == 54) break;   // OpFunction: past the decorations
+                    if (op == 71 && n == 4 && s->spv[i + 2] == 36) { tgt[nt] = s->spv[i + 1]; buf[nt++] = s->spv[i + 3]; }
+                    if (op == 71 && n == 4 && s->spv[i + 2] == 37) for (uint32_t k = 0; k < nt; k++) if (tgt[k] == s->spv[i + 1] && buf[k] < 4) s->xfb[buf[k]] = s->spv[i + 3];
+                    i += n;
+                }
+            }
             return s->spv[0] == 0x07230203;
         }
         if (e.key < key) lo = mid + 1; else hi = mid;
