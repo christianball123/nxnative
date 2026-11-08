@@ -1627,6 +1627,46 @@ static void draw_op(uint32_t op, const uint8_t *a, uint32_t size) {
 typedef struct { uint64_t serial; VkPipeline p; _Atomic int state; } cpipe;   // state: 1 being built in the background (pb_async), 2 built there
 #define CP_CAP 4096
 static cpipe g_cp[CP_CAP];
+// A left-out movie enhancement network still has to leave a picture. The networks' last pass samples the decoded frame and writes the larger output image; skipped, that image
+// stays black (Ocarina of Time's movies: sound over a black screen). So a skipped network pass that writes a storage image larger than the largest colour texture it samples (and
+// does not also write) is replaced by a linear blit of that texture into the image: the movie at full size, softer than with the network. The idea is Hookshot's
+// (github.com/NotRexed/Hookshot, GPL-3.0-or-later, gpu/vk/vk_draw.cpp upscale_stub); written again here for this layer. DM_MOVIE_STUB=0 leaves the image as it is
+static void movie_stub(const vks_prog *pr) {
+    static int off = -1; if (off < 0) { const char *e = getenv("DM_MOVIE_STUB"); off = e && *e == '0'; }
+    if (off) return;
+    const vks_shader *s = pr->st[VKS_CS];
+    int st = 0; for (int x = 0; x < NST; x++) if (k_nvn2model[x] == s->model) st = x;
+    vtex *in = NULL, *out = NULL; const treg *rin = NULL, *rout = NULL; uint64_t ia = 0, oa = 0;
+    VkImage imgs[32]; int nimgs = 0, ok = 0;
+    for (int k = 0; k < s->nb; k++) { const vks_bind *b = &s->b[k];   // the images it writes
+        if (b->vktype != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) continue;
+        uint32_t h = handle_of(st, b, &ok); if (!ok) continue;
+        const treg *r = ireg_get((int)(h & 0xfffff)); if (!r || r->t.d.depth > 1) continue;
+        vtex *v = prep_tex(&r->t); if (!v || !v->img) continue;
+        if (nimgs < 32) imgs[nimgs++] = v->img;
+        uint64_t a = (uint64_t)v->w * v->h; if (a > oa) { oa = a; out = v; rout = r; }
+    }
+    if (!out) return;
+    for (int k = 0; k < s->nb; k++) { const vks_bind *b = &s->b[k];   // the colour textures it samples that it does not also write
+        if (b->vktype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->vktype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
+        uint32_t h = handle_of(st, b, &ok); if (!ok) continue;
+        const treg *r = treg_get((int)(h & 0xfffff)); if (!r || r->t.d.depth > 1 || r->t.d.target != rout->t.d.target) continue;
+        vtex *v = prep_tex(&r->t); if (!v || !v->img || v == out) continue;
+        int w = 0; for (int q = 0; q < nimgs; q++) w |= imgs[q] == v->img; if (w) continue;
+        uint64_t a = (uint64_t)v->w * v->h; if (a > ia) { ia = a; in = v; rin = r; }
+    }
+    if (!in || oa <= ia || in->samples > 1 || out->samples > 1 || (in->fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && in->fmt <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) ||
+        (out->fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && out->fmt <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) || (fmt_aspects(in->fmt) | fmt_aspects(out->fmt)) != VK_IMAGE_ASPECT_COLOR_BIT) return;
+    VkFormatProperties fi, fo; vkGetPhysicalDeviceFormatProperties_(VK.phys, in->fmt, &fi); vkGetPhysicalDeviceFormatProperties_(VK.phys, out->fmt, &fo);
+    if (!(fi.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(fi.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) || !(fo.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+        static int n; if (n++ < 4) LOG("[vk] movie network: no linear blit from format %d to %d, the picture stays black", in->fmt, out->fmt); return; }
+    pass_end(); full_barrier();
+    VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)in->w, (int32_t)in->h, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)out->w, (int32_t)out->h, 1}}};
+    vkCmdBlitImage_(g_cb, in->img, VK_IMAGE_LAYOUT_GENERAL, out->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+    full_barrier(); gpu_wrote(out);
+    static int logged; if (!logged++) LOG("[vk] movie network %016llx left out: a linear blit of texture serial %llu (%ux%u) into serial %llu (%ux%u) stands in for its picture",
+                                          (unsigned long long)s->key, (unsigned long long)rin->t.serial, in->w, in->h, (unsigned long long)rout->t.serial, out->w, out->h);
+}
 static void dispatch_op(const p_dispatch *d) {
     const vks_prog *pr = g_cs_prog;
     if (!pr || !pr->st[VKS_CS]) return;
@@ -1646,7 +1686,7 @@ static void dispatch_op(const p_dispatch *d) {
         g_cp[i].p = p; if (p) g_pipes++;
     }
     if (atomic_load_explicit(&g_cp[i].state, memory_order_acquire) == 1) return;   // still being built in the background
-    if (!g_cp[i].p) return;
+    if (!g_cp[i].p) { if (movie_net(pr->st[VKS_CS]->key)) movie_stub(pr); return; }
     if (bind_sets(pr, VK_PIPELINE_BIND_POINT_COMPUTE) <= 0) return;
     pass_end();   // a texture's first use may have needed command-buffer work
     vkCmdBindPipeline_(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_cp[i].p);
