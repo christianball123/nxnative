@@ -15,7 +15,21 @@
 #define DM_UC_SS(uc) dm_uc_ss(uc)
 #define DM_UC_NS(uc) dm_uc_ns(uc)
 #define DM_UC_ESR(uc) dm_uc_esr(uc)
+// Guest memory and the game's modules below 2^39, where a Switch's addresses always are. Linux places mmap(NULL) near the top of the 48-bit space (0xffff...): Pokémon Legends: Z-A
+// keeps tags in the high bits of its pointers and dropped bit 47 of a heap pointer (a crash in its first frame at main+0x18064f0). The Mac's mmap(NULL) already lands low.
+// Tries free places from 4 GB up (MAP_FIXED_NOREPLACE, never over a mapping); mmap(NULL) when none fits below 2^39
+static inline void *dm_mmap_low(size_t len, int prot, int flags) {
+    static uint64_t next = UINT64_C(1) << 32;
+    for (uint64_t at = __atomic_load_n(&next, __ATOMIC_RELAXED), tries = 0; at + len <= (UINT64_C(1) << 39) && tries < 4096; tries++) {
+        void *p = mmap((void *)(uintptr_t)at, len, prot, flags | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p == (void *)(uintptr_t)at) { __atomic_store_n(&next, (at + len + 0x3fffffull) & ~0x3fffffull, __ATOMIC_RELAXED); return p; }
+        if (p != MAP_FAILED) munmap(p, len);   // an old kernel without MAP_FIXED_NOREPLACE treats it as a hint
+        at += UINT64_C(1) << 30;
+    }
+    return mmap(NULL, len, prot, flags, -1, 0);
+}
 #else
+#define dm_mmap_low(len, prot, flags) mmap(NULL, (len), (prot), (flags), -1, 0)
 #define DM_UC_SS(uc) (&(uc)->uc_mcontext->__ss)
 #define DM_UC_NS(uc) (&(uc)->uc_mcontext->__ns)
 #define DM_UC_ESR(uc) ((uc)->uc_mcontext->__es.__esr)
