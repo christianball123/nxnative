@@ -146,15 +146,27 @@ static void wb_land(const wback *w) {   // on the completion thread
     uint8_t *g = (uint8_t *)(uintptr_t)w->addr; const uint8_t *r = RG.p + w->off;
     g_wb_bytes += w->size;
     if (!w->orig) { dm_guest_write_prepare(g, w->size); memcpy(g, r, w->size); return; }
-    uint64_t i = 0;
-    while (i < w->size) {
-        if (w->size - i >= 8) { uint64_t a, b; memcpy(&a, r + i, 8); memcpy(&b, w->orig + i, 8); if (a == b) { i += 8; continue; } }
-        else if (r[i] == w->orig[i]) { i++; continue; }
-        while (r[i] == w->orig[i]) i++;   // the first changed byte (one is in these 8, or it is this one)
-        uint64_t j = i; while (j < w->size && r[j] != w->orig[j]) j++;   // the run of changed bytes (an unchanged byte may be one the CPU wrote since: left alone)
-        dm_guest_write_prepare(g + i, j - i); memcpy(g + i, r + i, j - i); g_wb_changed += j - i;
-        i = j;
+    // The span from the first to the last changed byte is prepared for writing once (dm_guest_write_prepare can be a system call), then only the bytes the GPU changed are
+    // copied, word by word where a whole word changed. Preparing each run of changed bytes on its own took Pokémon Legends: Z-A's skinned vertices (floats whose bytes often
+    // match by chance, so thousands of short runs) 260-480 ms a submission for 2-3 MB, and the game waited for it: one frame a second in Lumiose
+    const uint64_t n = w->size; const uint8_t *o = w->orig;
+    uint64_t lo = 0, hi = n;
+    while (lo + 8 <= n && !memcmp(r + lo, o + lo, 8)) lo += 8;
+    while (lo < n && r[lo] == o[lo]) lo++;
+    if (lo == n) return;   // nothing changed
+    while (hi - 8 >= lo + 8 && !memcmp(r + hi - 8, o + hi - 8, 8)) hi -= 8;
+    while (hi > lo && r[hi - 1] == o[hi - 1]) hi--;
+    dm_guest_write_prepare(g + lo, hi - lo);
+    uint64_t i = lo, changed = 0;
+    for (; i + 8 <= hi; i += 8) {
+        uint64_t a, b; memcpy(&a, r + i, 8); memcpy(&b, o + i, 8);
+        if (a == b) continue;
+        uint64_t d = a ^ b;
+        if (!((d - 0x0101010101010101ull) & ~d & 0x8080808080808080ull)) { memcpy(g + i, r + i, 8); changed += 8; continue; }   // every byte of the word changed
+        for (int k = 0; k < 8; k++) if (r[i + k] != o[i + k]) { g[i + k] = r[i + k]; changed++; }   // some did: only those (an unchanged byte may be one the CPU wrote since)
     }
+    for (; i < hi; i++) if (r[i] != o[i]) { g[i] = r[i]; changed++; }
+    g_wb_changed += changed;
 }
 static uint64_t ring_bytes(const void *p, uint64_t n) { uint64_t off = ring_alloc(n); if (off != ~0ull) memcpy(RG.p + off, p, n); return off; }
 
