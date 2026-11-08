@@ -881,9 +881,11 @@ static uint64_t sub_commit_locked(int force) {
         pthread_mutex_lock(&g_cm_mu); atomic_store(&g_fence, f); atomic_store(&g_done, f); pthread_once(&g_cm_once, cm_init); pthread_cond_broadcast(&g_cm_done); pthread_mutex_unlock(&g_cm_mu);
     }
     dump_submitted();
-    static uint64_t reported;
-    if (f == 1 || f - reported >= 600) {
-        reported = f; uint64_t np = 0, nm = 0, nf = 0; vks_stats(&np, &nm, &nf);
+    static uint64_t reported, reported_ns;
+    // every 600 submissions, or every 20 s when the game crawls (at two frames a second 600 took five minutes: Pokémon Legends: Z-A's slow Lumiose runs ended before the first)
+    uint64_t now_r = mono_ns();
+    if (f == 1 || f - reported >= 600 || (f - reported >= 10 && now_r - reported_ns > 20000000000ull)) {
+        reported = f; reported_ns = now_r; uint64_t np = 0, nm = 0, nf = 0; vks_stats(&np, &nm, &nf);
         char ds[640]; draw_summary(ds, sizeof ds);
         // memory: the textures alive on the GPU side, this process's resident memory, and what the system has left (a game's memory file fails with SIGBUS when it runs out)
         long rss_kb = 0, avail_kb = 0, swapf_kb = 0; char ln[256];
