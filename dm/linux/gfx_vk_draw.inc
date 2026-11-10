@@ -1684,19 +1684,39 @@ static void do_draw(const draw_args *a) {
     for (uint32_t c = 0; c < P.ncol && c < 8; c++) if (P.cv[c] && (k.chmask >> (4 * c) & 0xf)) P.cdirty |= 1u << c;
     if (P.dv && ((k.ds.dt && k.ds.dw) || k.ds.st)) P.ddirty = 1;
 }
+// Indirect arguments a shader of THIS submission writes (a compute culling pass, then the draws that take their counts from its output: Pokémon Legends: Z-A's lamps and
+// walls came and went, drawn with the counts of an earlier frame). The replay reads the arguments on the CPU as it records, and those bytes are not in guest memory before the
+// submission has run. So the submission ends here, runs, and lands its write-backs; the draw is then recorded into the next one with the arguments the GPU wrote.
+// DM_VK_INDIRECT_SPLIT=0 reads them as they are
+static uint64_t sub_commit_locked(int force);   // gfx_vk_replay.c
+static uint64_t g_ind_split;
+static void ind_fresh(uint64_t addr, uint64_t n) {
+    { static int said; if (addr && !said++) LOG("[vk] the game makes indirect draws (first arguments at %#llx)", (unsigned long long)addr); }
+    if (!addr || !n || !g_nwb || !g_cb_open || D.tf_on) return;
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_INDIRECT_SPLIT"); on = !(e && *e == '0'); }
+    if (!on) return;
+    for (int i = 0; i < g_nwb; i++) {
+        const wback *w = &g_wb[i];
+        if (!(addr < w->addr + w->size && w->addr < addr + n)) continue;
+        if (!g_ind_split++) LOG("[vk] indirect arguments at %#llx are written by a shader of the same submission (a %llu-byte buffer at %#llx): the submission is split there and waited for (DM_VK_INDIRECT_SPLIT=0: read as they are)",
+                                (unsigned long long)addr, (unsigned long long)w->size, (unsigned long long)w->addr);
+        sub_commit_locked(1); pend_wait();
+        return;
+    }
+}
 static void draw_op(uint32_t op, const uint8_t *a, uint32_t size) {
     if (op == OP_DRAW) {
         p_draw t; const p_draw *d = draw_rec(a, size, &t);
-        if (d->mdi_cnt) pend_hazard(d->mdi_cnt, 4);
-        if (d->ind) pend_hazard(d->ind, 20);
+        if (d->mdi_cnt) { ind_fresh(d->mdi_cnt, 4); pend_hazard(d->mdi_cnt, 4); }
+        if (d->ind) { ind_fresh(d->ind, 20); pend_hazard(d->ind, 20); }
         if (d->mdi_cnt && (uint32_t)d->mdi_i >= *(const uint32_t *)(uintptr_t)d->mdi_cnt) return;
         draw_args x = {d->prim, 0, (uint32_t)d->count, (uint32_t)d->instances, (uint32_t)d->first, (uint32_t)d->base_instance, 0, 0, 0};
         if (d->ind) { const uint32_t *g = (const uint32_t *)(uintptr_t)d->ind; x.count = g[0]; x.instances = g[1]; x.first = g[2]; x.base_instance = g[3]; }   // the arguments as the CPU sees them
         do_draw(&x);
     } else if (op == OP_DRAW_IDX) {
         p_draw_idx t; const p_draw_idx *d = draw_idx_rec(a, size, &t);
-        if (d->mdi_cnt) pend_hazard(d->mdi_cnt, 4);
-        if (d->ind) pend_hazard(d->ind, 20);
+        if (d->mdi_cnt) { ind_fresh(d->mdi_cnt, 4); pend_hazard(d->mdi_cnt, 4); }
+        if (d->ind) { ind_fresh(d->ind, 20); pend_hazard(d->ind, 20); }
         if (d->mdi_cnt && (uint32_t)d->mdi_i >= *(const uint32_t *)(uintptr_t)d->mdi_cnt) return;
         draw_args x = {d->prim, 1, (uint32_t)d->count, (uint32_t)d->instances, 0, (uint32_t)d->base_instance, d->base_vertex, d->ibuf, d->itype};
         if (d->ind) {
@@ -1706,8 +1726,8 @@ static void draw_op(uint32_t op, const uint8_t *a, uint32_t size) {
         do_draw(&x);
     } else if (op == OP_MULTI_DRAW) {
         const p_multi_draw *m = (const p_multi_draw *)a;
-        if (m->cnt) pend_hazard(m->cnt, 4);
-        if (m->ind && m->max) pend_hazard(m->ind, (uint64_t)m->max * (m->stride ? (uint64_t)m->stride : 20));
+        if (m->cnt) { ind_fresh(m->cnt, 4); pend_hazard(m->cnt, 4); }
+        if (m->ind && m->max) { ind_fresh(m->ind, (uint64_t)m->max * (m->stride ? (uint64_t)m->stride : 20)); pend_hazard(m->ind, (uint64_t)m->max * (m->stride ? (uint64_t)m->stride : 20)); }
         uint32_t n = (uint32_t)m->max; if (m->cnt) { uint32_t c = *(const uint32_t *)(uintptr_t)m->cnt; if (c < n) n = c; }
         int idx = m->itype >= 0; uint64_t stride = m->stride ? (uint64_t)m->stride : idx ? 20 : 16;
         uint32_t isz = m->itype == NVN_INDEX_TYPE_UNSIGNED_INT ? 4 : m->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 1;
@@ -1980,6 +2000,7 @@ static void draw_summary(char *out, size_t n) {
     for (int i = 0; i < SK_N && o < (int)n; i++) if (g_skip[i]) o += snprintf(out + o, n - o, "; skipped (%s) %llu", k_sk[i], (unsigned long long)g_skip[i]);
     if (g_tex_missing && o < (int)n) o += snprintf(out + o, n - o, "; texture bindings without a usable view %llu", (unsigned long long)g_tex_missing);
     if (g_xfb_draws && o < (int)n) o += snprintf(out + o, n - o, "; transform feedback draws %llu (ranges read from their capture %llu)", (unsigned long long)g_xfb_draws, (unsigned long long)g_wb_within);
+    if (g_ind_split && o < (int)n) o += snprintf(out + o, n - o, "; submissions split for indirect arguments written in them %llu", (unsigned long long)g_ind_split);
     if (g_storage_unsup && o < (int)n) o += snprintf(out + o, n - o, "; shader images in a format that cannot be written %llu", (unsigned long long)g_storage_unsup);
     if (g_tex_unreg && o < (int)n) o += snprintf(out + o, n - o, "; bound texture IDs not registered %llu", (unsigned long long)g_tex_unreg);
     if (g_ring_forgot && o < (int)n) o += snprintf(out + o, n - o, "; copies made again after the command stream changed their bytes %llu", (unsigned long long)g_ring_forgot);
