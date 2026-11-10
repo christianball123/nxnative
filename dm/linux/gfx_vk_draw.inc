@@ -404,6 +404,15 @@ static VkImageView tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_v
     return view_get_fmt(v, fmt, type, lv, nl, l0, nlay, sw, asp, storage);
 }
 
+// What compute shaders read and write, logged once per shader and binding (the first 120): the inputs of a game's GPU culling, when its output is not steady
+static int g_in_dispatch;
+static int cs_once(uint64_t key, uint32_t binding) {
+    static struct { uint64_t key; uint32_t b; } seen[120]; static int n;
+    if (!g_in_dispatch) return 0;
+    for (int i = 0; i < n; i++) if (seen[i].key == key && seen[i].b == binding) return 0;
+    if (n == 120) return 0;
+    seen[n].key = key; seen[n++].b = binding; return 1;
+}
 // ---------------------------------------------------------------- stand-ins for unbound resources: zero buffers, a zero texel buffer, 1x1 zero images of each shape
 static struct { VkBuffer zbuf; VkDeviceMemory zmem; VkBufferView ztb; VkImage img[4], dimg; VkDeviceMemory imem[4], dmem; VkImageView view[8], dview[4]; VkSampler samp; uint64_t support_off; int ok; } DZ;
 static int dummies_init(void) {
@@ -879,6 +888,14 @@ static int pass_begin(void) {
     P.w = w; P.h = h; P.samples = samples ? samples : 1; P.draws0 = g_drawn;
     P.layers = layers ? layers : 1;
     { static int n; if (P.layers > 1 && n++ < 6) LOG("[vk] a layered pass: %ux%u, %u layers (colour serial %llu)", w, h, P.layers, (unsigned long long)P.cser[0]); }
+    {   // each kind of pass once (the first 200): which textures are drawn into, at which level and layer (to match against what compute shaders read)
+        static struct { uint64_t c, d; uint32_t lv; } seen[200]; static int ns;
+        uint64_t dser = P.dv ? P.dv->serial : 0; uint32_t lvk = (nc ? P.clv[0] : 0) | (nc ? P.cl0[0] : 0) << 8 | (P.dv ? P.dlv : 0) << 16 | (P.dv ? P.dl0 : 0) << 24;
+        int k = 0; while (k < ns && !(seen[k].c == (nc ? P.cser[0] : 0) && seen[k].d == dser && seen[k].lv == lvk)) k++;
+        if (k == ns && ns < 200) { seen[ns].c = nc ? P.cser[0] : 0; seen[ns].d = dser; seen[ns++].lv = lvk;
+            LOG("[vk] pass kind: %ux%u, %u colour (first serial %llu level %u layer %u), depth serial %llu (level %u layer %u, format %d), %u layers", w, h, nc, nc ? (unsigned long long)P.cser[0] : 0ull, nc ? P.clv[0] : 0, nc ? P.cl0[0] : 0,
+                (unsigned long long)dser, P.dv ? P.dlv : 0, P.dv ? P.dl0 : 0, P.dv ? (int)P.dv->fmt : 0, P.layers); }
+    }
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, P.layers, 0, nc, ca, P.has_d ? &da : NULL, P.has_s ? &sa : NULL};
     g_pass_fs = 0; prof_mark(1, w, h, nc, P.dv != NULL, 0, 0, 0);
     vkCmdBeginRendering_(g_cb, &ri);
@@ -1284,6 +1301,8 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                 if (size > lim) size = lim;
                 off = ring_put(addr, size);   // the guest's exact bytes; the range rounds up into the ring's slack
                 if (off != ~0ull && b->kind == VKS_SBUF && (b->image & 1)) wb_add(addr, size, off);
+                if (cs_once(s->key, b->binding)) LOG("[vk] compute %016llx binding %u: %s buffer %#llx, %llu bytes%s", (unsigned long long)s->key, b->binding, uni ? "uniform" : "storage",
+                                                     (unsigned long long)addr, (unsigned long long)size, b->kind == VKS_SBUF && (b->image & 1) ? ", written" : "");
                 size = (size + 15) & ~15ull;
             }
             if (off == ~0ull && addr && size) return -1;   // the ring is full
@@ -1361,6 +1380,14 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                         (unsigned long long)r->t.serial, r->t.d.width, r->t.d.height, r->t.d.format, v2 ? tex_view_fmt(v2, &r->t) : 0, v2 ? (unsigned long long)v2->serial : 0ull, v2 ? v2->fmt : 0); }
                 else LOG("[vk] dump:   pass %d shader %016llx binding %u%s: EMPTY (%s; handle %#x bank %u)", g_dump_pass, (unsigned long long)s->key, b->binding, storage ? " (image)" : "",
                          !ok ? "handle not decoded" : !r ? "ID not registered" : "no usable view", b->reg, b->aux);
+            }
+            if (b->vktype != VK_DESCRIPTOR_TYPE_SAMPLER && cs_once(s->key, b->binding)) {
+                const treg *r = ok ? (storage ? ireg_get((int)(h & 0xfffff)) : treg_get((int)(h & 0xfffff))) : NULL; vtex *v2 = r ? tex_get(&r->t) : NULL;
+                if (r) LOG("[vk] compute %016llx binding %u: %s serial %llu, NVN format %#x target %d %ux%ux%u levels %u; image %ux%u layers %u levels %u format %d, %s; shader image type %#x; view %s (level %d+%d, layer %d+%d)",
+                           (unsigned long long)s->key, b->binding, storage ? "image" : "texture", (unsigned long long)r->t.serial, r->t.d.format, r->t.d.target, r->t.d.width, r->t.d.height, r->t.d.depth, r->t.d.levels,
+                           v2 ? v2->w : 0, v2 ? v2->h : 0, v2 ? v2->layers : 0, v2 ? v2->levels : 0, v2 ? (int)v2->fmt : 0, !v2 ? "no image" : v2->gpu ? "written by the GPU" : v2->uploaded ? "uploaded from the game's memory" : "never filled",
+                           b->image, iv ? "ok" : "NONE (a zero stand-in is read)", r->has_v ? (int)r->v.base_level : -1, r->has_v ? (int)r->v.nlevels : -1, r->has_v ? (int)r->v.min_layer : -1, r->has_v ? (int)r->v.nlayers : -1);
+                else LOG("[vk] compute %016llx binding %u: %s not bound (handle %#x)", (unsigned long long)s->key, b->binding, storage ? "image" : "texture", h);
             }
             if (!iv) iv = dummy_view(b->image);
             for (uint32_t k = 0; k < n; k++) ii[k] = (VkDescriptorImageInfo){sp, iv, VK_IMAGE_LAYOUT_GENERAL};
@@ -1822,7 +1849,8 @@ static void dispatch_op(const p_dispatch *d) {
     }
     if (atomic_load_explicit(&g_cp[i].state, memory_order_acquire) == 1) return;   // still being built in the background
     if (!g_cp[i].p) { if (movie_net(pr->st[VKS_CS]->key)) movie_stub(pr); return; }
-    if (bind_sets(pr, VK_PIPELINE_BIND_POINT_COMPUTE) <= 0) return;
+    g_in_dispatch = 1; int bs_r = bind_sets(pr, VK_PIPELINE_BIND_POINT_COMPUTE); g_in_dispatch = 0;
+    if (bs_r <= 0) return;
     pass_end();   // a texture's first use may have needed command-buffer work
     vkCmdBindPipeline_(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_cp[i].p);
     uint32_t x = (uint32_t)d->x, y = (uint32_t)d->y, z = (uint32_t)d->z;
