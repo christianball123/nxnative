@@ -189,10 +189,14 @@ def main():
     lw = work / 'linux'; patched = lw / f'patched_v{ver}'; nro_dir = lw / f'nro_v{ver}'
     patched.mkdir(parents=True, exist_ok=True)
     renv = dict(env, DM_GAME=tid)
+    # A module is rewritten again when its NSO, the rewriter or any patch file is newer than its rewrite (a new patch, such as Pokémon Legends: Z-A's 60 fps frame step, was
+    # skipped before: only the NSO's time was compared)
+    tools_t = max([p.stat().st_mtime for p in (REPO / 'dm/tools').glob('*.py')] + [p.stat().st_mtime for p in (REPO / 'dm/games').glob('*/patches.py')] + [0])
     def rewrite(names):
         for m, src in names.items():
             if not src.is_file(): say(f'[RED] {m}: not in {src.parent}, skipped'); continue
-            if (patched / f'{m}.patched.bin').is_file() and (patched / f'{m}.patched.bin').stat().st_mtime > src.stat().st_mtime: say(f'{m}: already rewritten'); continue
+            pb = patched / f'{m}.patched.bin'
+            if pb.is_file() and pb.stat().st_mtime > max(src.stat().st_mtime, tools_t): say(f'{m}: already rewritten'); continue
             run([sys.executable, REPO / 'dm/tools/patch_nso.py', src, patched, m], env=renv)
     rewrite({m: exefs / m for m in mods})
     # The NROs the game loads at run time with nn::ro (dm/tools/nro_collect.py): found in its files, or, when no file holds one (Mario Tennis Fever decodes its game code in memory),
