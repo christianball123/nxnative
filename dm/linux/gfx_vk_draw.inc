@@ -1704,6 +1704,20 @@ static void ind_fresh(uint64_t addr, uint64_t n) {
         return;
     }
 }
+// What the indirect draws are told to draw, watched for flicker: a draw whose instance count goes between zero and not zero from one time to the next is an object that
+// comes or goes. Counted (and the first few arguments logged) so a log shows whether the GPU's culling output is steady (Pokémon Legends: Z-A's lamps and walls)
+static uint64_t g_ind_n, g_ind_flip, g_ind_zero;
+static void ind_note(uint64_t addr, const uint32_t *g, int idx) {
+    static struct { uint64_t addr; uint32_t inst; } t[2048];
+    uint32_t inst = g[1] && g[0];
+    uint32_t i = (uint32_t)(addr * 0x9E3779B97F4A7C15ull >> 53) & 2047;
+    for (int k = 0; k < 16 && t[i].addr && t[i].addr != addr; k++) i = (i + 1) & 2047;
+    g_ind_n++; if (!inst) g_ind_zero++;
+    if (t[i].addr == addr && !t[i].inst != !inst) g_ind_flip++;
+    t[i].addr = addr; t[i].inst = inst;
+    static int n; if (n++ < 12) LOG("[vk] indirect %s at %#llx: %u %u %u %u %u", idx ? "indexed draw {count, instances, first index, base vertex, base instance}" : "draw {count, instances, first, base instance}",
+                                    (unsigned long long)addr, g[0], g[1], g[2], g[3], idx ? g[4] : 0);
+}
 static void draw_op(uint32_t op, const uint8_t *a, uint32_t size) {
     if (op == OP_DRAW) {
         p_draw t; const p_draw *d = draw_rec(a, size, &t);
@@ -1711,7 +1725,7 @@ static void draw_op(uint32_t op, const uint8_t *a, uint32_t size) {
         if (d->ind) { ind_fresh(d->ind, 20); pend_hazard(d->ind, 20); }
         if (d->mdi_cnt && (uint32_t)d->mdi_i >= *(const uint32_t *)(uintptr_t)d->mdi_cnt) return;
         draw_args x = {d->prim, 0, (uint32_t)d->count, (uint32_t)d->instances, (uint32_t)d->first, (uint32_t)d->base_instance, 0, 0, 0};
-        if (d->ind) { const uint32_t *g = (const uint32_t *)(uintptr_t)d->ind; x.count = g[0]; x.instances = g[1]; x.first = g[2]; x.base_instance = g[3]; }   // the arguments as the CPU sees them
+        if (d->ind) { const uint32_t *g = (const uint32_t *)(uintptr_t)d->ind; ind_note(d->ind, g, 0); x.count = g[0]; x.instances = g[1]; x.first = g[2]; x.base_instance = g[3]; }   // the arguments as the CPU sees them
         do_draw(&x);
     } else if (op == OP_DRAW_IDX) {
         p_draw_idx t; const p_draw_idx *d = draw_idx_rec(a, size, &t);
@@ -1721,6 +1735,7 @@ static void draw_op(uint32_t op, const uint8_t *a, uint32_t size) {
         draw_args x = {d->prim, 1, (uint32_t)d->count, (uint32_t)d->instances, 0, (uint32_t)d->base_instance, d->base_vertex, d->ibuf, d->itype};
         if (d->ind) {
             const uint32_t *g = (const uint32_t *)(uintptr_t)d->ind; uint32_t isz = d->itype == NVN_INDEX_TYPE_UNSIGNED_INT ? 4 : d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 1;
+            ind_note(d->ind, g, 1);
             x.count = g[0]; x.instances = g[1]; x.ibuf = d->ibuf + (uint64_t)g[2] * isz; x.base_vertex = (int32_t)g[3]; x.base_instance = g[4];
         }
         do_draw(&x);
@@ -1733,6 +1748,7 @@ static void draw_op(uint32_t op, const uint8_t *a, uint32_t size) {
         uint32_t isz = m->itype == NVN_INDEX_TYPE_UNSIGNED_INT ? 4 : m->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 1;
         for (uint32_t i = 0; i < n && i < 65536; i++) {
             const uint32_t *g = (const uint32_t *)(uintptr_t)(m->ind + i * stride);
+            ind_note(m->ind + i * stride, g, idx);
             draw_args x = idx ? (draw_args){m->prim, 1, g[0], g[1], 0, g[4], (int32_t)g[3], m->ibuf + (uint64_t)g[2] * isz, m->itype}
                               : (draw_args){m->prim, 0, g[0], g[1], g[2], g[3], 0, 0, 0};
             do_draw(&x);
@@ -2000,6 +2016,7 @@ static void draw_summary(char *out, size_t n) {
     for (int i = 0; i < SK_N && o < (int)n; i++) if (g_skip[i]) o += snprintf(out + o, n - o, "; skipped (%s) %llu", k_sk[i], (unsigned long long)g_skip[i]);
     if (g_tex_missing && o < (int)n) o += snprintf(out + o, n - o, "; texture bindings without a usable view %llu", (unsigned long long)g_tex_missing);
     if (g_xfb_draws && o < (int)n) o += snprintf(out + o, n - o, "; transform feedback draws %llu (ranges read from their capture %llu)", (unsigned long long)g_xfb_draws, (unsigned long long)g_wb_within);
+    if (g_ind_n && o < (int)n) o += snprintf(out + o, n - o, "; indirect draws %llu (%llu with nothing to draw, %llu went between nothing and something since their last time)", (unsigned long long)g_ind_n, (unsigned long long)g_ind_zero, (unsigned long long)g_ind_flip);
     if (g_ind_split && o < (int)n) o += snprintf(out + o, n - o, "; submissions split for indirect arguments written in them %llu", (unsigned long long)g_ind_split);
     if (g_storage_unsup && o < (int)n) o += snprintf(out + o, n - o, "; shader images in a format that cannot be written %llu", (unsigned long long)g_storage_unsup);
     if (g_tex_unreg && o < (int)n) o += snprintf(out + o, n - o, "; bound texture IDs not registered %llu", (unsigned long long)g_tex_unreg);
