@@ -404,6 +404,7 @@ static VkImageView tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_v
     return view_get_fmt(v, fmt, type, lv, nl, l0, nlay, sw, asp, storage);
 }
 
+static vtex *g_hiz; static uint64_t g_hiz_cs;   // a depth texture with mip levels that a compute shader reads (a culling pass's depth pyramid), and that shader
 // What compute shaders read and write, logged once per shader and binding (the first 120): the inputs of a game's GPU culling, when its output is not steady
 static int g_in_dispatch;
 static int cs_once(uint64_t key, uint32_t binding) {
@@ -1387,6 +1388,7 @@ static int write_set(const vks_shader *s, int st, VkDescriptorSet set) {
                            (unsigned long long)s->key, b->binding, storage ? "image" : "texture", (unsigned long long)r->t.serial, r->t.d.format, r->t.d.target, r->t.d.width, r->t.d.height, r->t.d.depth, r->t.d.levels,
                            v2 ? v2->w : 0, v2 ? v2->h : 0, v2 ? v2->layers : 0, v2 ? v2->levels : 0, v2 ? (int)v2->fmt : 0, !v2 ? "no image" : v2->gpu ? "written by the GPU" : v2->uploaded ? "uploaded from the game's memory" : "never filled",
                            b->image, iv ? "ok" : "NONE (a zero stand-in is read)", r->has_v ? (int)r->v.base_level : -1, r->has_v ? (int)r->v.nlevels : -1, r->has_v ? (int)r->v.min_layer : -1, r->has_v ? (int)r->v.nlayers : -1);
+                if (v2 && v2->levels > 1 && fmt_depth(v2->fmt) && !g_hiz) { g_hiz = v2; g_hiz_cs = s->key; }
                 else LOG("[vk] compute %016llx binding %u: %s not bound (handle %#x)", (unsigned long long)s->key, b->binding, storage ? "image" : "texture", h);
             }
             if (!iv) iv = dummy_view(b->image);
@@ -1829,6 +1831,7 @@ static void movie_stub(const vks_prog *pr) {
     static int logged; if (!logged++) LOG("[vk] movie network %016llx left out: a linear blit of texture serial %llu (%ux%u) into serial %llu (%ux%u) stands in for its picture",
                                           (unsigned long long)s->key, (unsigned long long)rin->t.serial, in->w, in->h, (unsigned long long)rout->t.serial, out->w, out->h);
 }
+static void hiz_probe(void);   // below
 static void dispatch_op(const p_dispatch *d) {
     const vks_prog *pr = g_cs_prog;
     if (!pr || !pr->st[VKS_CS]) return;
@@ -1855,6 +1858,7 @@ static void dispatch_op(const p_dispatch *d) {
     vkCmdBindPipeline_(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_cp[i].p);
     uint32_t x = (uint32_t)d->x, y = (uint32_t)d->y, z = (uint32_t)d->z;
     if (d->ind) { pend_hazard(d->ind, 12); const uint32_t *g = (const uint32_t *)(uintptr_t)d->ind; x = g[0]; y = g[1]; z = g[2]; }
+    if (g_hiz && pr->st[VKS_CS]->key == g_hiz_cs) hiz_probe();
     if (x && y && z) { prof_mark(1, x, y, z, 0, 1, 0, 0); vkCmdDispatch_(g_cb, x, y, z); prof_mark(0, x, y, z, 0, 1, pr->st[VKS_CS] ? pr->st[VKS_CS]->key : 0, 1); full_barrier(); g_disp_done++; g_cb_ops++; }
 }
 
@@ -1944,6 +1948,9 @@ static void dump_write(const stage_t *s) {
     }
     free(row); fclose(fp); g_dump_files++;
     LOG("[vk] dump: %s (%ux%u, values %.3g .. %.3g)", s->dump_name, w, h, mn, mx);
+    if (mono && (uint64_t)w * h <= 32) { char ln[600]; int o = 0;
+        for (uint32_t i = 0; i < w * h && o < 560; i++) { float t[4]; dump_texel(f, (const uint8_t *)s->p + (uint64_t)i * bpp, t); o += snprintf(ln + o, sizeof ln - o, " %.6g", t[0]); }
+        LOG("[vk] dump:   its values:%s", ln); }
 }
 static void dump_tex(vtex *v, uint32_t lv, uint32_t l0, const char *tag) {
     uint32_t bpp = dump_bpp(v->fmt);
@@ -1955,6 +1962,24 @@ static void dump_tex(vtex *v, uint32_t lv, uint32_t l0, const char *tag) {
     VkImageAspectFlags a = fmt_aspects(v->fmt); a = a & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
     VkBufferImageCopy bic = {0, 0, 0, {a, lv, v->is3d ? 0 : l0, 1}, {0, 0, 0}, {w, h, 1}};
     vkCmdCopyImageToBuffer_(g_cb, v->img, VK_IMAGE_LAYOUT_GENERAL, st->b, 1, &bic);
+}
+// The depth pyramid a culling compute shader reads, level by level, at three of its dispatches (the 200th on): the values each level holds go to the log (and pictures
+// into ~/nxnative-hiz). Pokémon Legends: Z-A's culling output is not steady: this shows whether the pyramid it tests against is
+static void hiz_probe(void) {
+    static int nth; int k = nth++ - 200; if (k < 0 || k > 2 || !g_hiz || !g_hiz->img) return;
+    uint32_t bpp = dump_bpp(g_hiz->fmt); if (!bpp || g_hiz->samples > 1) { LOG("[vk] depth pyramid serial %llu: format %d cannot be read out", (unsigned long long)g_hiz->serial, g_hiz->fmt); return; }
+    const char *home = getenv("HOME"); char dir[200], cmd[260]; snprintf(dir, sizeof dir, "%s/nxnative-hiz", home ? home : "/tmp"); snprintf(cmd, sizeof cmd, "mkdir -p '%s'", dir); if (system(cmd)) return;
+    LOG("[vk] depth pyramid serial %llu (%ux%u, %u levels) as the culling shader %016llx is about to read it, time %d of 3:", (unsigned long long)g_hiz->serial, g_hiz->w, g_hiz->h, g_hiz->levels, (unsigned long long)g_hiz_cs, k + 1);
+    full_barrier();
+    for (uint32_t lv = 0; lv < g_hiz->levels; lv++) {
+        uint32_t w = g_hiz->w >> lv ? g_hiz->w >> lv : 1, h = g_hiz->h >> lv ? g_hiz->h >> lv : 1;
+        stage_t *st = stage_new((uint64_t)w * h * bpp); if (!st) return;
+        st->dump_fmt = g_hiz->fmt; st->dw = w; st->dh = h;
+        snprintf(st->dump_name, sizeof st->dump_name, "%s/time%d_level%02u.ppm", dir, k + 1, lv);
+        VkBufferImageCopy bic = {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, lv, 0, 1}, {0, 0, 0}, {w, h, 1}};
+        vkCmdCopyImageToBuffer_(g_cb, g_hiz->img, VK_IMAGE_LAYOUT_GENERAL, st->b, 1, &bic);
+    }
+    full_barrier();
 }
 static void dump_pass(void) {
     if (!g_dump_subs) return;
