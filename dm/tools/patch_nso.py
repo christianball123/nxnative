@@ -72,6 +72,17 @@ if FAR:
 else:
     KEY_PAGE_OFF = (len(IMG) + 0x3FFF) & ~0x3FFF
     IMG.extend(bytes(0x4000))
+    # The frame step state page (FRAME_STEP below) goes right after the key page, in the gap before the 64 KB-aligned patch area. A main whose key page ends on a 64 KB boundary
+    # has no gap (Pokémon Legends: Z-A 2.0.2: 'frame step state page' failed), so such a main with frame step stubs takes one more zero page first; every other module's
+    # layout, and so its output, is unchanged
+    if NAME == 'main' and (((len(IMG) + 0xFFFF) & ~0xFFFF) - len(IMG)) < 0x40:
+        _bid = MOD.build_id[:0x10].hex()
+        _files = [os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sdk_patches.py')] + sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../games/*/patches.py')))
+        _files += [q for d in os.environ.get('DM_GAMES_DIR', '').split(os.pathsep) if d for q in sorted(glob.glob(os.path.join(glob.escape(d), '*', 'patches.py')))]
+        def _has_frame_step(path):
+            spec = importlib.util.spec_from_file_location('fs_probe', path); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+            return _bid in getattr(mod, 'FRAME_STEP', {})
+        if any(_has_frame_step(q) for q in _files): IMG.extend(bytes(0x4000))
     PATCH_OFF = (len(IMG) + 0xFFFF) & ~0xFFFF
     IMAGE_SIZE = BACK_OFF = 0   # only the layout with the patch area before the base has them
 
